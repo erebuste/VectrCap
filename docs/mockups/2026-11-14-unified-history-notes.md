@@ -6,6 +6,8 @@ The owner requested one History window instead of separate History/Image history
 
 All nine records and miniature captured-content illustrations are sample data. Desktop file/link/edit/pin/retry buttons describe their intended application actions when clicked; they do not access files, upload, open a browser, or alter the clipboard. The app implementation will remain Rust/egui; this HTML is a throwaway design artifact.
 
+The owner subsequently approved History favorites: shared star state and a Favorites-only filter within this same window, independent of retention. The approved spec/plan include them; this earlier HTML concept has not been revised to demonstrate stars or verify the new accessibility/contrast/scaling requirements.
+
 ## Design review
 
 - Single-font hook finding: contextually intentional. One consistent UI typeface fits the owner-selected compact native desktop utility. Adding a display family would create unnecessary visual distinction among related controls. Captured terminal illustrations use a source-content monospace face. No rule suppression or ignore entry was added.
