@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VectrCap unified History concept</title>
+<style>
+:root { color-scheme: dark; --small: 11px; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: transparent; }
+body { color: var(--foreground); font-family: var(--font-sans); font-size: 12px; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button, select { border: 1px solid var(--border); background: var(--secondary); border-radius: 5px; min-height: 30px; padding: 5px 9px; }
+button:hover, select:hover { background: var(--accent); }
+button:focus-visible, input:focus-visible, select:focus-visible, .entry:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+button:disabled { cursor: default; opacity: .4; }
+button[aria-pressed="true"] { color: var(--primary-foreground); background: var(--primary); border-color: var(--primary); }
+.top { display: flex; align-items: center; gap: 9px; padding: 7px 0 12px; }
+.brandmark { width: 19px; height: 19px; color: var(--primary); }
+h1 { font-size: 20px; letter-spacing: -.35px; margin: 0; font-weight: 650; }
+.title-meta { color: var(--muted-foreground); font-size: var(--small); }
+.spacer { flex: 1; }
+.views { display: flex; gap: 3px; }
+.views button { display: flex; gap: 5px; align-items: center; }
+.icon { width: 14px; height: 14px; flex: 0 0 auto; }
+.searchbar { display: flex; gap: 7px; margin-bottom: 10px; }
+.search { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 100px; border: 1px solid var(--border); background: var(--card); border-radius: 5px; padding: 0 9px; }
+.search input { min-width: 0; width: 100%; border: 0; outline: none; background: transparent; min-height: 33px; }
+.search .icon { color: var(--muted-foreground); }
+.filters { display: flex; align-items: center; gap: 4px; margin-bottom: 12px; flex-wrap: wrap; }
+.type-filter { background: transparent; border-color: transparent; min-height: 27px; padding: 4px 9px; }
+.type-filter span { color: var(--muted-foreground); margin-left: 4px; font-size: 10px; }
+.filters select { margin-left: auto; min-height: 28px; font-size: var(--small); }
+.workspace { display: grid; grid-template-columns: minmax(0, 1fr) 222px; gap: 14px; align-items: start; }
+.workspace.no-preview { grid-template-columns: minmax(0, 1fr); }
+.workspace.no-preview .inspector { display: none; }
+.workspace.no-preview .items:not(.list) { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.library { min-width: 0; }
+.section-label { display: flex; align-items: center; color: var(--muted-foreground); font-size: 10px; text-transform: uppercase; letter-spacing: .7px; margin: 0 0 9px; }
+.section-label span:last-child { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.items { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 8px; min-height: 419px; align-content: start; }
+.entry { min-width: 0; cursor: pointer; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; background: var(--card); position: relative; }
+.entry:hover { border-color: var(--muted-foreground); }
+.entry.current { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+.thumb { height: 87px; display: flex; align-items: center; justify-content: center; background: var(--code-background); overflow: hidden; position: relative; }
+.thumb svg { width: 100%; height: 100%; display: block; }
+.thumb .media-label { position: absolute; bottom: 5px; right: 5px; font-size: 9px; color: var(--foreground); padding: 2px 4px; background: var(--popover); border: 1px solid var(--border); border-radius: 3px; }
+.thumb.file { color: var(--muted-foreground); gap: 6px; flex-direction: column; }
+.thumb.file .icon { width: 28px; height: 28px; }
+.thumb.file .file-ext { font-size: 10px; letter-spacing: 1px; }
+.thumb.missing { background: var(--secondary); color: var(--muted-foreground); }
+.check { position: absolute; z-index: 1; top: 5px; left: 5px; margin: 0; width: 13px; height: 13px; accent-color: var(--primary); opacity: 0; }
+.entry:hover .check, .entry:focus-within .check, .check:checked { opacity: 1; }
+.entry-body { padding: 7px 7px 6px; }
+.filename { font-size: 11px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 5px; }
+.entry-meta { display: flex; align-items: center; gap: 5px; min-width: 0; font-size: 10px; color: var(--muted-foreground); }
+.entry-meta .size { margin-left: auto; white-space: nowrap; }
+.state { white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.state::before { content: ''; width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+.uploaded { color: var(--success); }
+.failed { color: var(--destructive); }
+.uploading { color: var(--primary); }
+.local { color: var(--muted-foreground); }
+.local-missing { font-size: 9px; margin-top: 5px; color: var(--warning); }
+.inspector { border-left: 1px solid var(--border); padding-left: 14px; min-width: 0; }
+.inspector-heading { display: flex; align-items: center; margin-bottom: 9px; color: var(--muted-foreground); font-size: 10px; text-transform: uppercase; letter-spacing: .7px; }
+.preview { height: 139px; border: 1px solid var(--border); border-radius: 5px; margin-bottom: 12px; background: var(--code-background); overflow: hidden; display: grid; place-items: center; }
+.preview svg { width: 100%; max-height: 100%; }
+.preview.file { color: var(--muted-foreground); }
+.preview.file .icon { width: 42px; height: 42px; }
+.detail-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; margin-bottom: 4px; }
+.detail-sub { font-size: 10px; color: var(--muted-foreground); margin-bottom: 13px; }
+.detail-states { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; font-size: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.detail-states .availability { color: var(--muted-foreground); }
+.detail-states .availability.missing { color: var(--warning); }
+.label { font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted-foreground); display: block; margin-bottom: 5px; }
+.link { font-size: 10px; color: var(--muted-foreground); overflow-wrap: anywhere; background: var(--secondary); border: 1px solid var(--border); border-radius: 4px; padding: 7px; margin: 9px 0 8px; min-height: 30px; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 11px; }
+.actions button { flex: 1; min-width: 75px; font-size: 10px; min-height: 29px; }
+.actions .primary { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+.secondary-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.secondary-actions button { font-size: 10px; background: transparent; min-height: 28px; }
+.metadata { margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--border); display: grid; grid-template-columns: 1fr auto; gap: 7px; font-size: 10px; }
+.metadata dt { color: var(--muted-foreground); }
+.metadata dd { margin: 0; text-align: right; }
+.note { color: var(--muted-foreground); font-size: 10px; line-height: 1.6; margin-top: 10px; }
+.footer { border-top: 1px solid var(--border); margin-top: 13px; padding: 9px 0 4px; display: flex; align-items: center; gap: 10px; color: var(--muted-foreground); font-size: 10px; flex-wrap: wrap; }
+.footer .failed { color: var(--destructive); }
+.bulk { display: flex; align-items: center; gap: 8px; }
+.bulk[hidden] { display: none; }
+.bulk button { font-size: 10px; min-height: 24px; padding: 2px 6px; }
+.list-head { display: none; }
+.items.list { display: flex; flex-direction: column; gap: 0; }
+.items.list .entry { display: grid; grid-template-columns: 21px 29px minmax(80px,1fr) 77px 48px; align-items: center; gap: 7px; min-height: 42px; border-radius: 0; border: 0; border-bottom: 1px solid var(--border); padding: 6px 3px; background: transparent; }
+.items.list .entry.current { box-shadow: none; background: color-mix(in srgb, var(--primary) 14%, transparent); border-bottom-color: var(--border); }
+.items.list .check { position: static; opacity: 1; width: 12px; height: 12px; }
+.items.list .thumb { width: 27px; height: 27px; border-radius: 3px; }
+.items.list .thumb.file { gap: 0; }
+.items.list .thumb.file .icon { width: 17px; height: 17px; }
+.items.list .media-label, .items.list .file-ext { display: none; }
+.items.list .entry-body { padding: 0; min-width: 0; }
+.items.list .filename { margin: 0 0 3px; font-size: 11px; }
+.items.list .list-info { color: var(--muted-foreground); font-size: 10px; }
+.list-status { font-size: 10px; }
+.list-size { color: var(--muted-foreground); font-size: 10px; text-align: right; }
+.empty { grid-column: 1 / -1; padding: 60px 12px; text-align: center; color: var(--muted-foreground); line-height: 1.8; }
+#message { min-height: 16px; color: var(--muted-foreground); font-size: 10px; margin-top: 7px; }
+@media (min-width: 1000px) { .workspace { grid-template-columns: minmax(0,1fr) 270px; } .thumb { height: 113px; } .preview { height: 175px; } }
+@media (max-width: 620px) { .workspace { grid-template-columns: minmax(0,1fr); } .inspector { border-left: 0; padding: 12px 0 0; border-top: 1px solid var(--border); } .preview { height: 170px; } .items { min-height: 0; } .workspace.no-preview .items:not(.list) { grid-template-columns: repeat(3, minmax(0,1fr)); } .filters select { margin-left: 3px; } .title-meta { display: none; } .searchbar select { max-width: 103px; } .items.list .entry { grid-template-columns: 18px 26px minmax(60px,1fr) 73px 43px; gap: 5px; } }
+@media (max-width: 380px) { .items, .workspace.no-preview .items:not(.list) { grid-template-columns: repeat(2, minmax(0,1fr)); } .top { gap: 6px; } .views button { font-size: 10px; padding: 4px 7px; } #preview-toggle { font-size: 10px; padding: 4px 6px; } }
+</style>
+</head>
+<body>
+<svg style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true"><defs>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m15 15 5 5" stroke="currentColor" stroke-width="1.7"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><path d="M8 5h13M8 12h13M8 19h13M3 5h1M3 12h1M3 19h1" stroke="currentColor" stroke-width="1.8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M5 2h9l5 5v15H5zM14 2v6h5M8 12h8M8 16h8" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
+<symbol id="i-brand" viewBox="0 0 24 24"><path d="m3 4 8 16 10-16M7 4l5 10 6-10" fill="none" stroke="currentColor" stroke-width="2.2"/></symbol>
+</defs></svg>
+<main aria-label="Unified History layout preview">
+<header class="top"><svg class="brandmark"><use href="#i-brand"/></svg><h1>History</h1><span class="title-meta">All your captures and files</span><span class="spacer"></span><div class="views" aria-label="History view"><button id="gallery" type="button" aria-pressed="true"><svg class="icon"><use href="#i-grid"/></svg>Gallery</button><button id="list" type="button" aria-pressed="false"><svg class="icon"><use href="#i-list"/></svg>List</button></div><button id="preview-toggle" type="button" aria-pressed="true">Preview</button></header>
+<div class="searchbar"><label class="search"><svg class="icon"><use href="#i-search"/></svg><input id="search" type="search" placeholder="Search captures, files, or links…" aria-label="Search history"></label><select id="status" aria-label="Upload status"><option value="all">All statuses</option><option value="uploaded">Uploaded</option><option value="local">Local only</option><option value="uploading">Uploading</option><option value="failed">Failed</option></select><select id="date" aria-label="Date filter"><option value="all">Any date</option><option value="today">Today</option><option value="yesterday">Yesterday</option></select></div>
+<div class="filters" aria-label="File type filters"><button class="type-filter" type="button" data-type="all" aria-pressed="true">All<span>9</span></button><button class="type-filter" type="button" data-type="image" aria-pressed="false">Images<span>5</span></button><button class="type-filter" type="button" data-type="recording" aria-pressed="false">Recordings<span>2</span></button><button class="type-filter" type="button" data-type="file" aria-pressed="false">Files<span>2</span></button><select id="sort" aria-label="Sort history"><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="name">Name A–Z</option></select></div>
+<div class="workspace" id="workspace"><section class="library" aria-label="Capture and file results"><div class="section-label"><span id="period">Recent activity</span><span id="count">9 items</span></div><div id="items" class="items" role="list" aria-label="History items"></div></section><aside id="inspector" class="inspector" aria-label="Selected item preview and details"></aside></div>
+<footer class="footer"><div id="footer-status">9 items · 1 uploading · 1 failed</div><span class="spacer"></span><div id="bulk" class="bulk" hidden></div><span id="keyboard-hint">Ctrl+F to search</span></footer><div id="message" aria-live="polite"></div>
+</main>
+<script>
+'use strict';
+/** @typedef {'uploaded'|'local'|'uploading'|'failed'} Status */
+/** @typedef {{id:number,name:string,type:'image'|'recording'|'file',format:string,size:string,date:'today'|'yesterday',time:string,status:Status,local:boolean,scene:string,dimensions:string,duration?:string,url?:string}} RecordItem */
+/** @type {ReadonlyArray<RecordItem>} */
+const records = Object.freeze([
+ {id:1,name:'capture_2026-11-14_1032.png',type:'image',format:'PNG',size:'248 KB',date:'today',time:'10:32',status:'uploaded',local:true,scene:'ui',dimensions:'1920 × 1080',url:'https://files.vectr.example/i/q7a3.png'},
+ {id:2,name:'terminal_build_output.png',type:'image',format:'PNG',size:'94 KB',date:'today',time:'10:18',status:'uploaded',local:true,scene:'terminal',dimensions:'1280 × 720',url:'https://files.vectr.example/i/n4b8.png'},
+ {id:3,name:'annotated_navigation.png',type:'image',format:'PNG',size:'186 KB',date:'today',time:'10:06',status:'local',local:true,scene:'annotation',dimensions:'1440 × 900'},
+ {id:4,name:'recording_2026-11-14.mp4',type:'recording',format:'MP4',size:'3.8 MB',date:'today',time:'09:54',status:'uploaded',local:true,scene:'video',dimensions:'1280 × 720',duration:'00:18',url:'https://files.vectr.example/i/x6k2.mp4'},
+ {id:5,name:'release_assets.zip',type:'file',format:'ZIP',size:'24.6 MB',date:'today',time:'09:41',status:'uploading',local:true,scene:'file',dimensions:'—'},
+ {id:6,name:'scrolling_documentation.png',type:'image',format:'PNG',size:'1.2 MB',date:'yesterday',time:'22:15',status:'failed',local:true,scene:'scroll',dimensions:'1180 × 4260'},
+ {id:7,name:'menu_walkthrough.gif',type:'recording',format:'GIF',size:'2.1 MB',date:'yesterday',time:'21:48',status:'uploaded',local:true,scene:'gif',dimensions:'960 × 540',duration:'00:06',url:'https://files.vectr.example/i/m2j9.gif'},
+ {id:8,name:'project_notes.pdf',type:'file',format:'PDF',size:'412 KB',date:'yesterday',time:'20:32',status:'uploaded',local:false,scene:'file',dimensions:'—',url:'https://files.vectr.example/i/p3d7.pdf'},
+ {id:9,name:'capture_2026-11-13_1944.png',type:'image',format:'PNG',size:'172 KB',date:'yesterday',time:'19:44',status:'uploaded',local:false,scene:'missing',dimensions:'1600 × 900',url:'https://files.vectr.example/i/v8r1.png'}
+]);
+const labels = Object.freeze({uploaded:'Uploaded',local:'Local only',uploading:'Uploading · 42%',failed:'Upload failed'});
+const state = {view:'gallery',type:'all',selected:1,checked:new Set(),preview:true};
+const byId = id => { const element=document.getElementById(id); if (!element) throw new Error('Missing preview element: '+id); return element; };
+const iconFile = '<svg class="icon" aria-hidden="true"><use href="#i-file"/></svg>';
+function artwork(scene) {
+ const header='<rect width="320" height="180" fill="var(--secondary)"/><rect x="16" y="13" width="288" height="154" rx="5" fill="var(--card)" stroke="var(--border)"/><path d="M16 32h288" stroke="var(--border)"/><circle cx="27" cy="23" r="2" fill="var(--muted-foreground)"/><circle cx="35" cy="23" r="2" fill="var(--muted-foreground)"/><circle cx="43" cy="23" r="2" fill="var(--muted-foreground)"/>';
+ let content='';
+ if(scene==='terminal') content='<text x="30" y="56" font-size="10" fill="var(--success)" font-family="monospace">cargo test</text><g stroke="var(--muted-foreground)" stroke-width="3" opacity=".6"><path d="M30 73h155M30 84h214M30 95h184M30 106h198M30 117h161M30 128h193"/></g><text x="30" y="150" font-size="10" fill="var(--success)" font-family="monospace">test result: ok.</text>';
+ else if(scene==='scroll') content='<rect x="40" y="43" width="240" height="113" fill="var(--secondary)"/><g stroke="var(--muted-foreground)" opacity=".6"><path d="M56 58h125" stroke-width="5"/><path d="M56 72h204M56 80h187M56 88h201M56 102h140M56 111h198M56 120h179M56 130h204M56 140h159" stroke-width="3"/></g>';
+ else {content='<rect x="27" y="43" width="65" height="113" rx="3" fill="var(--secondary)"/><g stroke="var(--muted-foreground)" stroke-width="3" opacity=".7"><path d="M37 57h39M37 73h31M37 89h42M37 105h34"/></g><text x="107" y="58" font-size="11" fill="var(--foreground)" font-family="sans-serif">'+(scene==='annotation'?'Navigation':'Task settings')+'</text><g fill="none" stroke="var(--border)"><rect x="105" y="70" width="180" height="24" rx="3"/><rect x="105" y="100" width="180" height="24" rx="3"/></g><g stroke="var(--muted-foreground)" stroke-width="3"><path d="M118 82h101M118 112h123"/></g><rect x="230" y="136" width="55" height="15" rx="3" fill="var(--primary)"/>';}
+ if(scene==='annotation') content+='<ellipse cx="64" cy="89" rx="34" ry="18" fill="none" stroke="var(--warning)" stroke-width="3"/><path d="m163 132-41-33 5 17m-5-17 18 2" stroke="var(--warning)" stroke-width="3" fill="none"/>';
+ if(scene==='video'||scene==='gif')content+='<circle cx="160" cy="96" r="23" fill="var(--popover)" stroke="var(--border)"/><path d="m154 84 17 12-17 12z" fill="var(--foreground)"/>';
+ return '<svg viewBox="0 0 320 180" role="img" aria-label="Illustrative captured-content preview">'+header+content+'</svg>';
+}
+function thumb(item,large=false) {
+ const box=document.createElement('div'); box.className=large?'preview':'thumb';
+ if(item.scene==='file'||!item.local){box.classList.add('file'); if(!item.local)box.classList.add('missing'); box.innerHTML=iconFile; const label=document.createElement('span'); label.className='file-ext'; label.textContent=item.local?item.format:'Local file missing'; box.append(label);}
+ else box.innerHTML=artwork(item.scene);
+ if(item.duration&&!large){const label=document.createElement('span');label.className='media-label';label.textContent=item.format+' '+item.duration;box.append(label);}
+ return box;
+}
+function statusNode(item){const span=document.createElement('span');span.className='state '+item.status;span.textContent=labels[item.status];return span;}
+function filtered(){const query=byId('search').value.trim().toLowerCase();const status=byId('status').value;const date=byId('date').value;let result=records.filter(item=>(state.type==='all'||item.type===state.type)&&(status==='all'||item.status===status)&&(date==='all'||item.date===date)&&[item.name,item.format,item.url??''].some(value=>value.toLowerCase().includes(query)));const sort=byId('sort').value;if(sort==='oldest')result.reverse();else if(sort==='name')result.sort((a,b)=>a.name.localeCompare(b.name));return result;}
+function selectItem(id){state.selected=id;render();}
+function renderEntry(item){
+ const entry=document.createElement('article');entry.className='entry'+(state.selected===item.id?' current':'');entry.setAttribute('role','listitem');entry.tabIndex=0;entry.setAttribute('aria-label',item.name+', '+labels[item.status]);
+ const check=document.createElement('input');check.type='checkbox';check.className='check';check.checked=state.checked.has(item.id);check.setAttribute('aria-label','Select '+item.name);check.addEventListener('click',event=>event.stopPropagation());check.addEventListener('change',()=>{if(check.checked)state.checked.add(item.id);else state.checked.delete(item.id);state.selected=item.id;render();});entry.append(check,thumb(item));
+ const body=document.createElement('div');body.className='entry-body';const filename=document.createElement('div');filename.className='filename';filename.textContent=item.name;filename.title=item.name;body.append(filename);
+ if(state.view==='gallery'){const meta=document.createElement('div');meta.className='entry-meta';meta.append(statusNode(item));const size=document.createElement('span');size.className='size';size.textContent=item.size;meta.append(size);body.append(meta);if(!item.local){const missing=document.createElement('div');missing.className='local-missing';missing.textContent='Local file missing';body.append(missing);}entry.append(body);}
+ else {const info=document.createElement('div');info.className='list-info';info.textContent=(item.date==='today'?'Today':'Yesterday')+' '+item.time+' · '+item.format+(item.local?'':' · Local missing');body.append(info);const status=document.createElement('div');status.className='list-status';status.append(statusNode(item));const size=document.createElement('div');size.className='list-size';size.textContent=item.size;entry.append(body,status,size);}
+ entry.addEventListener('click',()=>selectItem(item.id));entry.addEventListener('keydown',event=>{if(event.target!==entry)return;if(event.key==='Enter'||event.key===' '){event.preventDefault();selectItem(item.id);}});return entry;
+}
+function actionButton(label,enabled,primary=false){const button=document.createElement('button');button.type='button';button.textContent=label;button.disabled=!enabled;if(primary)button.className='primary';button.addEventListener('click',()=>{byId('message').textContent='Layout preview: '+label+' applies to the selected item in VectrCap.';});return button;}
+function renderInspector(item){const inspector=byId('inspector');inspector.replaceChildren();if(!item){const note=document.createElement('div');note.className='note';note.textContent='Select a capture or file to see its preview and actions.';inspector.append(note);return;}
+ const heading=document.createElement('div');heading.className='inspector-heading';heading.textContent='Preview & details';const name=document.createElement('div');name.className='detail-name';name.textContent=item.name;const sub=document.createElement('div');sub.className='detail-sub';sub.textContent=(item.date==='today'?'14 November':'13 November')+' 2026, '+item.time+' · '+item.format;const states=document.createElement('div');states.className='detail-states';states.append(statusNode(item));const availability=document.createElement('span');availability.className='availability'+(item.local?'':' missing');availability.textContent=item.local?'Local file available':'Local file missing';states.append(availability);inspector.append(heading,thumb(item,true),name,sub,states);
+ const link=document.createElement('div');link.className='link';link.textContent=item.url?item.url:'No share link yet';const actions=document.createElement('div');actions.className='actions';actions.append(actionButton(item.status==='failed'?'Retry upload':'Copy link',item.status==='failed'||Boolean(item.url),true),actionButton('Open link',Boolean(item.url)));const local=document.createElement('div');local.className='secondary-actions';local.append(actionButton('Open file',item.local),actionButton('Show folder',item.local),actionButton('Edit image',item.local&&item.type==='image'),actionButton('Pin to screen',item.local&&item.type==='image'));const metadata=document.createElement('dl');metadata.className='metadata';for(const [label,value]of[['Size',item.size],['Dimensions',item.dimensions],['Duration',item.duration??'—']]){const dt=document.createElement('dt');dt.textContent=label;const dd=document.createElement('dd');dd.textContent=value;metadata.append(dt,dd);}inspector.append(link,actions,local,metadata);if(item.status==='failed'||!item.local){const note=document.createElement('p');note.className='note';note.textContent=item.status==='failed'?'Connection interrupted. Your local image is safe and ready to retry.':'The local file is no longer available. Its uploaded link can still be copied or opened.';inspector.append(note);}}
+function render(){const result=filtered();if(!result.some(item=>item.id===state.selected))state.selected=result[0]?.id??null;byId('items').className='items'+(state.view==='list'?' list':'');byId('items').replaceChildren(...result.map(renderEntry));if(!result.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='No matching items. Try another search or clear your filters.';byId('items').append(empty);}byId('count').textContent=result.length===records.length?records.length+' items':result.length+' of '+records.length+' items';byId('gallery').setAttribute('aria-pressed',String(state.view==='gallery'));byId('list').setAttribute('aria-pressed',String(state.view==='list'));byId('preview-toggle').setAttribute('aria-pressed',String(state.preview));byId('workspace').className='workspace'+(state.preview?'':' no-preview');document.querySelectorAll('[data-type]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.type===state.type)));renderInspector(records.find(item=>item.id===state.selected));const bulk=byId('bulk');bulk.replaceChildren();bulk.hidden=state.checked.size===0;byId('keyboard-hint').hidden=state.checked.size>0;if(state.checked.size){const label=document.createElement('span');label.textContent=state.checked.size+' selected';bulk.append(label,actionButton('Copy links',true),actionButton('Clear selection',true));bulk.lastElementChild.addEventListener('click',()=>{state.checked.clear();render();});}}
+byId('gallery').addEventListener('click',()=>{state.view='gallery';render();});byId('list').addEventListener('click',()=>{state.view='list';render();});byId('preview-toggle').addEventListener('click',()=>{state.preview=!state.preview;render();});for(const id of['search','status','date','sort'])byId(id).addEventListener(id==='search'?'input':'change',render);document.querySelectorAll('[data-type]').forEach(button=>button.addEventListener('click',()=>{state.type=button.dataset.type;render();}));document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='f'){event.preventDefault();byId('search').focus();}});render();
+</script>
+</body>
+</html>
