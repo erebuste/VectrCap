@@ -1,8 +1,8 @@
 # Unified History concept
 
-Date: 2026-11-14. Status: proposed layout for owner review, not an implemented native application.
+Date: 2026-11-14. Status: layout approved by the owner on 2026-11-14; the native application has not been implemented.
 
-The owner requested one History window instead of separate History/Image history windows, and selected a compact dark desktop utility direction. The interactive HTML concept demonstrates Gallery/List switching, shared filters/search, selection, a collapsible preview/details pane, generic file cards, separate local availability and upload state, and checkbox selection.
+The owner requested one History window instead of separate History/Image history windows, and approved the compact dark desktop utility layout. Gallery and List share records, search, filters, and selection; the native app will remember the preferred view and preview-pane visibility between launches. The interactive HTML concept demonstrates Gallery/List switching, shared filters/search, selection, a collapsible preview/details pane, generic file cards, separate local availability and upload state, and checkbox selection.
 
 All nine records and miniature captured-content illustrations are sample data. Desktop file/link/edit/pin/retry buttons describe their intended application actions when clicked; they do not access files, upload, open a browser, or alter the clipboard. The app implementation will remain Rust/egui; this HTML is a throwaway design artifact.
 
