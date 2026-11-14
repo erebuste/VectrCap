@@ -7,11 +7,16 @@ use super::{
     destinations::{DestinationId, DestinationSelection, DestinationSnapshot, resolve_destination},
     error::AppError,
     events::*,
+    notifications::{
+        CompletionNotice, CompletionStatus, JobCompletion, NoticeView, NotificationCenter,
+        RequestedCompletionAction,
+    },
+    types::{Artifact, ArtifactKind},
 };
 use crate::{
     persistence::{
         artifacts::ArtifactStore,
-        history::History,
+        history::{History, JobStatus, UploadJob},
         settings::{ServerOrigin, Settings},
     },
     platform::CredentialStore,
@@ -57,6 +62,36 @@ impl DestinationReferences for References {
         Ok(())
     }
 }
+/// One visible completion notice paired with its currently offered actions.
+pub struct NoticeDisplay {
+    pub view: NoticeView,
+    pub actions: Vec<RequestedCompletionAction>,
+}
+/// Fixed, non-exhaustive list of executable-shaped extensions; existing user
+/// files of this shape only ever offer reveal, never open/execute.
+const EXECUTABLE_EXTENSIONS: &[&str] = &[
+    "exe",
+    "bat",
+    "cmd",
+    "com",
+    "scr",
+    "msi",
+    "ps1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "msc",
+    "jar",
+    "reg",
+    "lnk",
+    "pif",
+    "gadget",
+    "application",
+    "hta",
+];
 pub struct AppController {
     manager: DestinationManager,
     history: Arc<History>,
@@ -64,6 +99,7 @@ pub struct AppController {
     artifacts: Arc<ArtifactStore>,
     references: Arc<References>,
     workflows: HashMap<Uuid, DestinationSnapshot>,
+    notifications: NotificationCenter,
     pub lifecycle: Lifecycle,
     pub window: Option<Window>,
 }
@@ -93,6 +129,7 @@ impl AppController {
             artifacts,
             references,
             workflows: HashMap::new(),
+            notifications: NotificationCenter::new(),
             lifecycle: Lifecycle::Running,
             window,
         })
@@ -102,6 +139,60 @@ impl AppController {
     }
     pub fn active_workflow_count(&self) -> usize {
         self.workflows.len()
+    }
+    pub fn visible_notices(&self) -> Vec<NoticeDisplay> {
+        self.notifications
+            .visible()
+            .into_iter()
+            .map(|view| {
+                let actions = self.notifications.actions(view.id()).unwrap_or_default();
+                NoticeDisplay { view, actions }
+            })
+            .collect()
+    }
+    pub fn notifications_enabled(&self) -> bool {
+        self.notifications.notifications_enabled()
+    }
+    /// Non-`ArtifactKind::File` artifacts are the app's own encoder output and
+    /// always safe; an existing user-selected file is reveal-only when its
+    /// name has an executable-shaped extension.
+    fn is_safe_to_open(artifact: &Artifact) -> bool {
+        if artifact.kind != ArtifactKind::File {
+            return true;
+        }
+        let Some(extension) = std::path::Path::new(&artifact.display_name)
+            .extension()
+            .and_then(|e| e.to_str())
+        else {
+            return true;
+        };
+        !EXECUTABLE_EXTENSIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(extension))
+    }
+    fn completion_for(&self, job: &UploadJob) -> Result<Option<CompletionNotice>, AppError> {
+        let local_available = job.artifact.path.exists();
+        let safe_to_open = Self::is_safe_to_open(&job.artifact);
+        let notice = match &job.status {
+            JobStatus::Completed(receipt) => Some(CompletionNotice::Job(JobCompletion::try_new(
+                job.id,
+                &job.artifact.display_name,
+                local_available,
+                safe_to_open,
+                Some(receipt.clone()),
+                CompletionStatus::uploaded(),
+            )?)),
+            JobStatus::Failed { code } => Some(CompletionNotice::Job(JobCompletion::try_new(
+                job.id,
+                &job.artifact.display_name,
+                local_available,
+                safe_to_open,
+                None,
+                CompletionStatus::failed(code)?,
+            )?)),
+            _ => None,
+        };
+        Ok(notice)
     }
     pub fn dispatch(&mut self, command: AppCommand) -> Vec<AppEffect> {
         if matches!(command, AppCommand::Quit) && self.lifecycle != Lifecycle::Running {
@@ -271,6 +362,24 @@ impl AppController {
             }
             AppEvent::Queue(crate::vectr::queue::QueueEffect::Error(error)) => {
                 vec![AppEffect::Error(error), AppEffect::RefreshQueue]
+            }
+            AppEvent::Queue(crate::vectr::queue::QueueEffect::Changed(id)) => {
+                let mut effects = vec![];
+                if let Ok(Some(job)) = self.history.job(id) {
+                    match self.completion_for(&job) {
+                        Ok(Some(notice)) => match self.notifications.record(notice) {
+                            Ok(_) => {}
+                            // An already-visible duplicate for this job is
+                            // expected and benign; any other failure is real.
+                            Err(AppError::InvalidInput(_)) => {}
+                            Err(error) => effects.push(AppEffect::Error(error)),
+                        },
+                        Ok(None) => {}
+                        Err(error) => effects.push(AppEffect::Error(error)),
+                    }
+                }
+                effects.push(AppEffect::RefreshQueue);
+                effects
             }
             AppEvent::Queue(_) => vec![AppEffect::RefreshQueue],
             AppEvent::ConnectionTest { request, result }
