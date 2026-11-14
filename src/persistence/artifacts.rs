@@ -220,14 +220,6 @@ impl ArtifactStore {
         let file = tmp
             .persist_noclobber(&path)
             .map_err(|e| AppError::io(STAGE, &e.error))?;
-        let mut perms = file
-            .metadata()
-            .map_err(|e| AppError::io(STAGE, &e))?
-            .permissions();
-        perms.set_readonly(true);
-        file.set_permissions(perms)
-            .map_err(|e| AppError::io(STAGE, &e))?;
-        drop(file);
         let artifact = Artifact {
             id,
             path,
@@ -236,8 +228,70 @@ impl ArtifactStore {
             size,
             sha256,
         };
-        self.verify(&artifact)?;
+        let permissions: Result<(), AppError> = (|| {
+            let mut perms = file
+                .metadata()
+                .map_err(|e| AppError::io(STAGE, &e))?
+                .permissions();
+            perms.set_readonly(true);
+            file.set_permissions(perms)
+                .map_err(|e| AppError::io(STAGE, &e))
+        })();
+        drop(file);
+        if let Err(error) = permissions {
+            self.discard_staged(&artifact)?;
+            return Err(error);
+        }
+        hook("stage.finalized");
+        if let Err(error) = self.verify_cancellable(&artifact, cancel) {
+            self.discard_staged(&artifact)?;
+            return Err(error);
+        }
         Ok(artifact)
+    }
+
+    fn verify_cancellable(
+        &self,
+        artifact: &Artifact,
+        cancel: &CancellationToken,
+    ) -> Result<(), AppError> {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        if artifact.path != self.spool_path(artifact.id) {
+            return Err(AppError::ArtifactChanged);
+        }
+        let mut file = winfs::open_read_exclusive(&artifact.path)
+            .map_err(|e| AppError::io("verifying staged file", &e))?;
+        if file
+            .metadata()
+            .map_err(|e| AppError::io("verifying staged file", &e))?
+            .len()
+            != artifact.size
+        {
+            return Err(AppError::ArtifactChanged);
+        }
+        let Some((size, hash)) =
+            copy_hashing_checked(&mut file, &mut io::sink(), artifact.size, &|| {
+                cancel.is_cancelled()
+            })
+            .map_err(|e| AppError::io("verifying staged file", &e))?
+        else {
+            return Err(AppError::Cancelled);
+        };
+        if size != artifact.size || hash != artifact.sha256 {
+            return Err(AppError::ArtifactChanged);
+        }
+        Ok(())
+    }
+    /// Caller must prove no durable record references this newly staged ID.
+    pub(crate) fn discard_staged(&self, artifact: &Artifact) -> Result<(), AppError> {
+        if artifact.path != self.spool_path(artifact.id) {
+            return Err(AppError::InvalidInput("not an owned staging path"));
+        }
+        let file = winfs::open_owned_by_path(&artifact.path)
+            .map_err(|e| AppError::io("rolling back staged file", &e))?;
+        winfs::delete_by_handle(&file).map_err(|e| AppError::io("rolling back staged file", &e))
     }
 
     fn spool_path(&self, id: ArtifactId) -> PathBuf {
@@ -447,6 +501,24 @@ mod tests {
         (dir, store)
     }
 
+    #[test]
+    fn cancellation_after_finalize_removes_the_unadmitted_spool() {
+        let (dir, store) = fixture();
+        let source = dir.path().join("source.txt");
+        fs::write(&source, b"synthetic").unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        set_hook(move |point| {
+            if point == "stage.finalized" {
+                trigger.cancel();
+            }
+        });
+        let outcome = store.stage_file_cancellable(&source, ArtifactKind::File, &cancel);
+        clear_hook();
+        assert!(matches!(outcome, Err(AppError::Cancelled)));
+        assert!(spool_is_empty(&store));
+        assert_eq!(fs::read(source).unwrap(), b"synthetic");
+    }
     fn spool_is_empty(store: &ArtifactStore) -> bool {
         fs::read_dir(store.root())
             .map(|mut entries| entries.next().is_none())

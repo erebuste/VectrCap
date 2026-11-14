@@ -75,6 +75,14 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 impl History {
+    pub(crate) fn artifact_is_recorded(&self, id: ArtifactId) -> Result<bool, AppError> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE id=?1)",
+            [id.0.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn browse(&self, q: &HistoryQuery) -> Result<HistoryPage, AppError> {
         if q.search.len() > 256
             || q.search.chars().any(char::is_control)

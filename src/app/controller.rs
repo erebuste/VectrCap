@@ -120,6 +120,7 @@ struct FileBatch {
     /// in `workflows` is released once this reaches zero, independent of
     /// whether any created jobs have finished uploading yet.
     staging_remaining: usize,
+    staging_done: Vec<bool>,
     /// Created jobs not yet in a terminal state for notification purposes.
     jobs_remaining: usize,
     /// One slot per originally selected path, in picker order; filled in as
@@ -406,7 +407,7 @@ impl AppController {
         if paths.is_empty() || paths.len() > super::notifications::MAX_BATCH_ITEMS {
             return Err(AppError::InvalidInput("select 1 to 100 files to upload"));
         }
-        if self.workflows.len() >= 32 {
+        if self.workflows.len() >= 32 || self.batches.len() >= 32 {
             return Err(AppError::InvalidInput(
                 "too many concurrent uploads accepted",
             ));
@@ -424,6 +425,7 @@ impl AppController {
             batch,
             FileBatch {
                 staging_remaining: paths.len(),
+                staging_done: vec![false; paths.len()],
                 jobs_remaining: 0,
                 completions: vec![None; paths.len()],
             },
@@ -469,11 +471,42 @@ impl AppController {
         display_name: String,
         outcome: Result<Artifact, AppError>,
     ) -> Vec<AppEffect> {
+        let valid = self
+            .batches
+            .get_mut(&batch)
+            .and_then(|state| state.staging_done.get_mut(index))
+            .is_some_and(|done| {
+                if *done {
+                    false
+                } else {
+                    *done = true;
+                    true
+                }
+            });
+        if !valid {
+            let mut effects = vec![AppEffect::Error(AppError::InvalidInput(
+                "unknown or duplicate staging result",
+            ))];
+            if let Ok(artifact) = outcome
+                && let Err(error) = self.rollback_staged(&artifact)
+            {
+                effects.push(AppEffect::Error(error));
+            }
+            return effects;
+        }
         let mut effects = Vec::new();
         match outcome {
             Ok(artifact) => match self.accept_batch_artifact(batch, index, &artifact) {
                 Ok(job_effects) => effects.extend(job_effects),
-                Err(error) => effects.push(AppEffect::Error(error)),
+                Err(error) => {
+                    effects.push(AppEffect::FileRejected {
+                        display_name,
+                        error,
+                    });
+                    if let Err(error) = self.rollback_staged(&artifact) {
+                        effects.push(AppEffect::Error(error));
+                    }
+                }
             },
             Err(error) => effects.push(AppEffect::FileRejected {
                 display_name,
@@ -493,6 +526,12 @@ impl AppController {
         }
         self.maybe_flush_batch(batch, &mut effects);
         effects
+    }
+    fn rollback_staged(&self, artifact: &Artifact) -> Result<(), AppError> {
+        if !self.history.artifact_is_recorded(artifact.id)? {
+            self.artifacts.discard_staged(artifact)?;
+        }
+        Ok(())
     }
     /// Removes `job` from its batch's pending count (if any) and, once
     /// staging and every created job have resolved, emits one grouped

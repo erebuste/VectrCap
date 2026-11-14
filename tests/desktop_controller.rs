@@ -911,3 +911,48 @@ async fn oversized_staging_backlog_gets_explicit_busy_feedback_without_losing_an
     runtime.client.submit(AppCommand::Quit).unwrap();
     wait(&runtime.client, &rx, |s| s.lifecycle == Lifecycle::Exited);
 }
+
+#[test]
+fn failed_file_admission_rolls_back_only_its_unregistered_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store);
+    seed(
+        &mut app,
+        "Original",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-token",
+    );
+    let source = dir.path().join("reject.txt");
+    std::fs::write(&source, b"synthetic").unwrap();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(vec![source.clone()]));
+    let batch = effects
+        .into_iter()
+        .find_map(|e| {
+            if let AppEffect::StageFiles { batch, .. } = e {
+                Some(batch)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let artifacts = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let artifact = artifacts.stage_file(&source, ArtifactKind::File).unwrap();
+    let path = artifact.path.clone();
+    let mut settings = app.settings().clone();
+    settings.revision += 1;
+    settings.save(&dir.path().join("settings.json")).unwrap();
+    let effects = app.on_event(AppEvent::FileStaged {
+        batch,
+        index: 0,
+        display_name: "reject.txt".into(),
+        outcome: Ok(artifact),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::FileRejected { .. }))
+    );
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(source).unwrap(), b"synthetic");
+}
