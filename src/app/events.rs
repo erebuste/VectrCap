@@ -30,7 +30,21 @@ pub enum Lifecycle {
     Exited,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAction {
+    OpenLocal,
+    ShowFolder,
+    OpenLink,
+    CopyLinks,
+    RetryFailed,
+    Remove,
+}
 pub enum AppCommand {
+    SetHistoryPreferences(crate::persistence::settings::HistoryPreferences),
+    HistoryAction {
+        ids: Vec<Uuid>,
+        action: HistoryAction,
+    },
     Show(Window),
     CloseWindow,
     QueryHistory(crate::persistence::history::browser::HistoryQuery),
@@ -112,6 +126,11 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    LocalHistoryAction(super::local_actions::LocalHistoryAction),
+    HistoryRetryReport {
+        queued: usize,
+        skipped: usize,
+    },
     Window(Option<Window>),
     SettingsSaved(Settings),
     ConnectionSaved {

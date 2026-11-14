@@ -17,7 +17,7 @@ fn seeded() -> (tempfile::TempDir, History, Vec<Uuid>) {
         let name = if i == 0 {
             "literal %_' OR 1=1 --.png".to_owned()
         } else {
-            format!("capture-{i}.png")
+            format!("capture-{i}.{}", if i % 2 == 0 { "png" } else { "txt" })
         };
         tx.execute(
             "INSERT INTO artifacts VALUES (?1,?2,?3,?4,0,zeroblob(32),100)",
@@ -52,10 +52,7 @@ fn pages_are_bounded_and_tie_stable_with_no_duplicates() {
             break;
         }
         let last = page.records.last().unwrap();
-        query.after = Some(HistoryCursor {
-            created_ms: last.created_ms,
-            id: last.id,
-        });
+        query.after = Some(HistoryCursor::at(last));
     }
     assert_eq!(seen, expected);
 }
@@ -108,4 +105,154 @@ fn invalid_queries_and_missing_favorites_fail_closed() {
     }
     assert!(history.set_favorite(Uuid::new_v4(), true).is_err());
     assert!(history.set_favorite(Uuid::nil(), true).is_err());
+}
+
+#[test]
+fn every_sort_pages_stably_and_date_status_filters_share_the_collection() {
+    let (_dir, history, _) = seeded();
+    for sort in [
+        HistorySort::Newest,
+        HistorySort::Oldest,
+        HistorySort::Name,
+        HistorySort::Size,
+    ] {
+        let mut q = HistoryQuery {
+            sort,
+            ..Default::default()
+        };
+        let mut records = vec![];
+        loop {
+            let page = history.browse(&q).unwrap();
+            records.extend(page.records.iter().cloned());
+            if !page.has_more {
+                break;
+            }
+            q.after = Some(HistoryCursor::at(page.records.last().unwrap()));
+        }
+        assert_eq!(records.len(), 107);
+        let unique: std::collections::HashSet<_> = records.iter().map(|r| r.id).collect();
+        assert_eq!(unique.len(), 107);
+        for pair in records.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            match sort {
+                HistorySort::Newest => {
+                    assert!((a.created_ms, a.id.to_string()) > (b.created_ms, b.id.to_string()))
+                }
+                HistorySort::Oldest => {
+                    assert!((a.created_ms, a.id.to_string()) < (b.created_ms, b.id.to_string()))
+                }
+                HistorySort::Name => assert!(
+                    (a.name.to_ascii_lowercase(), a.id.to_string())
+                        < (b.name.to_ascii_lowercase(), b.id.to_string())
+                ),
+                HistorySort::Size => {
+                    assert!((a.size, a.id.to_string()) > (b.size, b.id.to_string()))
+                }
+            }
+        }
+    }
+    assert!(
+        history
+            .browse(&HistoryQuery {
+                since_ms: Some(101),
+                ..Default::default()
+            })
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(
+        history
+            .browse(&HistoryQuery {
+                until_ms: Some(99),
+                ..Default::default()
+            })
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(
+        !history
+            .browse(&HistoryQuery {
+                since_ms: Some(100),
+                until_ms: Some(100),
+                status: HistoryStatus::LocalOnly,
+                ..Default::default()
+            })
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(
+        history
+            .browse(&HistoryQuery {
+                status: HistoryStatus::Uploaded,
+                ..Default::default()
+            })
+            .unwrap()
+            .records
+            .is_empty()
+    );
+    assert!(
+        history
+            .browse(&HistoryQuery {
+                since_ms: Some(101),
+                until_ms: Some(100),
+                ..Default::default()
+            })
+            .is_err()
+    );
+}
+#[test]
+fn removing_local_only_history_does_not_delete_artifacts_or_files() {
+    let (dir, history, ids) = seeded();
+    history.set_favorite(ids[0], true).unwrap();
+    history.remove_history(&[ids[0], ids[1]]).unwrap();
+    assert!(history.history_record(ids[0]).unwrap().is_none());
+    let conn = Connection::open(dir.path().join("history.db")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM artifacts", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        107
+    );
+    assert!(history.remove_history(&[ids[2], Uuid::new_v4()]).is_err());
+    assert!(history.history_record(ids[2]).unwrap().is_some());
+}
+#[test]
+fn legacy_view_preferences_default_to_gallery_with_preview() {
+    use vectrcap::persistence::settings::{HistoryLayout, Settings};
+    let mut value = serde_json::to_value(Settings::default()).unwrap();
+    value.as_object_mut().unwrap().remove("history");
+    let settings: Settings = serde_json::from_value(value).unwrap();
+    assert_eq!(settings.history.layout, HistoryLayout::Gallery);
+    assert!(settings.history.preview);
+}
+#[test]
+fn date_inputs_are_inclusive_and_reject_reversed_or_malformed_ranges() {
+    use vectrcap::ui::history::date_range;
+    let (a, b) = date_range("2026-11-14", "2026-11-14").unwrap();
+    assert!(b.unwrap() > a.unwrap());
+    assert!(date_range("2026-11-15", "2026-11-14").is_err());
+    assert!(date_range("bad", "").is_err());
+    assert_eq!(date_range("", "").unwrap(), (None, None));
+}
+
+#[test]
+fn imported_image_classification_does_not_change_file_ownership() {
+    let (dir, history, ids) = seeded();
+    let conn = Connection::open(dir.path().join("history.db")).unwrap();
+    conn.execute("UPDATE artifacts SET display_name='Imported.PNG' WHERE id=(SELECT artifact_id FROM history_items WHERE id=?1)",[ids[1].to_string()]).unwrap();
+    let rows = history
+        .browse(&HistoryQuery {
+            kind: HistoryType::Images,
+            search: "Imported".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .records;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].artifact.kind,
+        vectrcap::app::types::ArtifactKind::File
+    );
 }

@@ -30,6 +30,7 @@ pub enum QueueCommand {
     PauseAll,
     ResumeAll,
     RetryEligible,
+    RetryJobs(Vec<JobId>),
     Cancel(JobId),
     Restart(JobId),
     Settled {
@@ -148,6 +149,9 @@ impl QueueController {
                 for stats in self.stats.values_mut() {
                     stats.pause();
                 }
+            }
+            QueueCommand::RetryJobs(ids) => {
+                self.history.retry_selected_uploads(&ids)?;
             }
             QueueCommand::RetryEligible => {
                 self.history.retry_eligible_uploads()?;

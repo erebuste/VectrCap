@@ -385,7 +385,7 @@ impl History {
         let now = now_ms();
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_artifact(&tx, artifact, now)?;
+        insert_artifact(&tx, artifact, now, true)?;
         let ordinal = next_upload_ordinal(&tx)?;
         tx.execute(
             "INSERT INTO jobs (id, artifact_id, dest_id, dest_label, dest_origin, dest_credential_generation, \
@@ -718,7 +718,7 @@ impl History {
         };
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_artifact(&tx, artifact, created_ms)?;
+        insert_artifact(&tx, artifact, created_ms, false)?;
         tx.execute(
             "INSERT INTO archive_entries (id, artifact_id, root, path, origin, size, sha256, \
              root_identity, file_identity, created_ms) \
@@ -1108,7 +1108,12 @@ fn next_upload_ordinal(tx: &Transaction<'_>) -> Result<i64, AppError> {
 
 /// Inserts the artifact and its single history item if they are new; an
 /// existing record must describe the same bytes.
-fn insert_artifact(tx: &Transaction<'_>, a: &Artifact, now: i64) -> Result<(), AppError> {
+fn insert_artifact(
+    tx: &Transaction<'_>,
+    a: &Artifact,
+    now: i64,
+    restore_history: bool,
+) -> Result<(), AppError> {
     let path = a.path.to_str().ok_or(AppError::InvalidInput(
         "artifact path must be valid Unicode",
     ))?;
@@ -1122,6 +1127,7 @@ fn insert_artifact(tx: &Transaction<'_>, a: &Artifact, now: i64) -> Result<(), A
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
+    let new_artifact = existing.is_none();
     match existing {
         Some((p, s, h)) if p == path && s == size && h == a.sha256 => {}
         Some(_) => {
@@ -1143,11 +1149,10 @@ fn insert_artifact(tx: &Transaction<'_>, a: &Artifact, now: i64) -> Result<(), A
                     now
                 ],
             )?;
-            tx.execute(
-                "INSERT INTO history_items (id, artifact_id, created_ms) VALUES (?1, ?2, ?3)",
-                params![Uuid::new_v4().to_string(), id, now],
-            )?;
         }
+    }
+    if new_artifact || restore_history {
+        tx.execute("INSERT INTO history_items(id,artifact_id,created_ms) SELECT ?1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM history_items WHERE artifact_id=?2)",params![Uuid::new_v4().to_string(),id,now])?;
     }
     Ok(())
 }
@@ -1426,5 +1431,42 @@ mod tests {
         let plan = plan.join(" | ");
         assert!(plan.contains("archive_live_auto"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+}
+
+#[cfg(test)]
+mod history_removal_tests {
+    use super::*;
+    #[test]
+    fn retention_registration_does_not_resurrect_removed_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::open(&dir.path().join("history.db")).unwrap();
+        let mut conn = history.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        let artifact = Artifact {
+            id: ArtifactId(Uuid::new_v4()),
+            path: dir.path().join("synthetic.spool"),
+            display_name: "synthetic.png".into(),
+            kind: ArtifactKind::Screenshot,
+            size: 0,
+            sha256: [0; 32],
+        };
+        insert_artifact(&tx, &artifact, 1, false).unwrap();
+        tx.execute("DELETE FROM history_items", []).unwrap();
+        insert_artifact(&tx, &artifact, 2, false).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM history_items", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        insert_artifact(&tx, &artifact, 3, true).unwrap();
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM history_items", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        tx.commit().unwrap();
     }
 }

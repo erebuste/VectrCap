@@ -32,6 +32,7 @@ pub struct DesktopView {
     pub lifecycle: Lifecycle,
     pub exit_requested: bool,
     pub jobs: Vec<UploadJob>,
+    pub history_retry_report: Option<(usize, usize)>,
     pub history_query: crate::persistence::history::browser::HistoryQuery,
     pub history_page: crate::persistence::history::browser::HistoryPage,
     pub batch_summary: Vec<super::controller::BatchSummaryRow>,
@@ -60,6 +61,7 @@ impl Default for DesktopView {
             batch_summary: vec![],
             history_page: Default::default(),
             history_query: Default::default(),
+            history_retry_report: None,
             transfers: HashMap::new(),
             queue_paused: false,
             error: None,
@@ -176,11 +178,25 @@ struct Effects {
     queue: Option<mpsc::Sender<QueueCommand>>,
     metadata: Option<ConnectionTask>,
     state: DesktopView,
+    local_actions: tokio::task::JoinSet<Result<(), AppError>>,
+    local_cancel: CancellationToken,
 }
 impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::LocalHistoryAction(task) => {
+                    if self.local_actions.len() >= 4 {
+                        self.state.error =
+                            Some(AppError::InUse("local actions are busy; try again"));
+                    } else {
+                        let cancel = self.local_cancel.clone();
+                        self.local_actions.spawn_blocking(move || task.run(cancel));
+                    }
+                }
+                AppEffect::HistoryRetryReport { queued, skipped } => {
+                    self.state.history_retry_report = Some((queued, skipped))
+                }
                 AppEffect::Window(window) => {
                     self.state.window = window;
                     self.state.focus_revision += 1;
@@ -244,6 +260,7 @@ impl Effects {
                 }
                 AppEffect::Error(error) => self.state.error = Some(error),
                 AppEffect::DrainWorker => {
+                    self.local_cancel.cancel();
                     self.state.exit_requested = true;
                     self.state.lifecycle = Lifecycle::Draining;
                     // Closing the sole command sender invokes the approved driver's
@@ -306,6 +323,8 @@ async fn serve(
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
     let mut effects = Effects {
+        local_actions: tokio::task::JoinSet::new(),
+        local_cancel: CancellationToken::new(),
         queue: Some(queue_tx),
         metadata: None,
         state: DesktopView {
@@ -323,6 +342,9 @@ async fn serve(
     let mut driver_consumed = false;
     let outcome = loop {
         let results = tokio::select! {
+            result = effects.local_actions.join_next(), if !effects.local_actions.is_empty() => {
+                match result {Some(Ok(Ok(())))=>vec![],Some(Ok(Err(AppError::Cancelled)))=>vec![],Some(Ok(Err(error)))=>vec![AppEffect::Error(error)],_=>vec![AppEffect::Error(AppError::Persistence("local action worker failed"))]}
+            }
             _ = stop.cancelled(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::Quit),
             command = commands.recv(), if controller.lifecycle == Lifecycle::Running => {
                 effects.state.error = None;
@@ -374,6 +396,8 @@ async fn serve(
     };
     // Even a snapshot/read failure must close and drain, not detach the driver
     // and let runtime teardown abort a request with an unrecorded outcome.
+    effects.local_cancel.cancel();
+    while effects.local_actions.join_next().await.is_some() {}
     effects.queue.take();
     if let Some(task) = effects.metadata.take() {
         task.abort();

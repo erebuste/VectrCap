@@ -82,6 +82,9 @@ impl eframe::App for Shell {
             }
             if self.current_window != self.view.window {
                 self.pane.clear(ctx);
+                if self.view.window != Some(Window::History) {
+                    self.history.suspend();
+                }
                 if self.view.window == Some(Window::Settings) {
                     self.pane.opened(settings);
                 }

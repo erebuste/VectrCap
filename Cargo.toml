@@ -9,6 +9,7 @@ publish = false
 
 # Native shell; capture, file ingress and History UI remain separate slices.
 [dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "7.0.0"
 rusqlite = { version = "0.42.0", features = ["bundled"] }
@@ -39,6 +40,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 # Already in the tree via dirs/tempfile. Handle-based file operations: directory-relative
 # NtCreateFile opens, rename/delete/identity by handle, final-path checks, free space.
 [target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_Graphics_Gdi"] }
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -47,6 +49,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Com",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Memory",
     "Win32_Security_Authorization",

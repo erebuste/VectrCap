@@ -9,6 +9,9 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 
 pub trait ShellActions: Send + Sync {
     fn open_path(&self, path: &Path) -> Result<(), AppError>;
+    fn open_document(&self, path: &Path, _extension: &str) -> Result<(), AppError> {
+        self.open_path(path)
+    }
     fn open_url(&self, url: &str) -> Result<(), AppError>;
     fn reveal_path(&self, path: &Path) -> Result<(), AppError>;
 }
@@ -79,6 +82,55 @@ fn execute(file: &[u16], parameters: Option<&[u16]>) -> Result<(), AppError> {
 }
 
 impl ShellActions for WindowsShellActions {
+    #[allow(unsafe_code)]
+    fn open_document(&self, path: &Path, extension: &str) -> Result<(), AppError> {
+        if ![
+            "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "mp4", "webm", "mov", "mkv",
+            "avi", "pdf", "txt", "md", "csv", "log", "json", "xml", "rtf", "wav", "mp3", "zip",
+        ]
+        .contains(&extension)
+            || !path.is_absolute()
+            || extension.is_empty()
+            || !extension.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(AppError::InvalidInput("invalid document target"));
+        }
+        use windows_sys::Win32::{
+            System::Com::{
+                COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+            },
+            UI::Shell::{
+                SEE_MASK_CLASSNAME, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+                ShellExecuteExW,
+            },
+        };
+        let file = wide_os(path.as_os_str());
+        let class = wide(&format!(".{extension}"));
+        let operation = wide("open");
+        unsafe {
+            let initialized = CoInitializeEx(
+                std::ptr::null(),
+                (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+            );
+            if initialized < 0 {
+                return Err(error());
+            }
+            let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+            info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+            info.fMask = SEE_MASK_CLASSNAME | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+            info.lpFile = file.as_ptr();
+            info.lpClass = class.as_ptr();
+            info.lpVerb = operation.as_ptr();
+            info.nShow = SW_SHOWNORMAL;
+            let ok = ShellExecuteExW(&mut info) != 0;
+            CoUninitialize();
+            if !ok {
+                return Err(error());
+            }
+        }
+        Ok(())
+    }
+
     fn open_path(&self, path: &Path) -> Result<(), AppError> {
         execute(&wide_os(path.as_os_str()), None)
     }
@@ -107,6 +159,23 @@ mod tests {
         // ShellExecute returns before the viewer reads the file. Keep the
         // fixture alive long enough for the manual native observation.
         std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+    #[test]
+    #[ignore = "opens a real viewer for a finalized spool file"]
+    fn opens_spool_with_explicit_document_class() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vectrcap-native-document.spool");
+        std::fs::write(&path, "VectrCap verified spool association.").unwrap();
+        WindowsShellActions.open_document(&path, "txt").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+    #[test]
+    fn executable_classes_are_rejected_before_shell_execution() {
+        assert!(
+            WindowsShellActions
+                .open_document(Path::new("C:\\synthetic.spool"), "exe")
+                .is_err()
+        );
     }
     #[test]
     fn explorer_path_is_absolute_and_not_a_bare_name() {

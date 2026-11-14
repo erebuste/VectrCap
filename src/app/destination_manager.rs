@@ -229,6 +229,25 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_history_preferences(
+        &mut self,
+        preferences: crate::persistence::settings::HistoryPreferences,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.history == preferences {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.history = preferences;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     /// Cooperating acceptance and edits share this leased revision boundary.
     pub fn ensure_revision(&self, expected_revision: u64) -> Result<(), AppError> {
         if expected_revision != self.settings.revision {

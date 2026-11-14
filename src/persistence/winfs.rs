@@ -542,3 +542,15 @@ mod tests {
         std::fs::write(path, b"other").unwrap();
     }
 }
+
+/// Open a regular descendant for reading without requesting delete access.
+pub(crate) fn open_child_read(parent: &File, name: &str) -> io::Result<File> {
+    regular(nt_open(
+        parent,
+        name,
+        FILE_GENERIC_READ,
+        FILE_SHARE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    )?)
+}

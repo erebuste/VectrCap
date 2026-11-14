@@ -4,3 +4,5 @@ pub mod credentials;
 pub mod instance;
 pub mod shell_actions;
 pub mod tray;
+
+pub mod poster;

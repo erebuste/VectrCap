@@ -8,3 +8,5 @@ pub mod error;
 pub mod events;
 pub mod notifications;
 pub mod types;
+
+pub mod local_actions;

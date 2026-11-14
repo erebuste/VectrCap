@@ -8,3 +8,5 @@ pub mod completion_notification;
 pub mod batch_summary;
 
 pub mod history;
+
+pub mod history_previews;

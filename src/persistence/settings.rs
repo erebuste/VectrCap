@@ -246,6 +246,27 @@ impl RecordingLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryLayout {
+    #[default]
+    Gallery,
+    List,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryPreferences {
+    pub layout: HistoryLayout,
+    pub preview: bool,
+}
+impl Default for HistoryPreferences {
+    fn default() -> Self {
+        Self {
+            layout: HistoryLayout::Gallery,
+            preview: true,
+        }
+    }
+}
+
 /// Local, versioned, secret-free settings. Tokens are never fields here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,6 +278,8 @@ pub struct Settings {
     /// Missing in older settings files: preserve the enabled default.
     #[serde(default = "notifications_default_enabled")]
     pub notifications_enabled: bool,
+    #[serde(default)]
+    pub history: HistoryPreferences,
     pub destinations: Destinations,
     pub archive: ArchivePolicy,
     pub filename: FilenamePreset,
@@ -273,6 +296,7 @@ impl Default for Settings {
             version: SETTINGS_VERSION,
             revision: 0,
             notifications_enabled: true,
+            history: HistoryPreferences::default(),
             destinations: Destinations::default(),
             archive: ArchivePolicy::default(),
             filename: FilenamePreset::default(),

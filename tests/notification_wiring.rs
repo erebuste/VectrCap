@@ -746,3 +746,325 @@ fn history_browser_searches_confirmed_links_and_preserves_controller_query() {
     assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
     assert!(app.history_query() == &query);
 }
+
+#[test]
+fn history_preferences_persist_and_failed_save_keeps_the_previous_value() {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    use vectrcap::persistence::settings::{HistoryLayout, HistoryPreferences};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, ..) = open(dir.path());
+    let desired = HistoryPreferences {
+        layout: HistoryLayout::List,
+        preview: false,
+    };
+    app.dispatch(AppCommand::SetHistoryPreferences(desired.clone()));
+    assert_eq!(app.settings().history, desired);
+    drop(app);
+    let (mut app, ..) = open(dir.path());
+    assert_eq!(app.settings().history, desired);
+    let revision = app.settings().revision;
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(dir.path().join("settings.json"))
+        .unwrap();
+    let effects = app.dispatch(AppCommand::SetHistoryPreferences(
+        HistoryPreferences::default(),
+    ));
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert_eq!(app.settings().history, desired);
+    assert_eq!(app.settings().revision, revision);
+    drop(held);
+}
+#[test]
+fn history_actions_resolve_current_records_and_never_upload_on_copy_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, shell, clipboard) = open(dir.path());
+    seed(&mut app);
+    let receipt = vectrcap::app::types::UploadReceipt::new(
+        "https://links.example/history-action",
+        "image.png",
+    )
+    .unwrap();
+    let job = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "image.png",
+        ArtifactKind::Screenshot,
+        Ok(receipt),
+    );
+    let row = app.history_page().unwrap().records.remove(0);
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::OpenLocal,
+    });
+    for effect in effects {
+        if let AppEffect::LocalHistoryAction(task) = effect {
+            task.run(tokio_util::sync::CancellationToken::new())
+                .unwrap();
+        }
+    }
+    assert_eq!(shell.opened.lock().unwrap().len(), 1);
+    *clipboard.fail.lock().unwrap() = true;
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::CopyLinks,
+    });
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert!(!effects.iter().any(|e| matches!(e, AppEffect::Queue(_))));
+    *clipboard.fail.lock().unwrap() = false;
+    std::fs::remove_file(&row.artifact.path).unwrap();
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::OpenLocal,
+    });
+    assert!(effects.into_iter().any(|e| {
+        match e {
+            AppEffect::LocalHistoryAction(task) => task
+                .run(tokio_util::sync::CancellationToken::new())
+                .is_err(),
+            _ => false,
+        }
+    }));
+    app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::CopyLinks,
+    });
+    assert_eq!(
+        clipboard.written.lock().unwrap().last().unwrap(),
+        "https://links.example/history-action"
+    );
+    app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::Remove,
+    });
+    assert!(history.job(job).unwrap().is_some());
+    assert!(history.history_record(row.id).unwrap().is_none());
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::CopyLinks,
+    });
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+}
+#[test]
+fn history_removal_is_atomic_and_retry_only_targets_selected_eligible_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let first = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "first.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let second = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "second.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let rows = app.history_page().unwrap().records;
+    let first_row = rows
+        .iter()
+        .find(|r| r.job.as_ref().unwrap().id == first)
+        .unwrap();
+    let second_row = rows
+        .iter()
+        .find(|r| r.job.as_ref().unwrap().id == second)
+        .unwrap();
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![first_row.id],
+        action: HistoryAction::RetryFailed,
+    });
+    let ids = effects
+        .into_iter()
+        .find_map(|e| {
+            if let AppEffect::Queue(QueueCommand::RetryJobs(ids)) = e {
+                Some(ids)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(ids, vec![first]);
+    history.retry_selected_uploads(&ids).unwrap();
+    assert_eq!(
+        history.job(first).unwrap().unwrap().status,
+        vectrcap::persistence::history::JobStatus::Pending
+    );
+    assert!(matches!(
+        history.job(second).unwrap().unwrap().status,
+        vectrcap::persistence::history::JobStatus::Failed { .. }
+    ));
+    history
+        .transition(second, vectrcap::persistence::history::JobStatus::Cancelled)
+        .unwrap();
+    assert!(
+        history
+            .remove_history(&[second_row.id, first_row.id])
+            .is_err()
+    );
+    assert!(history.history_record(second_row.id).unwrap().is_some());
+    assert!(second_row.artifact.path.exists());
+}
+
+#[test]
+fn a_new_upload_recreates_removed_history_without_restoring_its_favorite() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let id = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "reused.txt",
+        ArtifactKind::File,
+        Ok(
+            vectrcap::app::types::UploadReceipt::new("https://links.example/old", "reused.txt")
+                .unwrap(),
+        ),
+    );
+    let row = app.history_page().unwrap().records.remove(0);
+    history.set_favorite(row.id, true).unwrap();
+    history.remove_history(&[row.id]).unwrap();
+    let job = history.job(id).unwrap().unwrap();
+    history.create_job(&job.artifact, &job.destination).unwrap();
+    let row2 = app.history_page().unwrap().records.remove(0);
+    assert_ne!(row2.id, row.id);
+    assert!(!row2.favorite);
+    assert!(row2.artifact.path.exists());
+}
+#[test]
+fn history_status_filters_distinguish_failed_from_confirmed_uploads() {
+    use vectrcap::persistence::history::browser::*;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let uploaded = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "uploaded.txt",
+        ArtifactKind::File,
+        Ok(vectrcap::app::types::UploadReceipt::new(
+            "https://links.example/confirmed",
+            "uploaded.txt",
+        )
+        .unwrap()),
+    );
+    let failed = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "failed.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    for (status, id) in [
+        (HistoryStatus::Uploaded, uploaded),
+        (HistoryStatus::Failed, failed),
+    ] {
+        let rows = history
+            .browse(&HistoryQuery {
+                status,
+                ..Default::default()
+            })
+            .unwrap()
+            .records;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].job.as_ref().unwrap().id, id);
+    }
+}
+
+#[test]
+fn bulk_history_retry_skips_missing_sources_and_reports_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let valid = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "valid.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let missing = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "missing.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let rows = app.history_page().unwrap().records;
+    let valid_row = rows
+        .iter()
+        .find(|r| r.job.as_ref().unwrap().id == valid)
+        .unwrap();
+    let missing_row = rows
+        .iter()
+        .find(|r| r.job.as_ref().unwrap().id == missing)
+        .unwrap();
+    std::fs::remove_file(&missing_row.artifact.path).unwrap();
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![missing_row.id, valid_row.id],
+        action: HistoryAction::RetryFailed,
+    });
+    assert!(
+        effects.iter().any(
+            |e| matches!(e,AppEffect::Queue(QueueCommand::RetryJobs(ids)) if ids==&vec![valid])
+        )
+    );
+    assert!(effects.iter().any(|e| matches!(
+        e,
+        AppEffect::HistoryRetryReport {
+            queued: 1,
+            skipped: 1
+        }
+    )));
+}
+#[test]
+fn local_actions_are_deferred_cancellable_and_reject_removed_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, shell, _) = open(dir.path());
+    seed(&mut app);
+    accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "view.txt",
+        ArtifactKind::File,
+        Ok(
+            vectrcap::app::types::UploadReceipt::new("https://links.example/view", "view.txt")
+                .unwrap(),
+        ),
+    );
+    let row = app.history_page().unwrap().records.remove(0);
+    let effects = app.dispatch(AppCommand::HistoryAction {
+        ids: vec![row.id],
+        action: HistoryAction::OpenLocal,
+    });
+    assert!(shell.opened.lock().unwrap().is_empty());
+    let task = effects
+        .into_iter()
+        .find_map(|e| {
+            if let AppEffect::LocalHistoryAction(task) = e {
+                Some(task)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    history.remove_history(&[row.id]).unwrap();
+    assert!(
+        task.run(tokio_util::sync::CancellationToken::new())
+            .is_err()
+    );
+    assert!(shell.opened.lock().unwrap().is_empty());
+}

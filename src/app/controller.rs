@@ -183,7 +183,9 @@ impl AppController {
             .iter()
             .map(|id| {
                 let job = self.history.job(*id)?;
-                let local_available = job.as_ref().is_some_and(|j| j.artifact.path.is_file());
+                let local_available = job.as_ref().is_some_and(|j| {
+                    crate::persistence::history::browser::local_available_path(&j.artifact.path)
+                });
                 Ok(BatchSummaryRow {
                     id: *id,
                     job,
@@ -298,7 +300,10 @@ impl AppController {
         match &action {
             RequestedCompletionAction::OpenLocal(id) => {
                 let job = self.resolve_for_action(&action, *id)?;
-                self.shell.open_path(&job.artifact.path)?;
+                let extension = Self::viewer_extension(&job.artifact).ok_or(
+                    AppError::InvalidInput("this file can only be revealed in its folder"),
+                )?;
+                self.shell.open_document(&job.artifact.path, extension)?;
             }
             RequestedCompletionAction::ShowFolder(id) => {
                 let job = self.resolve_for_action(&action, *id)?;
@@ -397,8 +402,93 @@ impl AppController {
             .active = self.workflows.values().map(|s| s.id).collect();
         Ok(())
     }
+    fn history_action(
+        &mut self,
+        ids: Vec<Uuid>,
+        action: HistoryAction,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        use crate::persistence::history::browser::validate_selection;
+        validate_selection(&ids)?;
+        let rows = ids
+            .iter()
+            .map(|id| {
+                self.history
+                    .history_record(*id)?
+                    .ok_or(AppError::InvalidInput("history item no longer available"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match action {
+            HistoryAction::Remove => self.history.remove_history(&ids)?,
+            HistoryAction::RetryFailed => {
+                let jobs = self.history.retry_history_jobs(&ids)?;
+                if jobs.is_empty() {
+                    return Err(AppError::InvalidInput(
+                        "no eligible failed uploads selected",
+                    ));
+                }
+                let queued = jobs.len();
+                let skipped = ids.len() - queued;
+                return Ok(vec![
+                    AppEffect::Queue(crate::vectr::queue::QueueCommand::RetryJobs(jobs)),
+                    AppEffect::HistoryRetryReport { queued, skipped },
+                ]);
+            }
+            HistoryAction::CopyLinks => {
+                let links: Vec<_> = rows
+                    .iter()
+                    .filter_map(|r| r.job.as_ref())
+                    .filter_map(|j| {
+                        if let JobStatus::Completed(receipt) = &j.status {
+                            Some(receipt.url())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if links.is_empty() {
+                    return Err(AppError::InvalidInput("no confirmed links selected"));
+                }
+                self.clipboard.write_text(&links.join("\n"))?;
+            }
+            _ => {
+                if rows.len() != 1 {
+                    return Err(AppError::InvalidInput("select one item for this action"));
+                }
+                return Ok(vec![AppEffect::LocalHistoryAction(
+                    super::local_actions::LocalHistoryAction {
+                        id: ids[0],
+                        action,
+                        history: self.history.clone(),
+                        shell: self.shell.clone(),
+                    },
+                )]);
+            }
+        }
+        Ok(vec![])
+    }
+    pub fn viewer_extension(artifact: &Artifact) -> Option<&'static str> {
+        match artifact.kind {
+            ArtifactKind::Screenshot => Some("png"),
+            ArtifactKind::Gif => Some("gif"),
+            ArtifactKind::Mp4 => Some("mp4"),
+            ArtifactKind::File => {
+                let extension = std::path::Path::new(&artifact.display_name)
+                    .extension()?
+                    .to_str()?;
+                INERT_EXTENSIONS
+                    .iter()
+                    .copied()
+                    .find(|known| known.eq_ignore_ascii_case(extension))
+            }
+        }
+    }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::SetHistoryPreferences(preferences) => {
+                self.manager.set_history_preferences(preferences)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
+            AppCommand::HistoryAction { ids, action } => self.history_action(ids, action)?,
             AppCommand::QueryHistory(query) => {
                 self.history.browse(&query)?;
                 self.history_query = query;
