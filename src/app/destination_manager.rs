@@ -212,12 +212,8 @@ impl DestinationManager {
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
-    pub fn apply(
-        &mut self,
-        edit: DestinationEdit,
-        expected_revision: u64,
-    ) -> Result<ApplyOutcome, AppError> {
-        // Check BEFORE journal/store writes or any setup side effect.
+    /// Cooperating acceptance and edits share this leased revision boundary.
+    pub fn ensure_revision(&self, expected_revision: u64) -> Result<(), AppError> {
         if expected_revision != self.settings.revision
             || self.repository.load_settings()? != self.settings
         {
@@ -225,6 +221,15 @@ impl DestinationManager {
                 "settings changed; refresh before applying",
             ));
         }
+        Ok(())
+    }
+    pub fn apply(
+        &mut self,
+        edit: DestinationEdit,
+        expected_revision: u64,
+    ) -> Result<ApplyOutcome, AppError> {
+        // Check BEFORE journal/store writes or any setup side effect.
+        self.ensure_revision(expected_revision)?;
         edit.destinations.validate()?;
         let mut tokens = HashSet::new();
         for (id, token) in &edit.tokens {

@@ -7,7 +7,7 @@ description = "Windows tray capture and Vectr upload utility"
 license = "UNLICENSED"
 publish = false
 
-# Foundation, upload library and Task 3A credentials only; desktop/media pending.
+# Native shell; capture, file ingress and History UI remain separate slices.
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "7.0.0"
@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 zeroize = "1.9.1"
+eframe = { version = "=0.37.0", default-features = false, features = ["glow", "accesskit", "default_fonts", "clipboard"] }
+tray-icon = { version = "=0.26.1", default-features = false }
 
 [dev-dependencies]
 rcgen = "0.14.10"
@@ -45,6 +47,14 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_Security_Authorization",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
 ] }
 
 [lints.rust]

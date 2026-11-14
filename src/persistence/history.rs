@@ -204,6 +204,15 @@ pub struct History {
 }
 
 impl History {
+    /// Bounded shell view, without running recovery or modifying any job.
+    pub fn shell_jobs(&self) -> Result<Vec<UploadJob>, AppError> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(&format!("{JOB_SELECT} ORDER BY CASE WHEN j.status='running' THEN 0 WHEN j.status IN ('pending','interrupted','uncertain','failed') THEN 1 ELSE 2 END, j.acceptance_ordinal DESC LIMIT 100"))?;
+        let rows = statement
+            .query_map([], RawJob::read)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(RawJob::into_job).collect()
+    }
     /// A safe operation's retry budget and deadline survive pause and restart.
     pub fn upload_retry(&self, id: JobId, operation: &str) -> Result<Option<(u32, i64)>, AppError> {
         Ok(self
