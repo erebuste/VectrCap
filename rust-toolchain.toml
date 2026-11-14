@@ -1,0 +1,8 @@
+# Verified host toolchain on 2026-11-14: stable == rustc 1.98.1 (48a229cea), MSVC.
+# An exact `channel = "1.98.1"` would make rustup auto-install a second, identical
+# toolchain; Cargo.toml `rust-version` enforces the 1.98.1 floor instead.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+profile = "minimal"
