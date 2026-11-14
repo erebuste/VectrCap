@@ -13,7 +13,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
-    shown_since: std::collections::HashMap<crate::app::notifications::NoticeId, std::time::Instant>,
+    shown_since: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<crate::app::notifications::NoticeId, std::time::Instant>,
+        >,
+    >,
     client: DesktopClient,
     view: DesktopView,
     tray: Tray,
@@ -61,6 +65,11 @@ impl eframe::App for Shell {
             self.submit(AppCommand::Show(Window::Settings));
         }
         self.view = self.client.snapshot();
+        // eframe shows its first rendered window; explicitly preserve tray mode
+        // even before the initial worker snapshot arrives.
+        if self.view.window.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         if self.view.lifecycle == Lifecycle::Draining {
             self.pane.clear(ctx);
         }
@@ -96,14 +105,58 @@ impl eframe::App for Shell {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
+        if super::completion_notification::surface_visible(&self.view) {
+            let client = self.client.clone();
+            let shown = self.shown_since.clone();
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of("completion-notices"),
+                super::completion_notification::viewport_builder(),
+                move |ui, _class| {
+                    // Read the live snapshot: a disabled preference or dismissed
+                    // notice must not survive in a deferred callback's clone.
+                    let view = client.snapshot();
+                    if !super::completion_notification::surface_visible(&view) {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+                    let commands = if ui.ctx().input(|i| i.viewport().close_requested()) {
+                        view.notices
+                            .iter()
+                            .map(|n| AppCommand::DismissNotice(n.view.id()))
+                            .collect()
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| {
+                                super::completion_notification::draw(ui, &view, &mut shown)
+                            })
+                            .inner
+                    };
+                    drop(shown);
+                    for command in commands {
+                        if let Err(error) = client.submit(command) {
+                            client.report_error(error);
+                        }
+                    }
+                    // Only the notice surface has a timer; the hidden shell
+                    // remains driven by worker events. Stop when it disappears.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                },
+            );
+        } else {
+            self.shown_since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         // Exit follows driver settlement, never a window close or an upload hint.
         if self.view.lifecycle == Lifecycle::Exited && self.view.exit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut commands =
-            super::completion_notification::draw(ui, &self.view, &mut self.shown_since);
+        let mut commands = vec![];
         egui::Frame::central_panel(ui.style())
             .inner_margin(18.0)
             .show(ui, |ui| {

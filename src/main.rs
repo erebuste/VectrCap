@@ -50,7 +50,8 @@ fn run() -> Result<(), AppError> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([610.0, 650.0])
             .with_min_inner_size([360.0, 320.0])
-            .with_visible(false),
+            .with_visible(false)
+            .with_active(false),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

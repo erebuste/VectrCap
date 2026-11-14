@@ -163,3 +163,75 @@ fn notice_expiration_includes_boundary_and_handles_future_start() {
     );
     assert!(expired_notice_ids(&HashMap::from([(id, now + ttl)]), now, ttl).is_empty());
 }
+
+fn completion_view() -> vectrcap::app::desktop::DesktopView {
+    use vectrcap::app::{controller::NoticeDisplay, notifications::*, types::JobId};
+    let mut center = NotificationCenter::new();
+    center
+        .record(CompletionNotice::Job(
+            JobCompletion::try_new(
+                JobId(uuid::Uuid::new_v4()),
+                "capture.png",
+                true,
+                true,
+                None,
+                CompletionStatus::local_only(),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let view = center.visible().remove(0);
+    let actions = center.actions(view.id()).unwrap();
+    vectrcap::app::desktop::DesktopView {
+        notices: vec![NoticeDisplay { view, actions }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn completion_surface_is_available_while_main_window_is_hidden_and_withdraws_on_quit() {
+    use vectrcap::{app::events::Lifecycle, ui::completion_notification::surface_visible};
+    let mut view = completion_view();
+    assert!(view.window.is_none());
+    assert!(surface_visible(&view));
+    view.notifications_enabled = false;
+    assert!(!surface_visible(&view));
+    view.notifications_enabled = true;
+    view.lifecycle = Lifecycle::Draining;
+    assert!(!surface_visible(&view));
+    view.lifecycle = Lifecycle::Exited;
+    assert!(!surface_visible(&view));
+}
+
+#[test]
+fn completion_surface_requests_no_activation_or_taskbar_entry() {
+    let builder = vectrcap::ui::completion_notification::viewport_builder();
+    assert_eq!(builder.active, Some(false));
+    assert_eq!(builder.taskbar, Some(false));
+}
+
+#[test]
+fn completion_surface_expires_notices_and_clears_disabled_timers() {
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+    use vectrcap::{app::events::AppCommand, ui::completion_notification::draw};
+    let mut view = completion_view();
+    let id = view.notices[0].view.id();
+    let mut shown = HashMap::from([(id, Instant::now() - Duration::from_secs(7))]);
+    let ctx = eframe::egui::Context::default();
+    let mut commands = vec![];
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        commands = draw(ui, &view, &mut shown);
+    });
+    output.textures_delta.clear();
+    assert!(matches!(commands.as_slice(), [AppCommand::DismissNotice(expired)] if *expired == id));
+    view.notifications_enabled = false;
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        commands = draw(ui, &view, &mut shown);
+    });
+    output.textures_delta.clear();
+    assert!(commands.is_empty());
+    assert!(shown.is_empty());
+}

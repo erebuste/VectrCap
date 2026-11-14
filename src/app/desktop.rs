@@ -304,6 +304,7 @@ async fn serve(
         metadata: None,
         state: DesktopView {
             settings: Some(controller.settings().clone()),
+            notifications_enabled: controller.notifications_enabled(),
             window: controller.window,
             focus_revision: 1,
             ..Default::default()

@@ -1,4 +1,4 @@
-//! Passive notices rendered inside the existing shell window.
+//! Passive completion surface independent of the hidden main window.
 use crate::app::{
     desktop::DesktopView,
     events::AppCommand,
@@ -83,4 +83,21 @@ pub fn draw(
         });
     }
     commands
+}
+
+/// Completion windows never alter the main shell's visibility or focus.
+pub fn surface_visible(view: &DesktopView) -> bool {
+    view.notifications_enabled
+        && !view.notices.is_empty()
+        && view.lifecycle == crate::app::events::Lifecycle::Running
+}
+
+pub fn viewport_builder() -> eframe::egui::ViewportBuilder {
+    eframe::egui::ViewportBuilder::default()
+        .with_title("VectrCap notifications")
+        .with_inner_size([420.0, 340.0])
+        .with_resizable(false)
+        .with_active(false)
+        .with_taskbar(false)
+        .with_always_on_top()
 }
