@@ -15,6 +15,7 @@ use tray_icon::{
 };
 type Choices = Arc<Mutex<HashMap<String, (DestinationId, u64)>>>;
 pub struct Tray {
+    _hotkeys: super::hotkeys::HotkeyBridge,
     _appearance: super::appearance::AppearanceWake,
     icon: TrayIcon,
     choices: Choices,
@@ -33,6 +34,7 @@ impl Tray {
     ) -> Result<Self, AppError> {
         let choices: Choices = Arc::new(Mutex::new(HashMap::new()));
         let map = choices.clone();
+        let hotkey_client = client.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id.as_ref() == "upload-file" {
                 super::file_dialog::spawn_pick_and_upload(client.clone(), picker_gate.clone());
@@ -78,7 +80,12 @@ impl Tray {
         // long as `icon`, which outlives `appearance` in `Self`.
         let appearance =
             unsafe { super::appearance::AppearanceWake::attach(icon.window_handle(), context) }?;
+        let hotkeys = unsafe {
+            super::hotkeys::HotkeyBridge::attach(icon.window_handle(), hotkey_client.clone())
+        }?;
+        hotkey_client.submit(AppCommand::AttachHotkeyWindow(icon.window_handle() as isize))?;
         let mut tray = Self {
+            _hotkeys: hotkeys,
             _appearance: appearance,
             icon,
             choices,

@@ -10,3 +10,4 @@ pub mod notifications;
 pub mod types;
 
 pub mod local_actions;
+pub mod shortcuts;

@@ -271,6 +271,12 @@ impl DestinationReferences for References {
         }
         Ok(())
     }
+    fn set_configured_shortcuts(
+        &self,
+        _bindings: &[vectrcap::app::shortcuts::ShortcutBinding],
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
 }
 #[derive(Default)]
 struct Faults {

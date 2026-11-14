@@ -41,6 +41,11 @@ pub struct DesktopView {
     pub queue_paused: bool,
     pub error: Option<AppError>,
     pub saved: u64,
+    pub picker_requests: u64,
+    pub shortcut_statuses: Vec<(
+        super::shortcuts::ShortcutAction,
+        super::shortcuts::ShortcutStatus,
+    )>,
     pub save_result: Option<(uuid::Uuid, Result<(), AppError>)>,
     pub accepted_workflows: usize,
     pub notices: Vec<super::controller::NoticeDisplay>,
@@ -70,6 +75,8 @@ impl Default for DesktopView {
             queue_paused: false,
             error: None,
             saved: 0,
+            picker_requests: 0,
+            shortcut_statuses: vec![],
             save_result: None,
             accepted_workflows: 0,
             notices: vec![],
@@ -207,6 +214,8 @@ impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::ShortcutStatuses(statuses) => self.state.shortcut_statuses = statuses,
+                AppEffect::OpenFilePicker => self.state.picker_requests += 1,
                 AppEffect::LocalHistoryAction(task) => {
                     if self.local_actions.len() >= 4 {
                         self.state.error =

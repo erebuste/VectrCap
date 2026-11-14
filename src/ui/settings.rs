@@ -19,6 +19,7 @@ pub struct SettingsPane {
     error: Option<AppError>,
     remove: Option<DestinationId>,
     just_opened: bool,
+    shortcuts: Option<Vec<crate::app::shortcuts::ShortcutBinding>>,
 }
 impl SettingsPane {
     pub fn submission_failed(&mut self, error: AppError) {
@@ -41,6 +42,7 @@ impl SettingsPane {
     pub fn clear(&mut self, ctx: &egui::Context) {
         self.draft = None;
         self.remove = None;
+        self.shortcuts = None;
         self.error = None;
         egui::text_edit::TextEditState::default().store(ctx, egui::Id::unique("connection-token"));
     }
@@ -66,6 +68,10 @@ impl SettingsPane {
         ui: &mut Ui,
         settings: &Settings,
         notifications_enabled: bool,
+        statuses: &[(
+            crate::app::shortcuts::ShortcutAction,
+            crate::app::shortcuts::ShortcutStatus,
+        )],
     ) -> Vec<AppCommand> {
         let mut commands = vec![];
         let mut enabled = notifications_enabled;
@@ -75,6 +81,88 @@ impl SettingsPane {
         {
             commands.push(AppCommand::SetNotificationsEnabled(enabled));
         }
+        ui.collapsing("Appearance and startup", |ui| {
+            let mut appearance = settings.appearance;
+            egui::ComboBox::from_id_salt("ui-scale").selected_text(format!("{}%", appearance.ui_scale_percent)).show_ui(ui, |ui| {
+                for scale in crate::persistence::settings::AppearancePreferences::VALID_SCALES {
+                    ui.selectable_value(&mut appearance.ui_scale_percent, scale, format!("{scale}%"));
+                }
+            });
+            if appearance != settings.appearance {
+                commands.push(AppCommand::SetAppearance { appearance, revision: settings.revision });
+            }
+            ui.label("Scale changes interface text and controls relative to Windows DPI. Media pixels are unchanged.");
+            let mut startup = settings.startup;
+            if ui.checkbox(&mut startup.launch_at_sign_in, "Launch VectrCap when I sign in").changed() {
+                commands.push(AppCommand::SetStartup { startup, revision: settings.revision });
+            }
+        });
+        ui.collapsing("Archive and cleanup", |ui| {
+            use crate::persistence::settings::StorageMode;
+            let mut policy = settings.archive.clone();
+            ui.label(policy.archive_root.as_ref().map_or_else(|| "Archive: Pictures / VectrCap".to_owned(), |p| format!("Archive: {}", p.display())));
+            if ui.button("Choose archive folder...").clicked() { commands.push(AppCommand::ChooseArchiveFolder); }
+            if ui.button("Use default archive folder").clicked() { policy.archive_root = None; }
+            egui::ComboBox::from_id_salt("archive-mode").selected_text(format!("{:?}", policy.storage_mode)).show_ui(ui, |ui| {
+                for mode in [StorageMode::AlwaysSave, StorageMode::PendingOrFailed, StorageMode::NeverAutomatic] {
+                    ui.selectable_value(&mut policy.storage_mode, mode, format!("{mode:?}"));
+                }
+            });
+            let mut cleanup = policy.cleanup_age_days.is_some();
+            if ui.checkbox(&mut cleanup, "Enable age-based cleanup of app-owned archive copies").changed() {
+                policy.cleanup_age_days = cleanup.then_some(30);
+            }
+            if let Some(days) = &mut policy.cleanup_age_days {
+                ui.add(egui::DragValue::new(days).range(1..=3650).suffix(" days"));
+            }
+            ui.label("Cleanup runs at launch. Active upload sources are retained. Favorites do not change retention. Working spool and recording files remain necessary with any archive mode.");
+            if policy != settings.archive {
+                commands.push(AppCommand::SetArchivePolicy { policy, revision: settings.revision });
+            }
+        });
+        let shortcut_panel = ui.collapsing("Keyboard shortcuts", |ui| {
+            use crate::app::shortcuts::{KeyChord, KeyCode};
+            ui.label("Capture and editor assignments are saved for later activation; their keys are not registered yet. Apply validates all assignments together. Conflicts keep the previous settings.");
+            let bindings = self.shortcuts.get_or_insert_with(|| settings.shortcuts.effective());
+            for binding in bindings.iter_mut() {
+                if let Some((_, status)) = statuses.iter().find(|(action, _)| *action == binding.action) { ui.label(format!("Current registration: {status:?}")); }
+                ui.push_id(binding.action, |ui| {
+                    ui.label(format!("{} ({:?}){}", binding.action.label(), binding.scope, if binding.action.is_available_now() { "" } else { " - unavailable until its feature is implemented" }));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut binding.enabled, "Enabled");
+                        let mut chord = binding.chord.unwrap_or(KeyChord { ctrl: true, alt: false, shift: true, win: false, key: KeyCode::from_vk(0x41).expect("fixed key") });
+                        let mut changed = false;
+                        changed |= ui.checkbox(&mut chord.ctrl, "Ctrl").changed();
+                        changed |= ui.checkbox(&mut chord.alt, "Alt").changed();
+                        changed |= ui.checkbox(&mut chord.shift, "Shift").changed();
+                        changed |= ui.checkbox(&mut chord.win, "Win").changed();
+                        egui::ComboBox::from_id_salt("key").selected_text(binding.chord.map_or_else(|| "Unassigned".into(), |c| format!("VK {:02X}", c.key.vk()))).show_ui(ui, |ui| {
+                            for (vk, label) in (0x41..=0x5A).map(|vk| (vk, char::from_u32(vk).unwrap().to_string())).chain((0x70..=0x87).map(|vk| (vk, format!("F{}", vk - 0x6F)))) {
+                                changed |= ui.selectable_value(&mut chord.key, KeyCode::from_vk(vk).expect("fixed key"), label).changed();
+                            }
+                        });
+                        if changed { binding.chord = Some(chord); }
+                        if ui.button("Reset").clicked() {
+                            commands.push(AppCommand::ResetShortcuts { actions: Some(vec![binding.action]), revision: settings.revision });
+                            *binding = crate::app::shortcuts::ShortcutBinding::unassigned(binding.action);
+                        }
+                        if ui.button("Clear").clicked() { binding.chord = None; binding.enabled = false; }
+                    });
+                });
+            }
+            if ui.button("Apply shortcuts").clicked() {
+                commands.push(AppCommand::ApplyShortcuts { bindings: bindings.clone(), revision: settings.revision });
+            }
+            if ui.button("Reset all shortcuts").clicked() {
+                commands.push(AppCommand::ResetShortcuts { actions: None, revision: settings.revision });
+                self.shortcuts = None;
+            }
+        });
+        commands.push(AppCommand::SetShortcutEntryActive(
+            shortcut_panel.body_response.is_some_and(|response| {
+                response.contains_pointer() || ui.ctx().egui_wants_keyboard_input()
+            }),
+        ));
         ui.heading(if settings.destinations.is_empty() {
             "Connect to Vectr"
         } else {
@@ -374,5 +462,45 @@ mod tests {
         pane.reconcile(&view, &ctx);
         assert_eq!(pane.saving, None);
         assert!(pane.error.is_some());
+    }
+    #[test]
+    fn appearance_scales_validate_and_preserve_physical_geometry() {
+        let baseline = Settings::default();
+        for percent in [100, 125, 150, 175, 200] {
+            let mut settings = baseline.clone();
+            settings.appearance.ui_scale_percent = percent;
+            settings.validate().unwrap();
+            let encoded = serde_json::to_vec(&settings).unwrap();
+            let decoded: Settings = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, settings);
+            assert_eq!(settings.archive, baseline.archive);
+            assert_eq!(settings.filename, baseline.filename);
+        }
+        let mut invalid = baseline;
+        invalid.appearance.ui_scale_percent = 201;
+        assert!(invalid.validate().is_err());
+    }
+    #[test]
+    fn settings_draw_at_double_scale_and_narrow_width() {
+        let context = egui::Context::default();
+        context.set_zoom_factor(2.0);
+        let settings = Settings::default();
+        let mut pane = SettingsPane::default();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 640.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    pane.draw(ui, &settings, true, &[]);
+                });
+            },
+        );
+        assert!(!output.shapes.is_empty());
+        output.textures_delta.clear();
     }
 }

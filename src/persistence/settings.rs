@@ -7,6 +7,7 @@ use url::Url;
 
 use crate::app::destinations::Destinations;
 use crate::app::error::AppError;
+use crate::app::shortcuts::ShortcutSettings;
 use crate::persistence::filename::FilenamePreset;
 use crate::persistence::{PARTIAL_PREFIX, default_archive_root};
 
@@ -267,6 +268,43 @@ impl Default for HistoryPreferences {
     }
 }
 
+/// UI scale relative to the monitor's own Windows DPI scaling; chrome, text,
+/// and hit targets only — never physical capture/media coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppearancePreferences {
+    pub ui_scale_percent: u16,
+}
+
+impl AppearancePreferences {
+    pub const VALID_SCALES: [u16; 5] = [100, 125, 150, 175, 200];
+
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !Self::VALID_SCALES.contains(&self.ui_scale_percent) {
+            return Err(AppError::InvalidInput(
+                "UI scale must be 100, 125, 150, 175, or 200 percent",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for AppearancePreferences {
+    fn default() -> Self {
+        AppearancePreferences {
+            ui_scale_percent: 100,
+        }
+    }
+}
+
+/// Explicit per-user opt-in; off by default. A native startup registration is
+/// created only when this is `true`, never implied by any other setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupPreference {
+    pub launch_at_sign_in: bool,
+}
+
 /// Local, versioned, secret-free settings. Tokens are never fields here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +322,12 @@ pub struct Settings {
     pub archive: ArchivePolicy,
     pub filename: FilenamePreset,
     pub recording: RecordingLimits,
+    #[serde(default)]
+    pub shortcuts: ShortcutSettings,
+    #[serde(default)]
+    pub appearance: AppearancePreferences,
+    #[serde(default)]
+    pub startup: StartupPreference,
 }
 
 fn notifications_default_enabled() -> bool {
@@ -301,6 +345,9 @@ impl Default for Settings {
             archive: ArchivePolicy::default(),
             filename: FilenamePreset::default(),
             recording: RecordingLimits::default(),
+            shortcuts: ShortcutSettings::default(),
+            appearance: AppearancePreferences::default(),
+            startup: StartupPreference::default(),
         }
     }
 }
@@ -313,7 +360,12 @@ impl Settings {
         self.destinations.validate()?;
         self.archive.validate()?;
         self.filename.validate()?;
-        self.recording.validate()
+        self.recording.validate()?;
+        self.shortcuts.validate()?;
+        if self.shortcuts.bindings.iter().any(|binding| matches!(binding.destination, crate::app::destinations::DestinationSelection::Specific(id) if self.destinations.get(id).is_none())) {
+            return Err(AppError::InvalidInput("shortcut references an unknown destination"));
+        }
+        self.appearance.validate()
     }
 
     /// Reads at most 1 MiB, rejects unknown fields, and validates every value.

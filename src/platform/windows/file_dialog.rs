@@ -174,6 +174,58 @@ where
     }
 }
 
+/// Dedicated-thread archive-folder selection. Revision checks reject stale dialogs.
+pub fn spawn_pick_archive_folder(
+    client: DesktopClient,
+    mut policy: crate::persistence::settings::ArchivePolicy,
+    revision: u64,
+) {
+    let report = client.clone();
+    if std::thread::Builder::new()
+        .name("vectrcap-archive-picker".into())
+        .spawn(move || {
+            let result = (|| -> Result<(), AppError> {
+                unsafe {
+                    CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                        .ok()
+                        .map_err(|_| error())?;
+                    let _com = Com;
+                    let dialog: IFileOpenDialog =
+                        CoCreateInstance(&FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER)
+                            .map_err(|_| error())?;
+                    dialog
+                        .SetOptions(
+                            FOS_FORCEFILESYSTEM
+                                | FOS_PATHMUSTEXIST
+                                | windows::Win32::UI::Shell::FOS_PICKFOLDERS,
+                        )
+                        .map_err(|_| error())?;
+                    match dialog.Show(None) {
+                        Ok(()) => {}
+                        Err(e) if e.code().0 == ERROR_CANCELLED => return Ok(()),
+                        Err(_) => return Err(error()),
+                    }
+                    let item = dialog.GetResult().map_err(|_| error())?;
+                    let name = item
+                        .GetDisplayName(SIGDN_FILESYSPATH)
+                        .map_err(|_| error())?;
+                    let text = name.to_string().map_err(|_| error());
+                    CoTaskMemFree(Some(name.0.cast()));
+                    policy.archive_root = Some(PathBuf::from(text?));
+                    policy.validate()?;
+                    client.submit(AppCommand::SetArchivePolicy { policy, revision })
+                }
+            })();
+            if let Err(error) = result {
+                client.report_error(error);
+            }
+        })
+        .is_err()
+    {
+        report.report_error(error());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

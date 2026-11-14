@@ -5,9 +5,10 @@ use crate::{
         destination_manager::DestinationEdit,
         destinations::{DestinationId, DestinationSelection},
         error::AppError,
+        shortcuts::{ShortcutAction, ShortcutBinding},
         types::Artifact,
     },
-    persistence::settings::Settings,
+    persistence::settings::{AppearancePreferences, ArchivePolicy, Settings, StartupPreference},
     vectr::{
         client::UploadToken,
         queue::{QueueCommand, QueueEffect},
@@ -39,6 +40,10 @@ pub enum HistoryAction {
     CopyLinks,
     RetryFailed,
     Remove,
+    /// Deletes only the app-owned local archive copy (see `archive::delete_local`).
+    /// Distinct from `Remove`: the history record, favorite, and any
+    /// confirmed upload link are untouched.
+    DeleteLocalFile,
 }
 pub enum AppCommand {
     SetHistoryPreferences(crate::persistence::settings::HistoryPreferences),
@@ -100,6 +105,38 @@ pub enum AppCommand {
     /// is staged, and reused for every file in the batch regardless of how
     /// long staging takes or whether the default changes meanwhile.
     AcceptFileSelection(Vec<PathBuf>),
+    /// The tray's hidden window now exists; native hotkey registration can
+    /// begin. Carries its raw `HWND` value (`isize`), never a type that
+    /// implies cross-thread ownership of the window itself.
+    AttachHotkeyWindow(isize),
+    /// One native hotkey fired with this id. Resolved to an action (if any
+    /// current registration still owns it), then dispatched through the
+    /// same suppression/repeat policy as every other shortcut event.
+    NativeHotkeyFired(i32),
+    ApplyShortcuts {
+        bindings: Vec<ShortcutBinding>,
+        revision: u64,
+    },
+    ResetShortcuts {
+        actions: Option<Vec<ShortcutAction>>,
+        revision: u64,
+    },
+    /// Set by the Hotkeys settings page while its press-to-set field is
+    /// focused, so a matching active global hotkey cannot also dispatch.
+    SetShortcutEntryActive(bool),
+    SetAppearance {
+        appearance: AppearancePreferences,
+        revision: u64,
+    },
+    SetStartup {
+        startup: StartupPreference,
+        revision: u64,
+    },
+    ChooseArchiveFolder,
+    SetArchivePolicy {
+        policy: ArchivePolicy,
+        revision: u64,
+    },
     Quit,
 }
 #[derive(Debug, Clone, Copy)]
@@ -141,11 +178,20 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    ShortcutStatuses(
+        Vec<(
+            super::shortcuts::ShortcutAction,
+            super::shortcuts::ShortcutStatus,
+        )>,
+    ),
     LocalHistoryAction(super::local_actions::LocalHistoryAction),
     HistoryRetryReport {
         queued: usize,
         skipped: usize,
     },
+    /// The Upload-file hotkey fired: the UI thread owns the native picker's
+    /// single-flight gate and must open it, exactly like the tray menu item.
+    OpenFilePicker,
     Window(Option<Window>),
     SettingsSaved(Settings),
     ConnectionSaved {

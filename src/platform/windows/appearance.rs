@@ -1,6 +1,15 @@
 //! Read-only system appearance, sampled on native wake/repaint (no idle timer).
+//!
+//! The non-contrast palette below is sampled directly from the Vectr web
+//! panel's own design tokens (`web/src/index.css`, the `.dark` block) so the
+//! desktop app and the web panel read as one product: dark neutral surfaces
+//! with a lavender primary/selection/focus accent, rather than an invented
+//! desktop-only palette. Every value here is a verified sRGB conversion of
+//! that file's `oklch(...)` tokens (see each constant's doc comment for the
+//! source custom property); nothing is guessed. An enabled Windows contrast
+//! theme still fully overrides this palette below, unchanged from before.
 #![allow(unsafe_code)]
-use eframe::egui::{Color32, Stroke, Visuals};
+use eframe::egui::{Color32, CornerRadius, Stroke, Visuals};
 use windows_sys::Win32::{
     Graphics::Gdi::{
         COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
@@ -11,12 +20,72 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SystemParametersInfoW},
     },
 };
+
+/// `--background` (`oklch(0.145 0 0)`).
+const VECTR_BACKGROUND: Color32 = Color32::from_rgb(10, 10, 10);
+/// `--foreground` (`oklch(0.985 0 0)`).
+const VECTR_FOREGROUND: Color32 = Color32::from_rgb(250, 250, 250);
+/// `--card` / `--popover` (`oklch(0.205 0 0)`).
+const VECTR_CARD: Color32 = Color32::from_rgb(23, 23, 23);
+/// `--muted` / `--accent` / `--secondary` (`oklch(0.269 0 0)`).
+const VECTR_MUTED: Color32 = Color32::from_rgb(38, 38, 38);
+/// A lightened `--muted` for hover feedback; the CSS expresses hover with an
+/// opacity utility rather than a separate token.
+const VECTR_MUTED_HOVER: Color32 = Color32::from_rgb(54, 54, 54);
+/// `--muted-foreground` (`oklch(0.708 0 0)`).
+const VECTR_MUTED_FOREGROUND: Color32 = Color32::from_rgb(161, 161, 161);
+/// `--primary` / `--ring` (`oklch(0.78 0.11 305)`): the panel's lavender accent.
+const VECTR_PRIMARY: Color32 = Color32::from_rgb(200, 166, 240);
+/// `--primary-foreground` (`oklch(0.2 0.04 305)`).
+const VECTR_PRIMARY_FOREGROUND: Color32 = Color32::from_rgb(26, 17, 37);
+/// `--destructive` (`oklch(0.704 0.191 22.216)`).
+const VECTR_DESTRUCTIVE: Color32 = Color32::from_rgb(255, 100, 103);
+/// `--border` (`oklch(1 0 0 / 10%)`): translucent white over the background.
+const VECTR_BORDER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+/// `--radius: 0.625rem` scaled down, matching `--radius-sm`/`--radius-md`.
+const VECTR_RADIUS_CONTROL: u8 = 6;
+/// `--radius` itself, used for window/menu chrome.
+const VECTR_RADIUS_SURFACE: u8 = 10;
+
 pub fn visuals() -> Visuals {
     let mut visual = Visuals::dark();
-    visual.panel_fill = Color32::from_rgb(28, 30, 33);
-    visual.window_fill = visual.panel_fill;
-    visual.selection.bg_fill = Color32::from_rgb(109, 79, 36);
-    visual.selection.stroke = Stroke::new(1.5, Color32::from_rgb(247, 211, 151));
+    visual.panel_fill = VECTR_BACKGROUND;
+    visual.window_fill = VECTR_BACKGROUND;
+    visual.extreme_bg_color = VECTR_CARD;
+    visual.faint_bg_color = VECTR_MUTED;
+    visual.code_bg_color = VECTR_CARD;
+    visual.hyperlink_color = VECTR_PRIMARY;
+    visual.error_fg_color = VECTR_DESTRUCTIVE;
+    visual.selection.bg_fill = VECTR_PRIMARY;
+    visual.selection.stroke = Stroke::new(1.5, VECTR_PRIMARY_FOREGROUND);
+    visual.window_corner_radius = CornerRadius::same(VECTR_RADIUS_SURFACE);
+    visual.menu_corner_radius = CornerRadius::same(VECTR_RADIUS_SURFACE);
+    visual.widgets.noninteractive.bg_fill = VECTR_CARD;
+    visual.widgets.noninteractive.weak_bg_fill = VECTR_BACKGROUND;
+    visual.widgets.noninteractive.bg_stroke = Stroke::new(1.0, VECTR_BORDER);
+    visual.widgets.noninteractive.fg_stroke = Stroke::new(1.0, VECTR_FOREGROUND);
+    visual.widgets.noninteractive.corner_radius = CornerRadius::same(VECTR_RADIUS_CONTROL);
+    visual.widgets.inactive.bg_fill = VECTR_MUTED;
+    visual.widgets.inactive.weak_bg_fill = VECTR_CARD;
+    visual.widgets.inactive.bg_stroke = Stroke::new(1.0, VECTR_BORDER);
+    visual.widgets.inactive.fg_stroke = Stroke::new(1.0, VECTR_FOREGROUND);
+    visual.widgets.inactive.corner_radius = CornerRadius::same(VECTR_RADIUS_CONTROL);
+    visual.widgets.hovered.bg_fill = VECTR_MUTED_HOVER;
+    visual.widgets.hovered.weak_bg_fill = VECTR_MUTED;
+    visual.widgets.hovered.bg_stroke = Stroke::new(1.0, VECTR_PRIMARY);
+    visual.widgets.hovered.fg_stroke = Stroke::new(1.0, VECTR_FOREGROUND);
+    visual.widgets.hovered.corner_radius = CornerRadius::same(VECTR_RADIUS_CONTROL);
+    visual.widgets.active.bg_fill = VECTR_PRIMARY;
+    visual.widgets.active.weak_bg_fill = VECTR_PRIMARY;
+    visual.widgets.active.bg_stroke = Stroke::new(1.0, VECTR_PRIMARY);
+    visual.widgets.active.fg_stroke = Stroke::new(1.0, VECTR_PRIMARY_FOREGROUND);
+    visual.widgets.active.corner_radius = CornerRadius::same(VECTR_RADIUS_CONTROL);
+    visual.widgets.open.bg_fill = VECTR_PRIMARY;
+    visual.widgets.open.weak_bg_fill = VECTR_MUTED;
+    visual.widgets.open.bg_stroke = Stroke::new(1.0, VECTR_PRIMARY);
+    visual.widgets.open.fg_stroke = Stroke::new(1.0, VECTR_PRIMARY_FOREGROUND);
+    visual.widgets.open.corner_radius = CornerRadius::same(VECTR_RADIUS_CONTROL);
+    visual.weak_text_color = Some(VECTR_MUTED_FOREGROUND);
     unsafe {
         let mut contrast = HIGHCONTRASTW {
             cbSize: size_of::<HIGHCONTRASTW>() as u32,

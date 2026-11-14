@@ -29,6 +29,7 @@ pub struct Shell {
     /// Shared with the tray's "Upload file" menu item: the two entry points
     /// are single-flight together, not just independently.
     picker_gate: PickerGate,
+    picker_requests: u64,
 }
 impl Shell {
     pub fn new(
@@ -49,9 +50,20 @@ impl Shell {
             current_window: None,
             focus_requested,
             picker_gate,
+            picker_requests: 0,
         })
     }
     fn submit(&mut self, command: AppCommand) {
+        if matches!(command, AppCommand::ChooseArchiveFolder) {
+            if let Some(settings) = &self.view.settings {
+                crate::platform::windows::file_dialog::spawn_pick_archive_folder(
+                    self.client.clone(),
+                    settings.archive.clone(),
+                    settings.revision,
+                );
+            }
+            return;
+        }
         let editing = matches!(
             command,
             AppCommand::SaveConnection { .. }
@@ -72,6 +84,16 @@ impl eframe::App for Shell {
             self.submit(AppCommand::Show(Window::Settings));
         }
         self.view = self.client.snapshot();
+        if self.picker_requests != self.view.picker_requests {
+            self.picker_requests = self.view.picker_requests;
+            crate::platform::windows::file_dialog::spawn_pick_and_upload(
+                self.client.clone(),
+                self.picker_gate.clone(),
+            );
+        }
+        if let Some(settings) = &self.view.settings {
+            ctx.set_zoom_factor(f32::from(settings.appearance.ui_scale_percent) / 100.0);
+        }
         // eframe shows its first rendered window; explicitly preserve tray mode
         // even before the initial worker snapshot arrives.
         if self.view.window.is_none() {
@@ -223,10 +245,14 @@ impl eframe::App for Shell {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match (self.view.window, &self.view.settings) {
-                            (Some(Window::Settings), Some(settings)) => commands.extend(
-                                self.pane
-                                    .draw(ui, settings, self.view.notifications_enabled),
-                            ),
+                            (Some(Window::Settings), Some(settings)) => {
+                                commands.extend(self.pane.draw(
+                                    ui,
+                                    settings,
+                                    self.view.notifications_enabled,
+                                    &self.view.shortcut_statuses,
+                                ))
+                            }
                             (Some(Window::History), Some(_)) => {
                                 commands.extend(self.history.draw(ui, &self.view))
                             }

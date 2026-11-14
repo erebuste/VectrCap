@@ -11,6 +11,7 @@ use super::{
         CompletionNotice, CompletionStatus, JobCompletion, NoticeView, NotificationCenter,
         RequestedCompletionAction,
     },
+    shortcuts::{ShortcutEvent, ShortcutFocus, ShortcutManager, ShortcutOutcome},
     types::{Artifact, ArtifactKind},
 };
 use crate::{
@@ -53,6 +54,9 @@ impl DestinationReferences for References {
             .0
             .lock()
             .map_err(|_| AppError::Persistence("configured references unavailable"))?;
+        if candidate.shortcuts.bindings.iter().any(|binding| matches!(binding.destination, DestinationSelection::Specific(id) if candidate.destinations.get(id).is_none())) {
+            return Err(AppError::InvalidInput("repair shortcut destination references before removal"));
+        }
         if refs
             .configured
             .values()
@@ -61,6 +65,24 @@ impl DestinationReferences for References {
             return Err(AppError::InvalidInput(
                 "repair configured destination references before removal",
             ));
+        }
+        Ok(())
+    }
+    fn set_configured_shortcuts(
+        &self,
+        bindings: &[super::shortcuts::ShortcutBinding],
+    ) -> Result<(), AppError> {
+        let mut refs = self
+            .0
+            .lock()
+            .map_err(|_| AppError::Persistence("configured references unavailable"))?;
+        refs.configured
+            .retain(|key, _| !key.starts_with("shortcut:"));
+        for binding in bindings {
+            if let DestinationSelection::Specific(id) = binding.destination {
+                refs.configured
+                    .insert(format!("shortcut:{:?}", binding.action), id);
+            }
         }
         Ok(())
     }
@@ -146,6 +168,14 @@ pub struct AppController {
     notifications: NotificationCenter,
     shell: Arc<dyn ShellActions>,
     clipboard: Arc<dyn ClipboardWriter>,
+    /// `None` until `AttachHotkeyWindow` arrives: native registration needs
+    /// the tray's real window handle, which does not exist until the UI
+    /// thread creates it (just after this controller starts). The window
+    /// between app start and that attach is a few milliseconds; every
+    /// shortcut-dependent command degrades to a harmless no-op/busy error
+    /// during it rather than panicking or guessing a handle.
+    shortcuts: Option<ShortcutManager>,
+    shortcut_entry_active: bool,
     pub lifecycle: Lifecycle,
     pub window: Option<Window>,
 }
@@ -170,6 +200,22 @@ impl AppController {
             .destinations
             .is_empty()
             .then_some(Window::Settings);
+        // Cleanup can hash files, so keep it off the controller runtime.
+        if manager.settings().archive.cleanup_age_days.is_some() {
+            let policy = manager.settings().archive.clone();
+            let filename = manager.settings().filename.clone();
+            let history = history.clone();
+            std::thread::Builder::new()
+                .name("vectrcap-archive-cleanup".into())
+                .spawn(move || {
+                    if let Ok(root) = policy.resolved_root() {
+                        let archive =
+                            crate::persistence::archive::ArchiveStore::new(history, root, filename);
+                        let _ = archive.cleanup(&policy, chrono::Local::now());
+                    }
+                })
+                .map_err(|e| AppError::io("starting archive cleanup", &e))?;
+        }
         let mut notifications = NotificationCenter::new();
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
@@ -186,9 +232,14 @@ impl AppController {
             notifications,
             shell,
             clipboard,
+            shortcuts: None,
+            shortcut_entry_active: false,
             lifecycle: Lifecycle::Running,
             window,
         })
+    }
+    pub fn shortcuts(&self) -> Option<&ShortcutManager> {
+        self.shortcuts.as_ref()
     }
     pub fn history_page(
         &self,
@@ -757,6 +808,7 @@ impl AppController {
             }
             AppCommand::ShowBatchSummary(jobs) => self.show_batch_summary(jobs)?,
             AppCommand::Show(window) => {
+                self.shortcut_entry_active = false;
                 self.window = Some(window);
                 let mut effects = vec![AppEffect::Window(self.window)];
                 if window != Window::Settings {
@@ -765,6 +817,7 @@ impl AppController {
                 effects
             }
             AppCommand::CloseWindow => {
+                self.shortcut_entry_active = false;
                 self.window = None;
                 vec![AppEffect::Window(None), AppEffect::CancelConnectionTest]
             }
@@ -884,7 +937,107 @@ impl AppController {
                 self.execute_completion_action(notice, action)?
             }
             AppCommand::AcceptFileSelection(paths) => self.accept_file_selection(paths)?,
+            AppCommand::AttachHotkeyWindow(hwnd) => {
+                if self.shortcuts.is_none() {
+                    let backend = crate::platform::windows::hotkeys::Win32HotkeyBackend::new(hwnd);
+                    let (manager, _startup_conflicts) = ShortcutManager::new(
+                        Box::new(backend),
+                        self.manager.settings().shortcuts.effective(),
+                    );
+                    let statuses = super::shortcuts::ShortcutAction::all()
+                        .iter()
+                        .map(|&action| (action, manager.status(action)))
+                        .collect();
+                    self.shortcuts = Some(manager);
+                    return Ok(vec![AppEffect::ShortcutStatuses(statuses)]);
+                }
+                vec![]
+            }
+            AppCommand::NativeHotkeyFired(id) => {
+                let outcome = self.shortcuts.as_ref().and_then(|shortcuts| {
+                    let action = shortcuts.action_for_id(id)?;
+                    let focus = if self.shortcut_entry_active {
+                        ShortcutFocus::ShortcutEntry
+                    } else {
+                        ShortcutFocus::Normal
+                    };
+                    shortcuts.handle(
+                        ShortcutEvent {
+                            action,
+                            repeat: false,
+                        },
+                        focus,
+                    )
+                });
+                match outcome {
+                    Some(ShortcutOutcome::Command(cmd)) => self.apply(cmd)?,
+                    Some(ShortcutOutcome::OpenFilePicker) => vec![AppEffect::OpenFilePicker],
+                    None => vec![],
+                }
+            }
+            AppCommand::ApplyShortcuts { bindings, revision } => {
+                self.manager.ensure_revision(revision)?;
+                let Some(shortcuts) = &mut self.shortcuts else {
+                    return Err(AppError::InUse("hotkeys are still initializing; try again"));
+                };
+                let manager = &mut self.manager;
+                shortcuts.apply(bindings, |candidate| manager.save_shortcuts(candidate))?;
+                let statuses = super::shortcuts::ShortcutAction::all()
+                    .iter()
+                    .map(|&action| (action, shortcuts.status(action)))
+                    .collect();
+                return Ok(vec![
+                    AppEffect::ShortcutStatuses(statuses),
+                    AppEffect::SettingsSaved(self.settings().clone()),
+                ]);
+            }
+            AppCommand::ResetShortcuts { actions, revision } => {
+                self.manager.ensure_revision(revision)?;
+                let Some(shortcuts) = &mut self.shortcuts else {
+                    return Err(AppError::InUse("hotkeys are still initializing; try again"));
+                };
+                let candidate = shortcuts.reset_candidate(actions.as_deref());
+                let manager = &mut self.manager;
+                shortcuts.apply(candidate, |c| manager.save_shortcuts(c))?;
+                let statuses = super::shortcuts::ShortcutAction::all()
+                    .iter()
+                    .map(|&action| (action, shortcuts.status(action)))
+                    .collect();
+                vec![
+                    AppEffect::ShortcutStatuses(statuses),
+                    AppEffect::SettingsSaved(self.settings().clone()),
+                ]
+            }
+            AppCommand::SetShortcutEntryActive(active) => {
+                self.shortcut_entry_active = active;
+                vec![]
+            }
+            AppCommand::SetAppearance {
+                appearance,
+                revision,
+            } => {
+                self.manager.ensure_revision(revision)?;
+                self.manager.set_appearance(appearance)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
+            AppCommand::SetStartup { startup, revision } => {
+                self.manager.ensure_revision(revision)?;
+                crate::platform::windows::startup::apply(
+                    &crate::platform::windows::startup::NativeStartup,
+                    self.manager.settings().startup.launch_at_sign_in,
+                    startup.launch_at_sign_in,
+                    || self.manager.set_startup(startup),
+                )?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
+            AppCommand::ChooseArchiveFolder => vec![],
+            AppCommand::SetArchivePolicy { policy, revision } => {
+                self.manager.ensure_revision(revision)?;
+                self.manager.set_archive_policy(policy)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
             AppCommand::Quit => {
+                self.shortcuts = None;
                 self.lifecycle = Lifecycle::Draining;
                 // Workflows are deliberately NOT cleared here: a batch file
                 // already accepted (its destination reserved in `workflows`)

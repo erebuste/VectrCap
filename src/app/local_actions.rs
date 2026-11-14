@@ -58,6 +58,22 @@ impl LocalHistoryAction {
                 };
                 self.shell.open_url(receipt.url())?;
             }
+            HistoryAction::DeleteLocalFile => {
+                use crate::persistence::archive::{LocalDeleteOutcome, delete_local};
+                match delete_local(&self.history, row.artifact.id)? {
+                    LocalDeleteOutcome::Deleted => {}
+                    LocalDeleteOutcome::NoOwnedCopy => {
+                        return Err(AppError::InvalidInput(
+                            "no app-owned local copy to delete for this item",
+                        ));
+                    }
+                    LocalDeleteOutcome::Active => {
+                        return Err(AppError::InUse(
+                            "an unfinished upload still needs this local file",
+                        ));
+                    }
+                }
+            }
             _ => return Err(AppError::InvalidInput("unsupported local history action")),
         }
         Ok(())

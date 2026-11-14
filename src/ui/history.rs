@@ -24,6 +24,7 @@ pub struct HistoryPane {
     until: String,
     date_error: Option<&'static str>,
     remove: Option<Vec<Uuid>>,
+    delete_local: bool,
     previews: HistoryPreviews,
     last_layout: Option<HistoryLayout>,
     last_columns: Option<usize>,
@@ -213,11 +214,31 @@ impl HistoryPane {
             {
                 self.remove = Some(self.selection.clone());
             }
+            if ui
+                .add_enabled(
+                    self.selection.len() == 1,
+                    egui::Button::new("Delete local copy..."),
+                )
+                .clicked()
+            {
+                self.delete_local = true;
+            }
             if ui.button("Clear selection").clicked() {
                 self.selection.clear();
                 self.active = None;
             }
         });
+        if self.delete_local {
+            ui.group(|ui| {
+                ui.label("Permanently delete selected app-owned finalized local copies? Imported originals, remote uploads, links and favorites are kept. Active upload sources cannot be deleted.");
+                if ui.button("Confirm local file deletion").clicked() {
+                    commands.push(action(self.selection.clone(), HistoryAction::DeleteLocalFile));
+                    self.previews.suspend();
+                    self.delete_local = false;
+                }
+                if ui.button("Keep local files").clicked() { self.delete_local = false; }
+            });
+        }
         if let Some(ids) = self.remove.clone() {
             ui.group(|ui| {
                 ui.label(format!("Remove {} history records? Local files and remote uploads will be kept. Unfinished uploads must be settled or cancelled first.", ids.len()));

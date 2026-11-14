@@ -4,10 +4,14 @@
 //! additionally excludes other destination managers for this settings path.
 use crate::{
     app::{
-        destinations::{CredentialKey, DestinationId, Destinations},
+        destinations::{CredentialKey, DestinationId, DestinationSelection, Destinations},
         error::AppError,
+        shortcuts::ShortcutBinding,
     },
-    persistence::{history::History, settings::Settings},
+    persistence::{
+        history::History,
+        settings::{AppearancePreferences, Settings, StartupPreference},
+    },
     platform::{CredentialStore, windows::credentials::validate_token},
     vectr::client::UploadToken,
 };
@@ -36,6 +40,11 @@ pub trait DestinationReferences: Send + Sync {
     /// Validate every configured hotkey/profile ID against the candidate, after
     /// explicit repairs. Future controllers must include their candidate refs.
     fn validate_configured(&self, candidate: &Settings) -> Result<(), AppError>;
+    /// Record which destinations the current shortcut bindings reference, so
+    /// a later `validate_configured` call (from a destination edit) blocks
+    /// removing one a shortcut still points at by stable ID. Called only
+    /// after a shortcut save has already durably committed.
+    fn set_configured_shortcuts(&self, bindings: &[ShortcutBinding]) -> Result<(), AppError>;
 }
 
 /// Nonsecret exact-key ownership journal, committed BEFORE credential writes.
@@ -248,6 +257,86 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_appearance(&mut self, appearance: AppearancePreferences) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.appearance == appearance {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.appearance = appearance;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
+    pub fn set_archive_policy(
+        &mut self,
+        policy: crate::persistence::settings::ArchivePolicy,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.archive == policy {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.archive = policy;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
+    pub fn set_startup(&mut self, startup: StartupPreference) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.startup == startup {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.startup = startup;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
+    /// Validates the candidate's own destination references against the
+    /// CURRENT destination set, persists it as a new revision, then records
+    /// those references so a later destination removal cannot silently
+    /// orphan them. Native registration itself is the caller's job (see
+    /// `ShortcutManager::apply`); this method is exactly the "configuration
+    /// writer" that transaction is injected with.
+    pub fn save_shortcuts(&mut self, candidate: &[ShortcutBinding]) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        for binding in candidate {
+            if let DestinationSelection::Specific(id) = binding.destination
+                && self.settings.destinations.get(id).is_none()
+            {
+                return Err(AppError::InvalidInput(
+                    "shortcut destination no longer exists",
+                ));
+            }
+        }
+        let mut settings = self.settings.clone();
+        settings.shortcuts.bindings = candidate.to_vec();
+        settings.revision = settings
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        settings.validate()?;
+        self.repository.save_settings(&settings)?;
+        self.settings = settings;
+
+        Ok(())
+    }
     /// Cooperating acceptance and edits share this leased revision boundary.
     pub fn ensure_revision(&self, expected_revision: u64) -> Result<(), AppError> {
         if expected_revision != self.settings.revision {
@@ -292,6 +381,17 @@ impl DestinationManager {
             let next = edit.destinations.get(old.id);
             let identity_change =
                 next.is_none_or(|next| next.origin != old.origin) || tokens.contains(&old.id);
+            let configured_shortcut = self
+                .settings
+                .shortcuts
+                .bindings
+                .iter()
+                .any(|binding| binding.destination == DestinationSelection::Specific(old.id));
+            if identity_change && configured_shortcut {
+                return Err(AppError::InUse(
+                    "clear the shortcut destination assignment before changing or removing its connection",
+                ));
+            }
             if identity_change && active.contains(&old.id) {
                 return Err(AppError::InUse(
                     "destination is referenced by unfinished uploads or workflows",

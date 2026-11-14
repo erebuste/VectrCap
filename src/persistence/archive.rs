@@ -398,6 +398,86 @@ impl ArchiveStore {
     }
 }
 
+/// Outcome of an explicit, user-confirmed local-file deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDeleteOutcome {
+    Deleted,
+    /// Nothing app-owned exists for this item (already gone, or it was
+    /// never archived — e.g. an existing-file upload, which this action
+    /// never touches).
+    NoOwnedCopy,
+    /// An unfinished job still references this artifact.
+    Active,
+}
+
+/// Explicit, user-confirmed deletion of the one app-owned archived local
+/// copy for `artifact_id` (automatic or manual), using the exact same
+/// handle-bound identity verification as policy cleanup's `release_one`:
+/// the recorded root/file identity must still match before anything is
+/// opened for delete, so this can never become a path-based arbitrary
+/// delete. Never touches an original imported user file (those are never
+/// archived) or a remote/server-side copy. History's favorite flag and any
+/// confirmed upload link are untouched: only the `archive_entries` row for
+/// this local copy is marked removed.
+pub fn delete_local(
+    history: &History,
+    artifact_id: crate::app::types::ArtifactId,
+) -> Result<LocalDeleteOutcome, AppError> {
+    const CHECKING: &str = "checking the archived file";
+    let Some(candidate) = history.archive_entry_for_artifact(artifact_id)? else {
+        return Ok(LocalDeleteOutcome::NoOwnedCopy);
+    };
+    let entry = &candidate.entry;
+    let root = match winfs::open_root(&entry.root) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(LocalDeleteOutcome::NoOwnedCopy);
+        }
+        Err(e) => return Err(AppError::io("opening the archive folder", &e)),
+    };
+    let root_identity =
+        winfs::identity(&root).map_err(|e| AppError::io("opening the archive folder", &e))?;
+    let Some((month, name)) = month_and_name(&entry.path, &entry.root) else {
+        return Ok(LocalDeleteOutcome::NoOwnedCopy);
+    };
+    if !candidate.root_identity.is_proven()
+        || !root_identity.is_proven()
+        || !candidate.root_identity.same_object(root_identity)
+    {
+        return Ok(LocalDeleteOutcome::NoOwnedCopy);
+    }
+    let month_dir = match winfs::open_child_dir(&root, month, false) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(LocalDeleteOutcome::NoOwnedCopy);
+        }
+        Err(e) => return Err(dir_error(CHECKING, &e)),
+    };
+    let file = match winfs::open_child_file(&month_dir, name) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(LocalDeleteOutcome::NoOwnedCopy);
+        }
+        Err(e) => return Err(AppError::io(CHECKING, &e)),
+    };
+    let identity = winfs::identity(&file).map_err(|e| AppError::io(CHECKING, &e))?;
+    if !identity.is_proven()
+        || !candidate.file_identity.is_proven()
+        || !identity.same_object(candidate.file_identity)
+    {
+        return Ok(LocalDeleteOutcome::NoOwnedCopy);
+    }
+    let removed = history.commit_explicit_archive_removal(entry.id, || {
+        winfs::delete_by_handle(&file).map_err(|e| AppError::io("deleting the local file", &e))
+    })?;
+    drop(file);
+    Ok(if removed {
+        LocalDeleteOutcome::Deleted
+    } else {
+        LocalDeleteOutcome::Active
+    })
+}
+
 /// Classifies a failed open of an archive descendant as a reason to keep it.
 fn keep(e: io::Error, report: &mut CleanupReport, stage: &'static str) -> Result<(), AppError> {
     match e.kind() {
@@ -986,5 +1066,92 @@ mod tests {
             assert_eq!(archive.cleanup(&fx.policy(), later()).unwrap().removed, 0);
             assert_eq!(fs::read(&entry.path).unwrap(), b"png 1");
         });
+    }
+
+    #[test]
+    fn explicit_delete_removes_owned_copy_and_keeps_favorite_and_link() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        let art = fx.screenshot();
+        let entry = archive.save_manual(&art, captured()).unwrap();
+        let job = fx.history.create_job(&art, &snapshot()).unwrap();
+        let receipt =
+            crate::app::types::UploadReceipt::new("https://vectr.example/x", "x.png").unwrap();
+        fx.history
+            .transition(job.id, crate::persistence::history::JobStatus::Running)
+            .unwrap();
+        let session = uuid::Uuid::new_v4();
+        fx.history.set_session(job.id, session).unwrap();
+        fx.history
+            .record_receipt(job.id, 1, Some(session), &receipt)
+            .unwrap();
+        let history_id = fx.history.browse(&Default::default()).unwrap().records[0].id;
+        fx.history.set_favorite(history_id, true).unwrap();
+
+        assert_eq!(
+            delete_local(&fx.history, art.id).unwrap(),
+            LocalDeleteOutcome::Deleted
+        );
+        assert!(!exists(&entry.path), "the local copy must be gone");
+        let record = fx.history.history_record(history_id).unwrap().unwrap();
+        assert!(record.favorite, "favorite is preserved after local removal");
+        assert!(
+            matches!(
+                record.job.unwrap().status,
+                crate::persistence::history::JobStatus::Completed(_)
+            ),
+            "the confirmed upload link is preserved after local removal"
+        );
+    }
+
+    #[test]
+    fn explicit_delete_is_blocked_by_an_active_job() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        let art = fx.screenshot();
+        let entry = archive.save_finalized(&art, captured()).unwrap();
+        fx.history.create_job(&art, &snapshot()).unwrap();
+
+        assert_eq!(
+            delete_local(&fx.history, art.id).unwrap(),
+            LocalDeleteOutcome::Active
+        );
+        assert!(
+            exists(&entry.path),
+            "a source needed by an unfinished job is kept"
+        );
+    }
+
+    #[test]
+    fn explicit_delete_never_touches_a_file_that_was_never_archived() {
+        let fx = Fx::new();
+        let art = fx.screenshot(); // staged, but never archived
+        assert_eq!(
+            delete_local(&fx.history, art.id).unwrap(),
+            LocalDeleteOutcome::NoOwnedCopy
+        );
+        assert!(exists(&art.path), "the staged spool copy is untouched");
+    }
+
+    #[test]
+    fn explicit_delete_is_safe_when_the_recorded_object_was_swapped() {
+        for filesystem in ["FAT", "ReFS", "NTFS"] {
+            winfs::identity_queries::with(filesystem, false, || {
+                let fx = Fx::new();
+                let archive = fx.archive();
+                let art = fx.screenshot();
+                let entry = archive.save_finalized(&art, captured()).unwrap();
+                let bytes = fs::read(&entry.path).unwrap();
+                fs::remove_file(&entry.path).unwrap();
+                fs::write(&entry.path, &bytes).unwrap(); // same name/bytes, a different file object
+
+                assert_eq!(
+                    delete_local(&fx.history, art.id).unwrap(),
+                    LocalDeleteOutcome::NoOwnedCopy,
+                    "{filesystem}: an unproven/foreign object is never deleted"
+                );
+                assert!(exists(&entry.path));
+            });
+        }
     }
 }

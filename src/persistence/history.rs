@@ -987,6 +987,88 @@ impl History {
         Ok(true)
     }
 
+    /// The live archive entry (any origin) for one artifact, if it still has
+    /// one. Used only by the explicit, user-confirmed local-file delete
+    /// action — never by automatic policy cleanup, which stays scoped to
+    /// `archive_page`'s automatic-only, root-scoped, paged query above.
+    pub(crate) fn archive_entry_for_artifact(
+        &self,
+        artifact_id: ArtifactId,
+    ) -> Result<Option<ArchiveCandidate>, AppError> {
+        type ArchiveRow = (String, String, String, i64, Vec<u8>, i64, Vec<u8>, Vec<u8>);
+        let row: Option<ArchiveRow> = self
+            .lock()?
+            .query_row(
+                "SELECT id, root, path, size, sha256, created_ms, root_identity, file_identity \
+                 FROM archive_entries WHERE artifact_id = ?1 AND removed_ms IS NULL",
+                params![artifact_id.0.to_string()],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, root, path, size, sha, created, root_id, file_id)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ArchiveCandidate {
+            created_ms: created,
+            root_identity: identity_col(root_id)?,
+            file_identity: identity_col(file_id)?,
+            entry: ArchiveEntry {
+                id: ArchiveEntryId(parse_uuid(&id)?),
+                artifact_id,
+                root: PathBuf::from(root),
+                path: PathBuf::from(path),
+                origin: ArchiveOrigin::Automatic,
+                created_at: local_from_ms(created)?,
+                size: u64::try_from(size).map_err(|_| corrupt())?,
+                sha256: sha.try_into().map_err(|_| corrupt())?,
+            },
+        }))
+    }
+
+    /// Explicit, user-confirmed deletion of one app-owned archived file
+    /// (automatic or manual). Unlike `commit_archive_removal`, this is not
+    /// restricted to `origin = 'automatic'` or to an uploaded artifact, but
+    /// it keeps the same unconditional protection: an entry still referenced
+    /// by an unfinished job is never removed. `delete` must act on an
+    /// already handle-identity-verified file (see `archive::delete_local`).
+    pub(crate) fn commit_explicit_archive_removal(
+        &self,
+        id: ArchiveEntryId,
+        delete: impl FnOnce() -> Result<(), AppError>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM archive_entries e \
+             WHERE e.id = ?1 AND e.removed_ms IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
+                 AND j.status NOT IN ('completed', 'cancelled')))",
+            params![id.0.to_string()],
+            |r| r.get(0),
+        )?;
+        if !eligible {
+            return Ok(false);
+        }
+        delete()?;
+        tx.execute(
+            "UPDATE archive_entries SET removed_ms = ?2 WHERE id = ?1",
+            params![id.0.to_string(), now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     fn uuid_set(&self, sql: &str) -> Result<HashSet<Uuid>, AppError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(sql)?;
