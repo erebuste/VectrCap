@@ -234,3 +234,72 @@ fn executable_file_source_is_reveal_only_even_when_present() {
             .any(|a| matches!(a, RequestedCompletionAction::OpenLocal(_)))
     );
 }
+
+#[test]
+fn dismiss_removes_a_visible_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/report", "report.pdf")
+            .unwrap();
+    accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "report.pdf",
+        ArtifactKind::File,
+        Ok(receipt),
+    );
+    let id = app.visible_notices()[0].view.id();
+    app.dispatch(AppCommand::DismissNotice(id));
+    assert!(app.visible_notices().is_empty());
+}
+
+#[test]
+fn disabling_notifications_withdraws_visible_notices() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/report", "report.pdf")
+            .unwrap();
+    accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "report.pdf",
+        ArtifactKind::File,
+        Ok(receipt),
+    );
+    assert_eq!(app.visible_notices().len(), 1);
+    app.dispatch(AppCommand::SetNotificationsEnabled(false));
+    assert!(app.visible_notices().is_empty());
+    assert!(!app.notifications_enabled());
+}
+
+#[test]
+fn dismissing_an_unknown_notice_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/report", "report.pdf")
+            .unwrap();
+    accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "report.pdf",
+        ArtifactKind::File,
+        Ok(receipt),
+    );
+    let id = app.visible_notices()[0].view.id();
+    app.dispatch(AppCommand::DismissNotice(id));
+    let effects = app.dispatch(AppCommand::DismissNotice(id));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::Error(_)))
+    );
+}

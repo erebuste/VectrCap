@@ -341,6 +341,14 @@ impl AppController {
                 }]
             }
             AppCommand::CancelConnectionTest => vec![AppEffect::CancelConnectionTest],
+            AppCommand::DismissNotice(id) => {
+                self.notifications.dismiss(id)?;
+                vec![]
+            }
+            AppCommand::SetNotificationsEnabled(enabled) => {
+                self.notifications.set_notifications_enabled(enabled);
+                vec![]
+            }
             AppCommand::Quit => {
                 self.lifecycle = Lifecycle::Draining;
                 self.workflows.clear();

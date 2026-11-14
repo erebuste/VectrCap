@@ -66,6 +66,8 @@ pub enum AppCommand {
         revision: u64,
     },
     CancelConnectionTest,
+    DismissNotice(crate::app::notifications::NoticeId),
+    SetNotificationsEnabled(bool),
     Quit,
 }
 #[derive(Debug, Clone, Copy)]
