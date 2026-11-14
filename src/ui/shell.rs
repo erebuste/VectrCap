@@ -22,6 +22,7 @@ pub struct Shell {
     view: DesktopView,
     tray: Tray,
     pane: SettingsPane,
+    history: super::history::HistoryPane,
     focus_revision: u64,
     current_window: Option<Window>,
     focus_requested: Arc<AtomicBool>,
@@ -38,6 +39,7 @@ impl Shell {
             client,
             tray,
             pane: SettingsPane::default(),
+            history: Default::default(),
             shown_since: Default::default(),
             focus_revision: 0,
             current_window: None,
@@ -184,6 +186,12 @@ impl eframe::App for Shell {
                     {
                         commands.push(AppCommand::Show(Window::BatchSummary));
                     }
+                    if ui
+                        .selectable_label(self.view.window == Some(Window::History), "History")
+                        .clicked()
+                    {
+                        commands.push(AppCommand::Show(Window::History));
+                    }
                     if ui.button("Return to tray").clicked() {
                         commands.push(AppCommand::CloseWindow);
                     }
@@ -211,6 +219,9 @@ impl eframe::App for Shell {
                                 self.pane
                                     .draw(ui, settings, self.view.notifications_enabled),
                             ),
+                            (Some(Window::History), Some(_)) => {
+                                commands.extend(self.history.draw(ui, &self.view))
+                            }
                             (Some(Window::BatchSummary), Some(_)) => {
                                 super::batch_summary::draw(ui, &self.view);
                             }

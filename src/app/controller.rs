@@ -114,6 +114,7 @@ pub struct BatchSummaryRow {
 }
 pub struct AppController {
     batch_jobs: Vec<super::types::JobId>,
+    history_query: crate::persistence::history::browser::HistoryQuery,
     manager: DestinationManager,
     history: Arc<History>,
     store: Arc<dyn CredentialStore>,
@@ -157,12 +158,21 @@ impl AppController {
             references,
             workflows: HashMap::new(),
             batch_jobs: vec![],
+            history_query: Default::default(),
             notifications,
             shell,
             clipboard,
             lifecycle: Lifecycle::Running,
             window,
         })
+    }
+    pub fn history_page(
+        &self,
+    ) -> Result<crate::persistence::history::browser::HistoryPage, AppError> {
+        self.history.browse(&self.history_query)
+    }
+    pub fn history_query(&self) -> &crate::persistence::history::browser::HistoryQuery {
+        &self.history_query
     }
     pub fn settings(&self) -> &Settings {
         self.manager.settings()
@@ -389,6 +399,15 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::QueryHistory(query) => {
+                self.history.browse(&query)?;
+                self.history_query = query;
+                vec![]
+            }
+            AppCommand::SetHistoryFavorite { id, favorite } => {
+                self.history.set_favorite(id, favorite)?;
+                vec![]
+            }
             AppCommand::ShowBatchSummary(jobs) => self.show_batch_summary(jobs)?,
             AppCommand::Show(window) => {
                 self.window = Some(window);

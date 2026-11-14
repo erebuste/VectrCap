@@ -32,6 +32,8 @@ pub struct DesktopView {
     pub lifecycle: Lifecycle,
     pub exit_requested: bool,
     pub jobs: Vec<UploadJob>,
+    pub history_query: crate::persistence::history::browser::HistoryQuery,
+    pub history_page: crate::persistence::history::browser::HistoryPage,
     pub batch_summary: Vec<super::controller::BatchSummaryRow>,
     pub transfers: HashMap<crate::app::types::JobId, (u64, Option<f64>)>,
     pub queue_paused: bool,
@@ -56,6 +58,8 @@ impl Default for DesktopView {
             exit_requested: false,
             jobs: vec![],
             batch_summary: vec![],
+            history_page: Default::default(),
+            history_query: Default::default(),
             transfers: HashMap::new(),
             queue_paused: false,
             error: None,
@@ -351,6 +355,13 @@ async fn serve(
             Ok(rows) => rows,
             Err(error) => break Err(error),
         };
+        if controller.window == Some(Window::History) {
+            effects.state.history_query = controller.history_query().clone();
+            effects.state.history_page = match controller.history_page() {
+                Ok(page) => page,
+                Err(error) => break Err(error),
+            };
+        }
         effects.state.notices = controller.visible_notices();
         effects.state.notifications_enabled = controller.notifications_enabled();
         if let Err(error) = effects.apply(results, &history).await {

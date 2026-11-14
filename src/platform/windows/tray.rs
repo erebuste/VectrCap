@@ -31,6 +31,7 @@ impl Tray {
         let map = choices.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let command = match event.id.as_ref() {
+                "history" => Some(AppCommand::Show(Window::History)),
                 "uploads" => Some(AppCommand::Show(Window::Uploads)),
                 "settings" => Some(AppCommand::Show(Window::Settings)),
                 "quit" => Some(AppCommand::Quit),
@@ -85,6 +86,8 @@ impl Tray {
             menu.append(&MenuItem::with_id("uploads", "Uploads", true, None))
                 .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("settings", "Settings", true, None))
+                .map_err(|_| error())?;
+            menu.append(&MenuItem::with_id("history", "History", true, None))
                 .map_err(|_| error())?;
             let submenu = Submenu::new("Destination", !destinations.is_empty());
             let mut choices = HashMap::new();

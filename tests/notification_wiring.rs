@@ -706,3 +706,43 @@ fn batch_navigation_can_resolve_a_job_outside_the_queue_snapshot() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].job.as_ref().unwrap().id, selected);
 }
+
+#[test]
+fn history_browser_searches_confirmed_links_and_preserves_controller_query() {
+    use vectrcap::app::types::UploadReceipt;
+    use vectrcap::persistence::history::browser::*;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let id = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "history.txt",
+        ArtifactKind::File,
+        Ok(UploadReceipt::new("https://links.example/unique-history-link", "history.txt").unwrap()),
+    );
+    let query = HistoryQuery {
+        search: "unique-history-link".into(),
+        ..Default::default()
+    };
+    app.dispatch(AppCommand::QueryHistory(query.clone()));
+    app.dispatch(AppCommand::Show(Window::History));
+    let page = app.history_page().unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].job.as_ref().unwrap().id, id);
+    app.dispatch(AppCommand::SetHistoryFavorite {
+        id: page.records[0].id,
+        favorite: true,
+    });
+    assert!(app.history_page().unwrap().records[0].favorite);
+    app.dispatch(AppCommand::Show(Window::Settings));
+    app.dispatch(AppCommand::Show(Window::History));
+    assert!(app.history_query() == &query);
+    let effects = app.dispatch(AppCommand::QueryHistory(HistoryQuery {
+        search: "x".repeat(257),
+        ..Default::default()
+    }));
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert!(app.history_query() == &query);
+}

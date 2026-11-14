@@ -23,6 +23,9 @@ pub const RECEIPT: &str = r#"{"url":"https://links.example/private-canary","name
 pub fn remove_schema_v3(c: &rusqlite::Connection) {
     c.execute_batch(
         "DROP TABLE upload_replacements;
+        DROP INDEX IF EXISTS jobs_history_latest;
+        DROP INDEX IF EXISTS history_browse_order;
+        DROP INDEX IF EXISTS history_favorites_order;
         DROP INDEX jobs_schedulable_order;
         DROP INDEX jobs_acceptance_ordinal;
         ALTER TABLE jobs DROP COLUMN acceptance_ordinal;

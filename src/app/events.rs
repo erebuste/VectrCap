@@ -21,6 +21,7 @@ pub enum Window {
     Settings,
     Uploads,
     BatchSummary,
+    History,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
@@ -32,6 +33,11 @@ pub enum Lifecycle {
 pub enum AppCommand {
     Show(Window),
     CloseWindow,
+    QueryHistory(crate::persistence::history::browser::HistoryQuery),
+    SetHistoryFavorite {
+        id: Uuid,
+        favorite: bool,
+    },
     ShowBatchSummary(Vec<crate::app::types::JobId>),
     ApplyDestinations {
         edit: DestinationEdit,

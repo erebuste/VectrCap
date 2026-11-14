@@ -1,3 +1,4 @@
+pub mod browser;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -353,6 +354,7 @@ impl History {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         migrate(&mut conn)?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS history_browse_order ON history_items(created_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS history_favorites_order ON history_items(favorite,created_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS jobs_history_latest ON jobs(artifact_id,acceptance_ordinal DESC);")?;
         Ok(History {
             conn: Mutex::new(conn),
         })
