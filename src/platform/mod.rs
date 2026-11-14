@@ -11,11 +11,11 @@ pub trait CredentialStore: Send + Sync {
     fn delete(&self, key: &CredentialKey) -> Result<(), AppError>;
 }
 
-pub struct CredentialClientFactory<S> {
+pub struct CredentialClientFactory<S: ?Sized> {
     store: std::sync::Arc<S>,
     root: Option<reqwest::Certificate>,
 }
-impl<S: CredentialStore> CredentialClientFactory<S> {
+impl<S: CredentialStore + ?Sized> CredentialClientFactory<S> {
     pub fn new(store: std::sync::Arc<S>) -> Self {
         Self { store, root: None }
     }
@@ -26,7 +26,9 @@ impl<S: CredentialStore> CredentialClientFactory<S> {
         }
     }
 }
-impl<S: CredentialStore> crate::vectr::uploader::ClientFactory for CredentialClientFactory<S> {
+impl<S: CredentialStore + ?Sized> crate::vectr::uploader::ClientFactory
+    for CredentialClientFactory<S>
+{
     fn client(
         &self,
         destination: &crate::app::destinations::DestinationSnapshot,

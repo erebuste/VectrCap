@@ -40,6 +40,9 @@ pub enum QueueCommand {
 }
 #[derive(Debug)]
 pub enum QueueEffect {
+    /// Post-command invalidation, including idle queue-wide gate changes.
+    /// Consumers reread durable state; this carries no independent state.
+    StateChanged,
     Start(Box<UploadJob>),
     Pausing(JobId),
     Paused(JobId),
@@ -415,6 +418,7 @@ impl QueueController {
                         closed = true;
                         self.handle(QueueCommand::PauseAll)
                     };
+                    effects.push(QueueEffect::StateChanged);
                     uploader.notify_controls();
                 }
                 event = event_rx.recv() => {
