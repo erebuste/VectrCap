@@ -214,9 +214,20 @@ impl DestinationManager {
     }
     /// Cooperating acceptance and edits share this leased revision boundary.
     pub fn ensure_revision(&self, expected_revision: u64) -> Result<(), AppError> {
-        if expected_revision != self.settings.revision
-            || self.repository.load_settings()? != self.settings
-        {
+        if expected_revision != self.settings.revision {
+            return Err(AppError::InvalidInput(
+                "settings changed; refresh before applying",
+            ));
+        }
+        self.ensure_not_corrupted()
+    }
+    /// Detects settings.json being modified out-of-band since it was loaded.
+    /// Workflow admission/acceptance pin their destination snapshot at
+    /// BeginWorkflow time by design (same as never-reused credential
+    /// generations) and intentionally skip the caller-revision half of
+    /// `ensure_revision`, which only has meaning for destination edits.
+    pub fn ensure_not_corrupted(&self) -> Result<(), AppError> {
+        if self.repository.load_settings()? != self.settings {
             return Err(AppError::InvalidInput(
                 "settings changed; refresh before applying",
             ));

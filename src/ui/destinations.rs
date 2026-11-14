@@ -112,6 +112,11 @@ impl ConnectionDraft {
         let tokens = if self.token.is_empty() {
             vec![]
         } else {
+            // Validate the borrowed field in place; only take (and thus
+            // blank) it once we know construction will succeed, so an
+            // invalid paste (e.g. trailing whitespace) leaves the field
+            // intact for the user to see and correct.
+            UploadToken::validate(&self.token)?;
             let token = UploadToken::new(std::mem::take(&mut *self.token))?;
             crate::platform::windows::credentials::validate_token(&token)?;
             vec![(id, token)]

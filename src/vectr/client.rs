@@ -73,14 +73,20 @@ impl UploadToken {
     pub(crate) fn encoded(&self) -> &[u8] {
         self.0.as_bytes()
     }
-    pub fn new(value: String) -> Result<Self, AppError> {
-        let value = Zeroizing::new(value);
+    /// Borrowing precheck so callers can validate a secret still held
+    /// elsewhere (e.g. a UI draft field) before moving/zeroizing it.
+    pub fn validate(value: &str) -> Result<(), AppError> {
         if value.is_empty()
             || value.len() > 8192
             || !value.bytes().all(|b| (0x21..=0x7e).contains(&b))
         {
             return Err(AppError::Credential("invalid upload token"));
         }
+        Ok(())
+    }
+    pub fn new(value: String) -> Result<Self, AppError> {
+        let value = Zeroizing::new(value);
+        Self::validate(&value)?;
         Ok(Self(value))
     }
     fn header(&self) -> Result<HeaderValue, AppError> {

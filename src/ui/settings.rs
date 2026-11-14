@@ -35,9 +35,11 @@ impl SettingsPane {
             self.draft = Some(ConnectionDraft::new(settings, None));
         }
     }
+    /// Does not touch `saving`: `reconcile` owns that field's lifecycle and
+    /// runs every frame regardless of which window is active, so switching
+    /// tabs mid-save must not cause the eventual save_result to be dropped.
     pub fn clear(&mut self, ctx: &egui::Context) {
         self.draft = None;
-        self.saving = None;
         self.remove = None;
         self.error = None;
         egui::text_edit::TextEditState::default().store(ctx, egui::Id::unique("connection-token"));
@@ -336,4 +338,29 @@ fn connection(
         });
     }
     Ok(command)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::settings::Settings;
+    #[test]
+    fn clear_does_not_drop_a_save_result_pending_across_a_window_switch() {
+        let mut pane = SettingsPane::default();
+        let settings = Settings::default();
+        pane.opened(&settings);
+        let request = Uuid::new_v4();
+        pane.saving = Some(request);
+        let ctx = egui::Context::default();
+        // Simulate switching away from the Settings window while the save
+        // is still in flight: this must not make the eventual result unreachable.
+        pane.clear(&ctx);
+        assert_eq!(pane.saving, Some(request));
+        let view = DesktopView {
+            save_result: Some((request, Err(AppError::Credential("invalid upload token")))),
+            ..Default::default()
+        };
+        pane.reconcile(&view, &ctx);
+        assert_eq!(pane.saving, None);
+        assert!(pane.error.is_some());
+    }
 }

@@ -74,6 +74,20 @@ fn offline_connection_can_save_with_exact_origin_token_and_default() {
 }
 
 #[test]
+fn invalid_token_is_rejected_without_blanking_the_draft_field() {
+    use vectrcap::{persistence::settings::Settings, ui::destinations::ConnectionDraft};
+    let settings = Settings::default();
+    let mut draft = ConnectionDraft::new(&settings, None);
+    draft.name = "Personal".into();
+    draft.origin = "https://example.invalid".into();
+    // Trailing newline from a copy-paste is outside the printable-ASCII
+    // range UploadToken requires, so this must fail validation.
+    *draft.token = "synthetic-token\n".into();
+    assert!(draft.prepare_save(&settings).is_err());
+    assert_eq!(draft.token.as_str(), "synthetic-token\n");
+}
+
+#[test]
 fn stale_metadata_never_verifies_changed_form_and_only_404_allows_manual_domain() {
     use vectrcap::{
         app::error::AppError, persistence::settings::Settings, ui::destinations::ConnectionDraft,

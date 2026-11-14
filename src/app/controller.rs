@@ -181,7 +181,7 @@ impl AppController {
                         "invalid, duplicate or excess workflow",
                     ));
                 }
-                self.manager.ensure_revision(self.settings().revision)?;
+                self.manager.ensure_not_corrupted()?;
                 let snapshot = resolve_destination(
                     selection,
                     DestinationSelection::Inherit,
@@ -197,7 +197,7 @@ impl AppController {
                     .workflows
                     .get(&id)
                     .ok_or(AppError::InvalidInput("unknown accepted workflow"))?;
-                self.manager.ensure_revision(self.settings().revision)?;
+                self.manager.ensure_not_corrupted()?;
                 self.artifacts.verify(&artifact)?;
                 // Reference stays live until the durable job owns it.
                 let job = self.history.create_job(&artifact, snapshot)?;
