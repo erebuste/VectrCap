@@ -212,6 +212,23 @@ impl DestinationManager {
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
+    /// Commit the preference before publishing it to the controller or UI.
+    pub fn set_notifications_enabled(&mut self, enabled: bool) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.notifications_enabled == enabled {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.notifications_enabled = enabled;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     /// Cooperating acceptance and edits share this leased revision boundary.
     pub fn ensure_revision(&self, expected_revision: u64) -> Result<(), AppError> {
         if expected_revision != self.settings.revision {

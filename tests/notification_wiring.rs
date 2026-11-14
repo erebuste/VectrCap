@@ -512,3 +512,66 @@ fn action_re_resolves_against_current_history_before_executing() {
     );
     assert!(shell.opened.lock().unwrap().is_empty());
 }
+
+#[test]
+fn notification_preference_survives_restart_and_can_be_enabled_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, ..) = open(dir.path());
+    let revision = app.settings().revision;
+    let effects = app.dispatch(AppCommand::SetNotificationsEnabled(false));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::SettingsSaved(_)))
+    );
+    assert!(!app.notifications_enabled());
+    assert_eq!(app.settings().revision, revision + 1);
+    drop(app);
+    let (mut app, ..) = open(dir.path());
+    assert!(!app.notifications_enabled());
+    app.dispatch(AppCommand::SetNotificationsEnabled(true));
+    drop(app);
+    let (app, ..) = open(dir.path());
+    assert!(app.notifications_enabled());
+}
+
+#[test]
+fn failed_preference_save_preserves_runtime_and_disk_state() {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, ..) = open(dir.path());
+    let old = app.settings().clone();
+    let held = OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(dir.path().join("settings.json"))
+        .unwrap();
+    let effects = app.dispatch(AppCommand::SetNotificationsEnabled(false));
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert!(app.notifications_enabled());
+    assert_eq!(app.settings(), &old);
+    drop(held);
+    assert_eq!(
+        vectrcap::persistence::settings::Settings::load(&dir.path().join("settings.json")).unwrap(),
+        old
+    );
+}
+
+#[test]
+fn preference_update_rejects_external_edits_and_repeated_value_preserves_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, ..) = open(dir.path());
+    let revision = app.settings().revision;
+    app.dispatch(AppCommand::SetNotificationsEnabled(true));
+    assert_eq!(app.settings().revision, revision);
+    let mut external = app.settings().clone();
+    external.revision += 1;
+    external.save(&dir.path().join("settings.json")).unwrap();
+    let effects = app.dispatch(AppCommand::SetNotificationsEnabled(false));
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert!(app.notifications_enabled());
+    assert_eq!(
+        vectrcap::persistence::settings::Settings::load(&dir.path().join("settings.json")).unwrap(),
+        external
+    );
+}

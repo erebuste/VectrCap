@@ -140,6 +140,8 @@ impl AppController {
             .destinations
             .is_empty()
             .then_some(Window::Settings);
+        let mut notifications = NotificationCenter::new();
+        notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
             manager,
             history,
@@ -147,7 +149,7 @@ impl AppController {
             artifacts,
             references,
             workflows: HashMap::new(),
-            notifications: NotificationCenter::new(),
+            notifications,
             shell,
             clipboard,
             lifecycle: Lifecycle::Running,
@@ -458,8 +460,9 @@ impl AppController {
                 vec![]
             }
             AppCommand::SetNotificationsEnabled(enabled) => {
+                self.manager.set_notifications_enabled(enabled)?;
                 self.notifications.set_notifications_enabled(enabled);
-                vec![]
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
             AppCommand::ExecuteCompletionAction { notice, action } => {
                 self.notifications.request(notice, &action)?;

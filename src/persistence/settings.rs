@@ -254,10 +254,17 @@ pub struct Settings {
     /// Local optimistic-concurrency version, never a secret or export identity.
     #[serde(default)]
     pub revision: u64,
+    /// Missing in older settings files: preserve the enabled default.
+    #[serde(default = "notifications_default_enabled")]
+    pub notifications_enabled: bool,
     pub destinations: Destinations,
     pub archive: ArchivePolicy,
     pub filename: FilenamePreset,
     pub recording: RecordingLimits,
+}
+
+fn notifications_default_enabled() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -265,6 +272,7 @@ impl Default for Settings {
         Settings {
             version: SETTINGS_VERSION,
             revision: 0,
+            notifications_enabled: true,
             destinations: Destinations::default(),
             archive: ArchivePolicy::default(),
             filename: FilenamePreset::default(),

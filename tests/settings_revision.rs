@@ -43,3 +43,16 @@ fn failed_atomic_replace_preserves_old_revision_and_has_no_partial_output() {
     assert_eq!(Settings::load(&path).unwrap(), old);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
+
+#[test]
+fn legacy_settings_default_notifications_on_and_reject_invalid_values() {
+    let mut value = serde_json::to_value(Settings::default()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("notifications_enabled");
+    let settings: Settings = serde_json::from_value(value.clone()).unwrap();
+    assert!(settings.notifications_enabled);
+    value["notifications_enabled"] = serde_json::json!("false");
+    assert!(serde_json::from_value::<Settings>(value).is_err());
+}
