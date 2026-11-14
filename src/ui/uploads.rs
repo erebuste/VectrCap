@@ -1,14 +1,23 @@
 use crate::{
     app::{
-        desktop::DesktopView,
+        desktop::{DesktopClient, DesktopView},
         events::{AppCommand, QueueAction},
     },
     persistence::history::JobStatus,
 };
 use eframe::egui::Ui;
-pub fn draw(ui: &mut Ui, view: &DesktopView) -> Vec<AppCommand> {
+pub fn draw(ui: &mut Ui, view: &DesktopView, client: &DesktopClient) -> Vec<AppCommand> {
     let mut commands = vec![];
     ui.heading("Uploads");
+    if ui.button("Upload file…").clicked() {
+        crate::platform::windows::file_dialog::spawn_pick_and_upload(client.clone());
+    }
+    if !view.failed_uploads.is_empty() {
+        ui.add_space(6.0);
+        for (name, error) in &view.failed_uploads {
+            ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {error}"));
+        }
+    }
     ui.label(if view.queue_paused {
         "Queue paused. Resume all keeps individually paused jobs paused."
     } else {

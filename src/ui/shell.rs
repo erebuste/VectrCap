@@ -229,7 +229,7 @@ impl eframe::App for Shell {
                                 super::batch_summary::draw(ui, &self.view);
                             }
                             (Some(Window::Uploads), Some(_)) => {
-                                commands.extend(super::uploads::draw(ui, &self.view))
+                                commands.extend(super::uploads::draw(ui, &self.view, &self.client))
                             }
                             (_, None) => {
                                 ui.label("Opening local settings…");

@@ -508,3 +508,297 @@ async fn same_origin_controller_snapshots_resolve_their_own_tokens() {
     assert!(requests[0].headers.contains("authorization: synthetic-a"));
     assert!(requests[1].headers.contains("authorization: synthetic-b"));
 }
+
+/// Simulates the desktop staging driver for a controller-level test: calls
+/// the real `ArtifactStore::stage_file` (or passes through its real error
+/// for a bad path) and feeds the outcome into `on_event`, exactly like
+/// `src/app/desktop.rs`'s staging task does.
+fn stage_and_feed(
+    app: &mut AppController,
+    artifacts: &ArtifactStore,
+    batch: uuid::Uuid,
+    path: &std::path::Path,
+) -> Vec<AppEffect> {
+    let display_name = path.file_name().unwrap().to_string_lossy().into_owned();
+    let outcome = artifacts.stage_file(path, ArtifactKind::File);
+    app.on_event(AppEvent::FileStaged {
+        batch,
+        display_name,
+        outcome,
+    })
+}
+
+#[test]
+fn file_selection_batch_keeps_one_destination_across_a_default_change_during_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store.clone());
+    let first = seed(
+        &mut app,
+        "Original",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-a",
+    );
+    let artifacts = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let source_a = dir.path().join("a.txt");
+    let source_b = dir.path().join("b.txt");
+    std::fs::write(&source_a, b"file a").unwrap();
+    std::fs::write(&source_b, b"file b").unwrap();
+
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(vec![
+        source_a.clone(),
+        source_b.clone(),
+    ]));
+    let batch = effects
+        .iter()
+        .find_map(|e| match e {
+            AppEffect::StageFiles { batch, paths } => {
+                assert_eq!(paths, &[source_a.clone(), source_b.clone()]);
+                Some(*batch)
+            }
+            _ => None,
+        })
+        .expect("file selection accepted");
+    assert_eq!(app.active_workflow_count(), 1);
+
+    // Stage the first file, then change the default destination before the
+    // second file is staged. Both files must still use the ORIGINAL snapshot.
+    let effects_a = stage_and_feed(&mut app, &artifacts, batch, &source_a);
+    assert!(
+        effects_a
+            .iter()
+            .any(|e| matches!(e, AppEffect::JobAccepted(_)))
+    );
+    // Still reserved: the second file has not finished staging yet.
+    assert_eq!(app.active_workflow_count(), 1);
+
+    let second = seed(
+        &mut app,
+        "Later default",
+        ServerOrigin::parse("https://later.invalid").unwrap(),
+        "synthetic-b",
+    );
+    app.dispatch(AppCommand::SetDefault {
+        id: second,
+        revision: app.settings().revision,
+    });
+    assert_eq!(app.settings().destinations.default_id(), Some(second));
+
+    let effects_b = stage_and_feed(&mut app, &artifacts, batch, &source_b);
+    assert!(
+        effects_b
+            .iter()
+            .any(|e| matches!(e, AppEffect::JobAccepted(_)))
+    );
+    // Staging is done for the whole batch; the reservation is released.
+    assert_eq!(app.active_workflow_count(), 0);
+
+    let history = History::open(&dir.path().join("history.db")).unwrap();
+    let jobs = history.shell_jobs().unwrap();
+    assert_eq!(jobs.len(), 2);
+    for job in &jobs {
+        assert_eq!(
+            job.destination.id, first,
+            "must keep the batch's original snapshot"
+        );
+        assert_eq!(job.destination.label, "Original");
+    }
+    // Original user files are never modified by staging.
+    assert_eq!(std::fs::read(&source_a).unwrap(), b"file a");
+    assert_eq!(std::fs::read(&source_b).unwrap(), b"file b");
+}
+
+#[test]
+fn bad_file_alongside_valid_file_in_a_batch_still_uploads_the_valid_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store);
+    seed(
+        &mut app,
+        "Personal",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-a",
+    );
+    let artifacts = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, b"valid file").unwrap();
+    let missing = dir.path().join("does-not-exist.txt");
+
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(vec![
+        good.clone(),
+        missing.clone(),
+    ]));
+    let batch = effects
+        .iter()
+        .find_map(|e| match e {
+            AppEffect::StageFiles { batch, .. } => Some(*batch),
+            _ => None,
+        })
+        .unwrap();
+
+    let good_effects = stage_and_feed(&mut app, &artifacts, batch, &good);
+    let job_id = good_effects
+        .iter()
+        .find_map(|e| match e {
+            AppEffect::JobAccepted(id) => Some(*id),
+            _ => None,
+        })
+        .expect("the valid sibling file is still accepted");
+
+    let bad_effects = stage_and_feed(&mut app, &artifacts, batch, &missing);
+    assert!(matches!(
+        bad_effects.as_slice(),
+        [AppEffect::FileRejected { display_name, .. }] if display_name == "does-not-exist.txt"
+    ));
+
+    // The batch fully resolved: no leaked workflow reservation.
+    assert_eq!(app.active_workflow_count(), 0);
+    let history = History::open(&dir.path().join("history.db")).unwrap();
+    let jobs = history.shell_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, job_id);
+    assert_eq!(std::fs::read(&good).unwrap(), b"valid file");
+}
+
+#[test]
+fn file_selection_without_a_configured_destination_fails_before_touching_any_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store);
+    let path = dir.path().join("a.txt");
+    std::fs::write(&path, b"content").unwrap();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(vec![path.clone()]));
+    assert!(matches!(
+        effects.as_slice(),
+        [AppEffect::Error(AppError::NeedsSetup(_))]
+    ));
+    assert_eq!(app.active_workflow_count(), 0);
+    // Nothing was staged: the source still has its original bytes, and no
+    // spool directory was ever populated.
+    assert_eq!(std::fs::read(&path).unwrap(), b"content");
+    assert!(
+        !dir.path().join("spool").exists()
+            || std::fs::read_dir(dir.path().join("spool"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
+fn file_selection_bounds_batch_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store);
+    seed(
+        &mut app,
+        "Personal",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-a",
+    );
+    let too_many = (0..101)
+        .map(|i| dir.path().join(format!("f{i}.txt")))
+        .collect();
+    assert!(matches!(
+        app.dispatch(AppCommand::AcceptFileSelection(too_many))
+            .as_slice(),
+        [AppEffect::Error(AppError::InvalidInput(_))]
+    ));
+    assert_eq!(app.active_workflow_count(), 0);
+    assert!(matches!(
+        app.dispatch(AppCommand::AcceptFileSelection(vec![]))
+            .as_slice(),
+        [AppEffect::Error(AppError::InvalidInput(_))]
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_file_batch_settles_two_files_through_a_fixture_tls_server() {
+    use support::{Fixture, RECEIPT, Reply};
+    let server = Fixture::new(vec![Reply::json(200, RECEIPT), Reply::json(200, RECEIPT)]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store.clone());
+    seed(&mut app, "Personal", server.origin.clone(), "synthetic-a");
+    drop(app);
+    let first = dir.path().join("first.txt");
+    let second = dir.path().join("second.txt");
+    // Empty files use the single-request multipart path, keeping this fixture
+    // to one reply per file instead of a full create/put/complete sequence.
+    std::fs::write(&first, []).unwrap();
+    std::fs::write(&second, []).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let runtime = DesktopRuntime::spawn(
+        dir.path().into(),
+        store.clone(),
+        Arc::new(CredentialClientFactory::with_root_certificate(
+            store,
+            server.root.clone(),
+        )),
+        Arc::new(move || {
+            let _ = tx.send(());
+        }),
+    )
+    .unwrap();
+    wait(&runtime.client, &rx, |s| s.settings.is_some());
+    runtime
+        .client
+        .submit(AppCommand::AcceptFileSelection(vec![first, second]))
+        .unwrap();
+    let state = wait(&runtime.client, &rx, |s| {
+        s.jobs.len() == 2 && s.jobs.iter().all(|j| j.status.is_terminal())
+    });
+    assert!(
+        state
+            .jobs
+            .iter()
+            .all(|j| matches!(j.status, JobStatus::Completed(_)))
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    runtime.client.submit(AppCommand::Quit).unwrap();
+    wait(&runtime.client, &rx, |s| s.lifecycle == Lifecycle::Exited);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_during_staging_never_orphans_an_accepted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store.clone());
+    seed(
+        &mut app,
+        "Personal",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-a",
+    );
+    drop(app);
+    let path = dir.path().join("during-quit.txt");
+    std::fs::write(&path, b"synthetic").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let runtime = DesktopRuntime::spawn(
+        dir.path().into(),
+        store.clone(),
+        Arc::new(CredentialClientFactory::new(store)),
+        Arc::new(move || {
+            let _ = tx.send(());
+        }),
+    )
+    .unwrap();
+    wait(&runtime.client, &rx, |s| s.settings.is_some());
+    runtime
+        .client
+        .submit(AppCommand::AcceptFileSelection(vec![path]))
+        .unwrap();
+    runtime.client.submit(AppCommand::Quit).unwrap();
+    wait(&runtime.client, &rx, |s| s.lifecycle == Lifecycle::Exited);
+    // Whatever landed in the spool must have a durable job record: staging
+    // and quitting concurrently must never leave an orphaned spool file, and
+    // must never silently lose the accepted file either.
+    let history = History::open(&dir.path().join("history.db")).unwrap();
+    let jobs = history.shell_jobs().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let spool_files = std::fs::read_dir(&spool_dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    assert!(jobs.len() <= 1 && spool_files <= 1);
+    assert_eq!(jobs.len(), spool_files);
+}

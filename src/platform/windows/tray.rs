@@ -30,6 +30,10 @@ impl Tray {
         let choices: Choices = Arc::new(Mutex::new(HashMap::new()));
         let map = choices.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if event.id.as_ref() == "upload-file" {
+                super::file_dialog::spawn_pick_and_upload(client.clone());
+                return;
+            }
             let command = match event.id.as_ref() {
                 "history" => Some(AppCommand::Show(Window::History)),
                 "uploads" => Some(AppCommand::Show(Window::Uploads)),
@@ -83,6 +87,8 @@ impl Tray {
     pub fn update(&mut self, destinations: &Destinations, revision: u64) -> Result<(), AppError> {
         if self.revision != Some(revision) {
             let menu = Menu::new();
+            menu.append(&MenuItem::with_id("upload-file", "Upload file", true, None))
+                .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("uploads", "Uploads", true, None))
                 .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("settings", "Settings", true, None))

@@ -14,6 +14,7 @@ use crate::{
         uploader_info::UploaderInfoSupport,
     },
 };
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,11 @@ pub enum AppCommand {
         notice: crate::app::notifications::NoticeId,
         action: crate::app::notifications::RequestedCompletionAction,
     },
+    /// A confirmed native file-picker selection (1 to 100 paths). The
+    /// destination default is resolved exactly once, here, before any file
+    /// is staged, and reused for every file in the batch regardless of how
+    /// long staging takes or whether the default changes meanwhile.
+    AcceptFileSelection(Vec<PathBuf>),
     Quit,
 }
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +129,12 @@ pub enum AppEvent {
     ConnectionTest {
         request: Uuid,
         result: Result<UploaderInfoSupport, AppError>,
+    },
+    /// One file from an accepted batch finished staging (or failed to).
+    FileStaged {
+        batch: Uuid,
+        display_name: String,
+        outcome: Result<Artifact, AppError>,
     },
 }
 pub enum AppEffect {
@@ -154,4 +166,15 @@ pub enum AppEffect {
     CancelConnectionTest,
     Exit,
     Error(AppError),
+    /// Begin bounded off-thread staging for every path in an accepted batch.
+    StageFiles {
+        batch: Uuid,
+        paths: Vec<PathBuf>,
+    },
+    /// One file in a batch could not be staged; its sibling files are
+    /// unaffected. No job was created and no original file was touched.
+    FileRejected {
+        display_name: String,
+        error: AppError,
+    },
 }

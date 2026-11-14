@@ -5,6 +5,7 @@ use super::{
     events::*,
 };
 use crate::{
+    app::types::{Artifact, ArtifactKind},
     persistence::{
         artifacts::ArtifactStore,
         history::{History, UploadJob},
@@ -44,6 +45,9 @@ pub struct DesktopView {
     pub accepted_workflows: usize,
     pub notices: Vec<super::controller::NoticeDisplay>,
     pub notifications_enabled: bool,
+    /// Files rejected by the current/most recent batch's staging, bounded;
+    /// cleared when a new native-picker batch is accepted.
+    pub failed_uploads: Vec<(String, AppError)>,
     pub connection: Option<(
         uuid::Uuid,
         Result<crate::vectr::uploader_info::UploaderInfoSupport, AppError>,
@@ -70,6 +74,7 @@ impl Default for DesktopView {
             accepted_workflows: 0,
             notices: vec![],
             notifications_enabled: true,
+            failed_uploads: vec![],
             connection: None,
         }
     }
@@ -174,12 +179,15 @@ type ConnectionTask = tokio::task::JoinHandle<(
     uuid::Uuid,
     Result<crate::vectr::uploader_info::UploaderInfoSupport, AppError>,
 )>;
+type StagingTask = (uuid::Uuid, String, Result<Artifact, AppError>);
 struct Effects {
     queue: Option<mpsc::Sender<QueueCommand>>,
     metadata: Option<ConnectionTask>,
     state: DesktopView,
     local_actions: tokio::task::JoinSet<Result<(), AppError>>,
     local_cancel: CancellationToken,
+    artifacts: Arc<ArtifactStore>,
+    staging: tokio::task::JoinSet<StagingTask>,
 }
 impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
@@ -259,6 +267,33 @@ impl Effects {
                     self.state.connection = None;
                 }
                 AppEffect::Error(error) => self.state.error = Some(error),
+                AppEffect::StageFiles { batch, paths } => {
+                    self.state.failed_uploads.clear();
+                    for path in paths {
+                        let artifacts = self.artifacts.clone();
+                        let cancel = self.local_cancel.clone();
+                        let display_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "selected file".to_owned());
+                        self.staging.spawn_blocking(move || {
+                            let outcome = if cancel.is_cancelled() {
+                                Err(AppError::Cancelled)
+                            } else {
+                                artifacts.stage_file(&path, ArtifactKind::File)
+                            };
+                            (batch, display_name, outcome)
+                        });
+                    }
+                }
+                AppEffect::FileRejected {
+                    display_name,
+                    error,
+                } => {
+                    if self.state.failed_uploads.len() < 100 {
+                        self.state.failed_uploads.push((display_name, error));
+                    }
+                }
                 AppEffect::DrainWorker => {
                     self.local_cancel.cancel();
                     self.state.exit_requested = true;
@@ -319,12 +354,14 @@ async fn serve(
         Arc::new(crate::platform::windows::clipboard::WindowsClipboard),
     )?;
     let queue = QueueController::new(history.clone())?;
-    let uploader = Arc::new(Uploader::new(history.clone(), artifacts, factory));
+    let uploader = Arc::new(Uploader::new(history.clone(), artifacts.clone(), factory));
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
     let mut effects = Effects {
         local_actions: tokio::task::JoinSet::new(),
         local_cancel: CancellationToken::new(),
+        artifacts: artifacts.clone(),
+        staging: tokio::task::JoinSet::new(),
         queue: Some(queue_tx),
         metadata: None,
         state: DesktopView {
@@ -344,6 +381,14 @@ async fn serve(
         let results = tokio::select! {
             result = effects.local_actions.join_next(), if !effects.local_actions.is_empty() => {
                 match result {Some(Ok(Ok(())))=>vec![],Some(Ok(Err(AppError::Cancelled)))=>vec![],Some(Ok(Err(error)))=>vec![AppEffect::Error(error)],_=>vec![AppEffect::Error(AppError::Persistence("local action worker failed"))]}
+            }
+            // No lifecycle guard: a file already accepted into a batch must
+            // still become a durable job even if Quit arrives mid-staging.
+            result = effects.staging.join_next(), if !effects.staging.is_empty() => {
+                match result {
+                    Some(Ok((batch, display_name, outcome))) => controller.on_event(AppEvent::FileStaged { batch, display_name, outcome }),
+                    _ => vec![AppEffect::Error(AppError::Persistence("file staging worker failed"))],
+                }
             }
             _ = stop.cancelled(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::Quit),
             command = commands.recv(), if controller.lifecycle == Lifecycle::Running => {
@@ -398,6 +443,19 @@ async fn serve(
     // and let runtime teardown abort a request with an unrecorded outcome.
     effects.local_cancel.cancel();
     while effects.local_actions.join_next().await.is_some() {}
+    // A file already accepted into a batch durably becomes a job the moment
+    // `on_event` runs, even though nothing reads the published view anymore;
+    // draining here (instead of dropping the JoinSet) is what prevents an
+    // in-flight staged file from being orphaned without a job record.
+    while let Some(result) = effects.staging.join_next().await {
+        if let Ok((batch, display_name, outcome)) = result {
+            controller.on_event(AppEvent::FileStaged {
+                batch,
+                display_name,
+                outcome,
+            });
+        }
+    }
     effects.queue.take();
     if let Some(task) = effects.metadata.take() {
         task.abort();

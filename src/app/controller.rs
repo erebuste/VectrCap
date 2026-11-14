@@ -112,6 +112,19 @@ pub struct BatchSummaryRow {
     pub job: Option<UploadJob>,
     pub local_available: bool,
 }
+/// Tracks one accepted native-file-picker batch from acceptance through its
+/// last upload settlement, so every file's completion can be grouped into a
+/// single notice instead of one toast per file.
+#[derive(Default)]
+struct FileBatch {
+    /// Paths not yet staged (succeeded or failed). The destination snapshot
+    /// in `workflows` is released once this reaches zero, independent of
+    /// whether any created jobs have finished uploading yet.
+    staging_remaining: usize,
+    /// Created jobs not yet in a terminal state for notification purposes.
+    jobs_remaining: usize,
+    completions: Vec<JobCompletion>,
+}
 pub struct AppController {
     batch_jobs: Vec<super::types::JobId>,
     history_query: crate::persistence::history::browser::HistoryQuery,
@@ -121,6 +134,8 @@ pub struct AppController {
     artifacts: Arc<ArtifactStore>,
     references: Arc<References>,
     workflows: HashMap<Uuid, DestinationSnapshot>,
+    batches: HashMap<Uuid, FileBatch>,
+    job_batch: HashMap<super::types::JobId, Uuid>,
     notifications: NotificationCenter,
     shell: Arc<dyn ShellActions>,
     clipboard: Arc<dyn ClipboardWriter>,
@@ -157,6 +172,8 @@ impl AppController {
             artifacts,
             references,
             workflows: HashMap::new(),
+            batches: HashMap::new(),
+            job_batch: HashMap::new(),
             batch_jobs: vec![],
             history_query: Default::default(),
             notifications,
@@ -370,6 +387,145 @@ impl AppController {
             _ => None,
         };
         Ok(notice)
+    }
+    /// Accepts a confirmed native-picker selection (1 to 100 paths). Resolves
+    /// the default destination exactly once for the whole batch, reads its
+    /// credential eagerly so a missing/broken setup fails here with no file
+    /// touched, then hands every path to the shell for bounded off-thread
+    /// staging. `MAX_BATCH_ITEMS` also bounds `CompletionNotice::Batch`.
+    fn accept_file_selection(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        if paths.is_empty() || paths.len() > super::notifications::MAX_BATCH_ITEMS {
+            return Err(AppError::InvalidInput("select 1 to 100 files to upload"));
+        }
+        if self.workflows.len() >= 32 {
+            return Err(AppError::InvalidInput(
+                "too many concurrent uploads accepted",
+            ));
+        }
+        self.manager.ensure_not_corrupted()?;
+        let snapshot = resolve_destination(
+            DestinationSelection::Inherit,
+            DestinationSelection::Inherit,
+            &self.settings().destinations,
+        )?;
+        self.store.read(&snapshot.credential)?;
+        let batch = Uuid::new_v4();
+        self.workflows.insert(batch, snapshot);
+        self.batches.insert(
+            batch,
+            FileBatch {
+                staging_remaining: paths.len(),
+                ..Default::default()
+            },
+        );
+        self.update_active()?;
+        Ok(vec![
+            AppEffect::WorkflowAccepted(batch),
+            AppEffect::StageFiles { batch, paths },
+        ])
+    }
+    /// Creates the durable job for one successfully staged batch file,
+    /// reusing the batch's single pre-resolved destination snapshot.
+    fn accept_batch_artifact(
+        &mut self,
+        batch: Uuid,
+        artifact: &Artifact,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        let snapshot = self
+            .workflows
+            .get(&batch)
+            .ok_or(AppError::InvalidInput("unknown accepted workflow"))?;
+        self.manager.ensure_not_corrupted()?;
+        self.artifacts.verify(artifact)?;
+        let job = self.history.create_job(artifact, snapshot)?;
+        self.job_batch.insert(job.id, batch);
+        if let Some(state) = self.batches.get_mut(&batch) {
+            state.jobs_remaining += 1;
+        }
+        Ok(vec![
+            AppEffect::JobAccepted(job.id),
+            AppEffect::Queue(crate::vectr::queue::QueueCommand::Admit(job.id)),
+        ])
+    }
+    /// One path from an accepted batch finished staging, successfully or not.
+    fn file_staged(
+        &mut self,
+        batch: Uuid,
+        display_name: String,
+        outcome: Result<Artifact, AppError>,
+    ) -> Vec<AppEffect> {
+        let mut effects = Vec::new();
+        match outcome {
+            Ok(artifact) => match self.accept_batch_artifact(batch, &artifact) {
+                Ok(job_effects) => effects.extend(job_effects),
+                Err(error) => effects.push(AppEffect::Error(error)),
+            },
+            Err(error) => effects.push(AppEffect::FileRejected {
+                display_name,
+                error,
+            }),
+        }
+        if let Some(state) = self.batches.get_mut(&batch) {
+            state.staging_remaining = state.staging_remaining.saturating_sub(1);
+            if state.staging_remaining == 0 {
+                // Every path has either become a durable job or been
+                // explicitly rejected; the destination reservation is no
+                // longer needed even if some jobs are still uploading.
+                self.workflows.remove(&batch);
+                let _ = self.update_active();
+                let _ = self.manager.cleanup();
+            }
+        }
+        self.maybe_flush_batch(batch, &mut effects);
+        effects
+    }
+    /// Removes `job` from its batch's pending count (if any) and, once
+    /// staging and every created job have resolved, emits one grouped
+    /// completion notice for the whole batch instead of one per job.
+    fn resolve_batch_job(
+        &mut self,
+        job: super::types::JobId,
+        completion: Option<JobCompletion>,
+        effects: &mut Vec<AppEffect>,
+    ) -> bool {
+        let Some(batch) = self.job_batch.remove(&job) else {
+            return false;
+        };
+        if let Some(state) = self.batches.get_mut(&batch) {
+            state.jobs_remaining = state.jobs_remaining.saturating_sub(1);
+            if let Some(completion) = completion {
+                state.completions.push(completion);
+            }
+        }
+        self.maybe_flush_batch(batch, effects);
+        true
+    }
+    fn maybe_flush_batch(&mut self, batch: Uuid, effects: &mut Vec<AppEffect>) {
+        let done = self
+            .batches
+            .get(&batch)
+            .is_some_and(|state| state.staging_remaining == 0 && state.jobs_remaining == 0);
+        if !done {
+            return;
+        }
+        let Some(state) = self.batches.remove(&batch) else {
+            return;
+        };
+        if state.completions.is_empty() {
+            return;
+        }
+        match self
+            .notifications
+            .record(CompletionNotice::Batch(state.completions))
+        {
+            Ok(_) => {}
+            // An already-visible duplicate is benign; see the single-job path below.
+            Err(AppError::InvalidInput(_)) => {}
+            Err(error) => effects.push(AppEffect::Error(error)),
+        }
     }
     pub fn dispatch(&mut self, command: AppCommand) -> Vec<AppEffect> {
         if matches!(command, AppCommand::Quit) && self.lifecycle != Lifecycle::Running {
@@ -626,6 +782,7 @@ impl AppController {
                 self.notifications.request(notice, &action)?;
                 self.execute_completion_action(notice, action)?
             }
+            AppCommand::AcceptFileSelection(paths) => self.accept_file_selection(paths)?,
             AppCommand::Quit => {
                 self.lifecycle = Lifecycle::Draining;
                 self.workflows.clear();
@@ -652,20 +809,40 @@ impl AppController {
                 let mut effects = vec![];
                 if let Ok(Some(job)) = self.history.job(id) {
                     match self.completion_for(&job) {
-                        Ok(Some(notice)) => match self.notifications.record(notice) {
-                            Ok(_) => {}
-                            // An already-visible duplicate for this job is
-                            // expected and benign; any other failure is real.
-                            Err(AppError::InvalidInput(_)) => {}
-                            Err(error) => effects.push(AppEffect::Error(error)),
-                        },
-                        Ok(None) => {}
+                        Ok(Some(CompletionNotice::Job(completion))) => {
+                            // A batch member's completion is collected into
+                            // one grouped notice instead of its own toast.
+                            if !self.resolve_batch_job(id, Some(completion.clone()), &mut effects) {
+                                match self.notifications.record(CompletionNotice::Job(completion)) {
+                                    Ok(_) => {}
+                                    // An already-visible duplicate for this
+                                    // job is expected and benign; any other
+                                    // failure is real.
+                                    Err(AppError::InvalidInput(_)) => {}
+                                    Err(error) => effects.push(AppEffect::Error(error)),
+                                }
+                            }
+                        }
+                        Ok(Some(CompletionNotice::Batch(_))) => {}
+                        Ok(None) => {
+                            // A cancelled batch member never completes; it
+                            // must still free its slot so sibling files are
+                            // not stuck waiting on it forever.
+                            if job.status == JobStatus::Cancelled {
+                                self.resolve_batch_job(id, None, &mut effects);
+                            }
+                        }
                         Err(error) => effects.push(AppEffect::Error(error)),
                     }
                 }
                 effects.push(AppEffect::RefreshQueue);
                 effects
             }
+            AppEvent::FileStaged {
+                batch,
+                display_name,
+                outcome,
+            } => self.file_staged(batch, display_name, outcome),
             AppEvent::Queue(_) => vec![AppEffect::RefreshQueue],
             AppEvent::ConnectionTest { request, result }
                 if self.lifecycle == Lifecycle::Running =>

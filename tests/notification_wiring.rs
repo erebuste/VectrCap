@@ -1068,3 +1068,151 @@ fn local_actions_are_deferred_cancellable_and_reject_removed_records() {
     );
     assert!(shell.opened.lock().unwrap().is_empty());
 }
+
+/// Drives a native multi-file selection exactly like the real staging driver
+/// in `src/app/desktop.rs`: accepts the batch, stages each path with the real
+/// `ArtifactStore`, admits each resulting job on a queue sharing the same
+/// History, and settles it with the given result, in order.
+fn accept_batch_and_settle(
+    app: &mut AppController,
+    history: &Arc<History>,
+    artifacts: &Arc<ArtifactStore>,
+    files: Vec<(&str, Result<vectrcap::app::types::UploadReceipt, AppError>)>,
+) -> Vec<vectrcap::app::types::JobId> {
+    let sources: Vec<_> = files
+        .iter()
+        .map(|(name, _)| {
+            let path = std::env::temp_dir().join(format!("{}-{name}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, b"synthetic").unwrap();
+            path
+        })
+        .collect();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(sources.clone()));
+    let batch = effects
+        .into_iter()
+        .find_map(|e| match e {
+            AppEffect::StageFiles { batch, .. } => Some(batch),
+            _ => None,
+        })
+        .expect("batch accepted");
+    let mut job_ids = Vec::new();
+    for source in &sources {
+        let display_name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let outcome = artifacts.stage_file(source, ArtifactKind::File);
+        std::fs::remove_file(source).ok();
+        let effects = app.on_event(AppEvent::FileStaged {
+            batch,
+            display_name,
+            outcome,
+        });
+        let job_id = effects
+            .into_iter()
+            .find_map(|e| match e {
+                AppEffect::JobAccepted(id) => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        job_ids.push(job_id);
+    }
+    let mut queue = QueueController::new(history.clone()).unwrap();
+    for (job_id, (_, result)) in job_ids.iter().zip(files) {
+        queue.handle(QueueCommand::Admit(*job_id));
+        history.set_session(*job_id, uuid::Uuid::new_v4()).unwrap();
+        let attempt = history.job(*job_id).unwrap().unwrap().attempt;
+        let effects = queue.handle(QueueCommand::Settled {
+            job: *job_id,
+            attempt,
+            result,
+        });
+        for effect in effects {
+            if let QueueEffect::Changed(id) = effect {
+                app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+            }
+        }
+    }
+    job_ids
+}
+
+#[test]
+fn batch_completion_is_one_grouped_notice_with_successful_links_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, clipboard) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/good", "good.txt").unwrap();
+    let jobs = accept_batch_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        vec![
+            ("good.txt", Ok(receipt.clone())),
+            ("bad.txt", Err(AppError::Network)),
+        ],
+    );
+    // One grouped notice for the whole batch, not two independent toasts.
+    let notices = app.visible_notices();
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert!(notice.view.is_batch());
+    assert_eq!(notice.view.items().len(), 2);
+    assert_eq!(notice.view.items()[0].job_id(), jobs[0]);
+    assert_eq!(notice.view.items()[1].job_id(), jobs[1]);
+    assert_eq!(
+        notice.view.items()[0].status(),
+        &CompletionStatus::uploaded()
+    );
+    assert!(matches!(
+        notice.view.items()[1].status(),
+        CompletionStatus::Failed(_)
+    ));
+    // Copying "successful links" must only ever copy the confirmed one.
+    let copy_action = notice
+        .actions
+        .iter()
+        .find(|a| matches!(a, RequestedCompletionAction::CopySuccessfulLinks { .. }))
+        .cloned()
+        .expect("batch offers copying its successful links");
+    let RequestedCompletionAction::CopySuccessfulLinks { jobs: successful } = &copy_action else {
+        unreachable!()
+    };
+    assert_eq!(successful, &[jobs[0]]);
+    app.dispatch(AppCommand::ExecuteCompletionAction {
+        notice: notice.view.id(),
+        action: copy_action,
+    });
+    assert_eq!(
+        clipboard.written.lock().unwrap().as_slice(),
+        [receipt.url().to_owned()]
+    );
+}
+
+#[test]
+fn batch_summary_opens_from_its_grouped_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, _clipboard) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/one", "one.txt").unwrap();
+    let other =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/two", "two.txt").unwrap();
+    let jobs = accept_batch_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        vec![("one.txt", Ok(receipt)), ("two.txt", Ok(other))],
+    );
+    let notice = app.visible_notices().remove(0);
+    let open_action = notice
+        .actions
+        .iter()
+        .find(|a| matches!(a, RequestedCompletionAction::OpenBatchSummary { .. }))
+        .cloned()
+        .unwrap();
+    app.dispatch(AppCommand::ExecuteCompletionAction {
+        notice: notice.view.id(),
+        action: open_action,
+    });
+    let summary = app.batch_summary().unwrap();
+    assert_eq!(summary.len(), 2);
+    assert_eq!(summary.iter().map(|r| r.id).collect::<Vec<_>>(), jobs);
+}
