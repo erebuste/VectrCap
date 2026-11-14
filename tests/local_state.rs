@@ -11,7 +11,7 @@ use vectrcap::app::error::AppError;
 use vectrcap::app::types::{ArtifactKind, UploadReceipt};
 use vectrcap::persistence::artifacts::ArtifactStore;
 use vectrcap::persistence::history::{History, JobStatus};
-use vectrcap::persistence::settings::{RecordingLimits, ServerOrigin, Settings};
+use vectrcap::persistence::settings::{LinkOrigin, RecordingLimits, ServerOrigin, Settings};
 
 fn snapshot() -> DestinationSnapshot {
     let mut d = Destinations::default();
@@ -100,6 +100,52 @@ fn rejects_unsafe_origins() {
         ServerOrigin::parse("https://vectr.example").unwrap(),
         ServerOrigin::parse("https://VECTR.example/").unwrap()
     );
+}
+
+#[test]
+fn dot_segment_origins_are_rejected_before_normalization() {
+    // WHATWG parsing reduces each of these paths to "/", so only a raw check catches them.
+    let dotted = [
+        "https://vectr.example/.",
+        "https://vectr.example/..",
+        "https://vectr.example/./",
+        "https://vectr.example/a/..",
+        "https://vectr.example:8443/a/../",
+        "https://vectr.example/%2e",
+    ];
+    for s in dotted {
+        assert!(
+            matches!(ServerOrigin::parse(s), Err(AppError::InvalidInput(_))),
+            "ServerOrigin {s:?}"
+        );
+        assert!(
+            matches!(LinkOrigin::parse(s), Err(AppError::InvalidInput(_))),
+            "LinkOrigin {s:?}"
+        );
+        let json = serde_json::to_string(s).unwrap();
+        assert!(serde_json::from_str::<ServerOrigin>(&json).is_err(), "serde {s:?}");
+        assert!(serde_json::from_str::<LinkOrigin>(&json).is_err(), "serde {s:?}");
+    }
+
+    // The same strings are refused inside a persisted settings document.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut s = Settings::default();
+    s.destinations
+        .add(
+            "Phone",
+            ServerOrigin::parse("https://vectr.example").unwrap(),
+            Some(LinkOrigin::parse("https://share.example").unwrap()),
+        )
+        .unwrap();
+    s.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    for field in ["origin", "link_domain_override"] {
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["destinations"]["items"][0][field] = "https://vectr.example/a/..".into();
+        fs::write(&path, v.to_string()).unwrap();
+        assert!(Settings::load(&path).is_err(), "settings {field}");
+    }
 }
 
 #[test]

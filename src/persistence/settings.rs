@@ -95,6 +95,11 @@ fn parse_https_origin(input: &str) -> Result<String, AppError> {
             "origin must start with https:// followed by a host",
         ));
     }
+    // `? # \` are already refused, so the authority ends at the first '/'. Whatever
+    // follows must be exactly "/": WHATWG would collapse "/a/.." or "/." to "/".
+    if input[8..].find('/').is_some_and(|i| &input[8 + i..] != "/") {
+        return Err(AppError::InvalidInput("origin must not contain a path"));
+    }
     let url = Url::parse(input).map_err(|_| AppError::InvalidInput("origin is not a valid URL"))?;
     if url.scheme() != "https" || url.host().is_none() {
         return Err(AppError::InvalidInput("origin must be an HTTPS host"));
