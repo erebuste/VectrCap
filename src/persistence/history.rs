@@ -292,7 +292,9 @@ impl History {
     /// if the job was cancelled, failed, or interrupted while the request was in
     /// flight (remote success is authoritative; no work restarts). The result
     /// must name the job's recorded session (`None` for a sessionless empty-file
-    /// upload) and an attempt that actually started. Recording the same receipt
+    /// upload, enforced against stored artifact size) and an attempt that
+    /// actually started. Nonempty artifacts require a matching recorded session.
+    /// Recording the same receipt
     /// again is a no-op; a different receipt for a completed job is refused.
     pub fn record_receipt(
         &self,
@@ -303,19 +305,41 @@ impl History {
     ) -> Result<(), AppError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        type ReceiptRow = (String, i64, Option<String>, Option<String>, Option<String>);
+        type ReceiptRow = (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
         let row: Option<ReceiptRow> = tx
             .query_row(
-                "SELECT status, attempt, session_id, receipt_url, receipt_name FROM jobs WHERE id = ?1",
+                "SELECT j.status, j.attempt, j.session_id, j.receipt_url, j.receipt_name, a.size \
+                 FROM jobs j JOIN artifacts a ON a.id = j.artifact_id WHERE j.id = ?1",
                 params![id.0.to_string()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let (status, started, stored_session, url, name) =
+        let (status, started, stored_session, url, name, size) =
             row.ok_or(AppError::InvalidInput("unknown upload job"))?;
         if attempt == 0 || i64::from(attempt) > started {
             return Err(AppError::InvalidInput(
                 "result does not belong to a started upload attempt",
+            ));
+        }
+        if size != 0 && session.is_none() {
+            return Err(AppError::InvalidInput(
+                "nonempty upload results require a recorded session",
             ));
         }
         if stored_session != session.map(|s| s.to_string()) {
@@ -526,6 +550,58 @@ impl History {
         self.lock()?.execute(
             "DELETE FROM archive_intents WHERE id = ?1",
             params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Recovery pages nominate work only. Recheck the complete live snapshot and
+    /// exclude every registered archive (manual/active eligibility belongs to
+    /// policy cleanup, never crash recovery), under the same write transaction
+    /// that orders registration/intent retirement. `delete` holds the validated
+    /// file open and must delete by that handle.
+    pub(crate) fn commit_recovered_archive_removal(
+        &self,
+        intent: &ArchiveIntent,
+        name: &str,
+        delete: impl FnOnce() -> Result<(), AppError>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let path = Path::new(&intent.root).join(&intent.month).join(name);
+        let path = path
+            .to_str()
+            .ok_or(AppError::InvalidInput("archive path must be valid Unicode"))?;
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM archive_intents i WHERE i.id = ?1 \
+             AND i.root = ?2 AND i.root_identity = ?3 AND i.month = ?4 \
+             AND i.size = ?5 AND i.sha256 = ?6 AND i.file_identity IS ?7 AND i.final_name IS ?8 \
+             AND NOT EXISTS (SELECT 1 FROM archive_entries e WHERE e.removed_ms IS NULL \
+                 AND (e.path = ?9 OR (e.root_identity = i.root_identity AND e.file_identity = i.file_identity))))",
+            params![intent.id.to_string(), intent.root, intent.root_identity.to_bytes().as_slice(),
+                intent.month, i64::try_from(intent.size).map_err(|_| corrupt())?, intent.sha256.as_slice(),
+                intent.file_identity.map(|i| i.to_bytes().to_vec()), intent.final_name, path],
+            |r| r.get(0),
+        )?;
+        if !eligible {
+            return Ok(false);
+        }
+        delete()?;
+        tx.execute(
+            "DELETE FROM archive_intents WHERE id = ?1",
+            params![intent.id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Retire only the fetched snapshot; never discard a writer's newer proof.
+    pub(crate) fn retire_archive_intent(&self, intent: &ArchiveIntent) -> Result<(), AppError> {
+        self.lock()?.execute(
+            "DELETE FROM archive_intents WHERE id = ?1 AND root = ?2 AND root_identity = ?3 \
+             AND month = ?4 AND size = ?5 AND sha256 = ?6 AND file_identity IS ?7 AND final_name IS ?8",
+            params![intent.id.to_string(), intent.root, intent.root_identity.to_bytes().as_slice(),
+                intent.month, i64::try_from(intent.size).map_err(|_| corrupt())?, intent.sha256.as_slice(),
+                intent.file_identity.map(|i| i.to_bytes().to_vec()), intent.final_name],
         )?;
         Ok(())
     }

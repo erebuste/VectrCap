@@ -97,8 +97,10 @@ impl Fixture {
             match s {
                 JobStatus::Completed(r) => {
                     let attempt = self.history.job(job.id).unwrap().unwrap().attempt;
+                    let session = uuid::Uuid::new_v4();
+                    self.history.set_session(job.id, session).unwrap();
                     self.history
-                        .record_receipt(job.id, attempt, None, r)
+                        .record_receipt(job.id, attempt, Some(session), r)
                         .unwrap();
                 }
                 s => self.history.transition(job.id, s.clone()).unwrap(),

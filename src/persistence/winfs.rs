@@ -26,15 +26,15 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
-    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
-    FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
-    FileDispositionInfoEx, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
+    DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+    FILE_WRITE_ATTRIBUTES, FileDispositionInfo, FileDispositionInfoEx, FileIdInfo,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -49,7 +49,8 @@ const DIR_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const FILE_SHARE: u32 = FILE_SHARE_READ;
 const OWNED_FILE_ACCESS: u32 = FILE_GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES;
 
-/// Volume serial + 128-bit file ID: identifies one file object on this machine.
+/// A qualified volume serial + FileIdInfo ID, or the all-zero unproven marker.
+/// Persisted IDs are filesystem-specific; never compare unproven markers as proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileIdentity {
     volume: u64,
@@ -57,6 +58,19 @@ pub(crate) struct FileIdentity {
 }
 
 impl FileIdentity {
+    const UNPROVEN: Self = Self {
+        volume: 0,
+        id: [0; 16],
+    };
+
+    pub(crate) fn is_proven(self) -> bool {
+        self != Self::UNPROVEN
+    }
+
+    pub(crate) fn same_object(self, other: Self) -> bool {
+        self.is_proven() && other.is_proven() && self == other
+    }
+
     pub(crate) fn to_bytes(self) -> [u8; 24] {
         let mut b = [0u8; 24];
         b[..8].copy_from_slice(&self.volume.to_le_bytes());
@@ -74,37 +88,121 @@ impl FileIdentity {
     }
 }
 
+/// Persistent automatic deletion is supported only for NTFS/ReFS with a
+/// successful full FileIdInfo query. FAT/exFAT, unknown/unqueryable volumes,
+/// and *every* legacy fallback are unproven. Saving still works there, but
+/// later policy/crash cleanup retains files. Immediate rollback of our own
+/// newly created, continuously held handle needs no persistent ID.
+///
+/// Microsoft documents FileIdInfo for comparing open objects, not eternal
+/// uniqueness across arbitrary filesystem restoration/cloning or ID reuse.
+/// Never infer ownership from a filename, length, hash or legacy index alone.
 pub(crate) fn identity(file: &File) -> io::Result<FileIdentity> {
-    let h = file.as_raw_handle();
+    let filesystem = match query_filesystem(file) {
+        Ok(fs) => fs,
+        Err(_) => return Ok(FileIdentity::UNPROVEN),
+    };
+    if !filesystem.eq_ignore_ascii_case("NTFS") && !filesystem.eq_ignore_ascii_case("ReFS") {
+        return Ok(FileIdentity::UNPROVEN);
+    }
+    let Ok(info) = query_file_id(file) else {
+        return Ok(FileIdentity::UNPROVEN);
+    };
+    let id = FileIdentity {
+        volume: info.VolumeSerialNumber,
+        id: info.FileId.Identifier,
+    };
+    // Treat reserved/empty IDs as unavailable rather than granting authority.
+    if id.id == [0; 16] {
+        return Ok(FileIdentity::UNPROVEN);
+    }
+    Ok(id)
+}
+
+fn query_filesystem(file: &File) -> io::Result<String> {
+    #[cfg(test)]
+    if let Some((filesystem, _)) = identity_queries::current(file) {
+        return Ok(filesystem.to_owned());
+    }
+    // Documented maximum is MAX_PATH + 1 WCHARs, including the terminator.
+    let mut name = [0u16; 261];
+    // SAFETY: optional outputs are null; the name buffer is live and bounded.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let end = name
+        .iter()
+        .position(|&c| c == 0)
+        .ok_or_else(|| invalid("unterminated filesystem name"))?;
+    String::from_utf16(&name[..end]).map_err(|_| invalid("invalid filesystem name"))
+}
+
+fn query_file_id(file: &File) -> io::Result<FILE_ID_INFO> {
+    #[cfg(test)]
+    if let Some((_, extended)) = identity_queries::current(file) {
+        return if extended {
+            let mut info = FILE_ID_INFO {
+                VolumeSerialNumber: 42,
+                ..Default::default()
+            };
+            info.FileId.Identifier = [7; 16];
+            Ok(info)
+        } else {
+            Err(io::Error::from_raw_os_error(87))
+        };
+    }
     let mut info = FILE_ID_INFO::default();
-    // SAFETY: `info` is a writable FILE_ID_INFO of the size passed; `h` is open.
+    // SAFETY: `info` is writable, correctly sized; `file` owns the live handle.
     let ok = unsafe {
         GetFileInformationByHandleEx(
-            h,
+            file.as_raw_handle(),
             FileIdInfo,
             (&raw mut info).cast(),
             size_of::<FILE_ID_INFO>() as u32,
         )
     };
-    if ok != 0 {
-        return Ok(FileIdentity {
-            volume: info.VolumeSerialNumber,
-            id: info.FileId.Identifier,
-        });
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(info)
     }
-    // File systems without 128-bit IDs (for example FAT) report the 64-bit index.
-    let mut legacy = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `legacy` is a writable BY_HANDLE_FILE_INFORMATION; `h` is open.
-    if unsafe { GetFileInformationByHandle(h, &mut legacy) } == 0 {
-        return Err(io::Error::last_os_error());
+}
+
+/// Test-only substitution of documented OS query responses; all file operations,
+/// transactions, hashing, rename and deletion in consumer tests remain real.
+#[cfg(test)]
+pub(crate) mod identity_queries {
+    use std::cell::Cell;
+    thread_local!(static QUERY: Cell<Option<(&'static str, bool)>> = const { Cell::new(None) });
+    pub(super) fn current(file: &std::fs::File) -> Option<(&'static str, bool)> {
+        // Keep real root identities so consumer tests exercise the file check.
+        if file.metadata().ok()?.is_dir() {
+            return None;
+        }
+        QUERY.with(Cell::get)
     }
-    let index = (u64::from(legacy.nFileIndexHigh) << 32) | u64::from(legacy.nFileIndexLow);
-    let mut id = [0u8; 16];
-    id[..8].copy_from_slice(&index.to_le_bytes());
-    Ok(FileIdentity {
-        volume: u64::from(legacy.dwVolumeSerialNumber),
-        id,
-    })
+    pub(crate) fn with<T>(fs: &'static str, extended: bool, run: impl FnOnce() -> T) -> T {
+        struct Reset(Option<(&'static str, bool)>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                QUERY.with(|q| q.set(self.0));
+            }
+        }
+        let _reset = Reset(QUERY.with(|q| q.replace(Some((fs, extended)))));
+        run()
+    }
 }
 
 fn invalid(msg: &'static str) -> io::Error {

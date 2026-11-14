@@ -271,7 +271,11 @@ fn reopens_pending_jobs() {
         history.set_job_paused(paused.id, true).unwrap();
         history.transition(done.id, JobStatus::Running).unwrap();
         let receipt = UploadReceipt::new("https://i.example/f/d.bin", "d.bin").unwrap();
-        history.record_receipt(done.id, 1, None, &receipt).unwrap();
+        let done_session = Uuid::new_v4();
+        history.set_session(done.id, done_session).unwrap();
+        history
+            .record_receipt(done.id, 1, Some(done_session), &receipt)
+            .unwrap();
         (resumable, uncertain, paused, done)
     }; // process "exits" here
 
@@ -348,7 +352,11 @@ fn job_transitions_are_validated_and_sanitized() {
     history.transition(job.id, JobStatus::Running).unwrap();
     let receipt = UploadReceipt::new("https://i.example/f/a.bin", "a.bin").unwrap();
     assert_eq!(history.job(job.id).unwrap().unwrap().attempt, 2);
-    history.record_receipt(job.id, 2, None, &receipt).unwrap();
+    let session = Uuid::new_v4();
+    history.set_session(job.id, session).unwrap();
+    history
+        .record_receipt(job.id, 2, Some(session), &receipt)
+        .unwrap();
 
     // A confirmed receipt is terminal and never downgraded.
     for next in [
@@ -466,7 +474,15 @@ fn late_receipt_after_cancel_fail_or_interrupt_is_kept_and_bound() {
             let name = format!("{n}.bin");
             let art = store
                 .stage_file(
-                    &write(dir.path(), &name, name.as_bytes()),
+                    &write(
+                        dir.path(),
+                        &name,
+                        if session.is_none() {
+                            b""
+                        } else {
+                            name.as_bytes()
+                        },
+                    ),
                     ArtifactKind::File,
                 )
                 .unwrap();
@@ -556,6 +572,18 @@ fn late_receipt_after_cancel_fail_or_interrupt_is_kept_and_bound() {
     history
         .record_receipt(empty, 1, None, &receipt("e"))
         .unwrap();
+
+    // The actual zero-byte single upload keeps late/idempotent/conflict semantics.
+    assert_eq!(history.job(empty).unwrap().unwrap().artifact.size, 0);
+    history
+        .record_receipt(empty, 1, None, &receipt("e"))
+        .unwrap();
+    assert!(invalid(history.record_receipt(
+        empty,
+        1,
+        None,
+        &receipt("other")
+    )));
 
     // Same receipt again is idempotent; a conflicting one is refused.
     history
@@ -709,4 +737,50 @@ fn settings_roundtrip_is_validated_and_versioned() {
     bad.recording.gif_max_seconds = 0;
     assert!(bad.save(&path).is_err());
     assert_eq!(Settings::load(&path).unwrap(), s);
+}
+
+#[test]
+fn sessionless_receipt_rejects_nonempty_pending() {
+    rejects_nonempty_sessionless(JobStatus::Pending);
+}
+
+#[test]
+fn sessionless_receipt_rejects_nonempty_cancelled() {
+    rejects_nonempty_sessionless(JobStatus::Cancelled);
+}
+
+#[test]
+fn sessionless_receipt_rejects_nonempty_failed() {
+    rejects_nonempty_sessionless(JobStatus::Failed {
+        code: "http.timeout".into(),
+    });
+}
+
+fn rejects_nonempty_sessionless(status: JobStatus) {
+    let dir = TempDir::new().unwrap();
+    let store = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let db = dir.path().join("history.sqlite3");
+    let history = History::open(&db).unwrap();
+    let receipt = UploadReceipt::new("https://i.example/f/ok", "ok").unwrap();
+
+    let art = store
+        .stage_file(
+            &write(dir.path(), "nonempty.bin", b"not empty"),
+            ArtifactKind::File,
+        )
+        .unwrap();
+    let job = history.create_job(&art, &snapshot()).unwrap();
+    history.transition(job.id, JobStatus::Running).unwrap();
+    history.transition(job.id, status.clone()).unwrap();
+    let before = history.job(job.id).unwrap().unwrap();
+    assert!(
+        matches!(
+            history.record_receipt(job.id, 1, None, &receipt),
+            Err(AppError::InvalidInput(_))
+        ),
+        "nonempty {status:?} must require its recorded session"
+    );
+    assert_eq!(history.job(job.id).unwrap().unwrap(), before);
+    let reopened = History::open(&db).unwrap();
+    assert_eq!(reopened.job(job.id).unwrap().unwrap(), before);
 }

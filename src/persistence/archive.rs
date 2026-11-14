@@ -57,6 +57,8 @@ pub struct CleanupReport {
     pub kept_other_root: usize,
     /// Open in another program without delete sharing; retried next pass.
     pub kept_in_use: usize,
+    /// Filesystem/identity queries cannot establish supported persistent ownership.
+    pub kept_unproven_identity: usize,
 }
 
 /// Rows fetched per query; bounds memory and connection-lock time.
@@ -164,13 +166,13 @@ impl ArchiveStore {
                 return Ok(removed);
             };
             after = Some(last.id);
+            hook("recovery.page_fetched");
             for intent in &page {
-                match recover_intent(intent)? {
+                match recover_intent(&self.history, intent)? {
                     Recovery::Removed => {
                         removed += 1;
-                        self.history.drop_archive_intent(intent.id)?;
                     }
-                    Recovery::Settled => self.history.drop_archive_intent(intent.id)?,
+                    Recovery::Settled => self.history.retire_archive_intent(intent)?,
                     Recovery::Retry => {}
                 }
             }
@@ -228,6 +230,7 @@ impl ArchiveStore {
             }
         };
 
+        hook("archive.before_identity_recorded");
         let result = (|| {
             let file_identity = winfs::identity(&file).map_err(|e| AppError::io(SAVING, &e))?;
             intent.file_identity = Some(file_identity);
@@ -346,7 +349,11 @@ impl ArchiveStore {
             report.kept_other_root += 1;
             return Ok(());
         };
-        if candidate.root_identity != root_identity {
+        if !candidate.root_identity.is_proven() || !root_identity.is_proven() {
+            report.kept_unproven_identity += 1;
+            return Ok(());
+        }
+        if !candidate.root_identity.same_object(root_identity) {
             report.kept_other_root += 1;
             return Ok(());
         }
@@ -359,8 +366,12 @@ impl ArchiveStore {
             Err(e) => return keep(e, report, CHECKING),
         };
         // Same object (not just same bytes) and still the recorded bytes.
-        let same_object = winfs::identity(&file).map_err(|e| AppError::io(CHECKING, &e))?
-            == candidate.file_identity;
+        let identity = winfs::identity(&file).map_err(|e| AppError::io(CHECKING, &e))?;
+        if !identity.is_proven() || !candidate.file_identity.is_proven() {
+            report.kept_unproven_identity += 1;
+            return Ok(());
+        }
+        let same_object = identity.same_object(candidate.file_identity);
         let unchanged = same_object && {
             let (read, hash) = copy_hashing(&mut &file, &mut io::sink(), entry.size)
                 .map_err(|e| AppError::io(CHECKING, &e))?;
@@ -435,7 +446,7 @@ fn output_format(name: &str) -> Result<OutputFormat, AppError> {
     })
 }
 
-fn recover_intent(intent: &ArchiveIntent) -> Result<Recovery, AppError> {
+fn recover_intent(history: &History, intent: &ArchiveIntent) -> Result<Recovery, AppError> {
     const RECOVERING: &str = "recovering an interrupted archive copy";
     let io_err = |e: io::Error| AppError::io(RECOVERING, &e);
     let in_use = |e: &io::Error| e.raw_os_error() == Some(ERROR_SHARING_VIOLATION);
@@ -451,8 +462,11 @@ fn recover_intent(intent: &ArchiveIntent) -> Result<Recovery, AppError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Recovery::Settled),
         Err(_) => return Ok(Recovery::Retry), // e.g. an offline drive
     };
-    if winfs::identity(&root).map_err(io_err)? != intent.root_identity {
-        // The path now names a different folder; never act inside it.
+    if !winfs::identity(&root)
+        .map_err(io_err)?
+        .same_object(intent.root_identity)
+    {
+        // Changed or unproven root binding: never act inside it.
         return Ok(Recovery::Settled);
     }
     let month = match winfs::open_child_dir(&root, &intent.month, false) {
@@ -465,16 +479,14 @@ fn recover_intent(intent: &ArchiveIntent) -> Result<Recovery, AppError> {
     match winfs::open_child_file(&month, &intent.partial_name()) {
         Ok(file) => {
             let ours = match intent.file_identity {
-                Some(id) => winfs::identity(&file).map_err(io_err)? == id,
-                // Crashed between create and recording identity: the name is
-                // unique to this intent, and it can hold at most the copy.
-                None => file.metadata().map_err(io_err)?.len() <= intent.size,
+                Some(id) => winfs::identity(&file).map_err(io_err)?.same_object(id),
+                // Neither the unique name nor a plausible length proves ownership.
+                None => false,
             };
             if !ours {
                 return Ok(Recovery::Settled);
             }
-            winfs::delete_by_handle(&file).map_err(io_err)?;
-            return Ok(Recovery::Removed);
+            return remove_recovered(history, intent, &intent.partial_name(), &file);
         }
         Err(e) if in_use(&e) => return Ok(Recovery::Retry), // an active writer
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -488,7 +500,7 @@ fn recover_intent(intent: &ArchiveIntent) -> Result<Recovery, AppError> {
     };
     match winfs::open_child_file(&month, name) {
         Ok(file) => {
-            if winfs::identity(&file).map_err(io_err)? != id {
+            if !winfs::identity(&file).map_err(io_err)?.same_object(id) {
                 return Ok(Recovery::Settled); // someone else's file at that name
             }
             let (read, hash) =
@@ -496,13 +508,29 @@ fn recover_intent(intent: &ArchiveIntent) -> Result<Recovery, AppError> {
             if read != intent.size || hash != intent.sha256 {
                 return Ok(Recovery::Settled); // changed since: treat as the user's
             }
-            winfs::delete_by_handle(&file).map_err(io_err)?;
-            Ok(Recovery::Removed)
+            remove_recovered(history, intent, name, &file)
         }
         Err(e) if in_use(&e) => Ok(Recovery::Retry),
         Err(e) if gone(&e) => Ok(Recovery::Settled),
         Err(e) => Err(io_err(e)),
     }
+}
+
+fn remove_recovered(
+    history: &History,
+    intent: &ArchiveIntent,
+    name: &str,
+    file: &File,
+) -> Result<Recovery, AppError> {
+    let removed = history.commit_recovered_archive_removal(intent, name, || {
+        winfs::delete_by_handle(file)
+            .map_err(|e| AppError::io("recovering an interrupted archive copy", &e))
+    })?;
+    Ok(if removed {
+        Recovery::Removed
+    } else {
+        Recovery::Settled
+    })
 }
 
 #[cfg(test)]
@@ -798,5 +826,165 @@ mod tests {
         assert_eq!(removed.get(), Some(0), "an open partial is never swept");
         assert!(exists(&entry.unwrap().path));
         assert_eq!(fx.intents(), 0);
+    }
+    #[test]
+    fn stale_recovery_page_preserves_committed_manual_archive() {
+        stale_recovery_page_preserves_committed_archive(true);
+    }
+
+    #[test]
+    fn stale_recovery_page_preserves_committed_active_archive() {
+        stale_recovery_page_preserves_committed_archive(false);
+    }
+
+    fn stale_recovery_page_preserves_committed_archive(manual: bool) {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+        let fx = Fx::new();
+        let art = fx.screenshot();
+        if !manual {
+            fx.history.create_job(&art, &snapshot()).unwrap();
+        }
+        // Separate connection models the writer/recovery lifecycle across processes.
+        let writer_history =
+            Arc::new(History::open(&fx.dir.path().join("history.sqlite3")).unwrap());
+        let writer = ArchiveStore::new(writer_history, fx.root.clone(), FilenamePreset::default());
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        let (done_tx, done_rx) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            set_hook(move |point| {
+                if point == "archive.published" {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            });
+            let result = if manual {
+                writer.save_manual(&art, captured())
+            } else {
+                writer.save_finalized(&art, captured())
+            };
+            clear_hook();
+            // save returned: registration/intent retirement committed, file closed.
+            done_tx.send(result.unwrap()).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let result = saved.clone();
+        set_hook(move |point| {
+            if point == "recovery.page_fetched" && result.borrow().is_none() {
+                resume_tx.send(()).unwrap();
+                *result.borrow_mut() = Some(done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            }
+        });
+        let recovery = fx.archive().recover_partials();
+        clear_hook();
+        worker.join().unwrap();
+        let entry = saved.borrow().clone().expect("post-fetch barrier reached");
+        assert_eq!(
+            recovery.unwrap(),
+            0,
+            "a stale intent must not remove a committed archive"
+        );
+        assert_eq!(fs::read(&entry.path).unwrap(), b"png 1");
+        assert_eq!(fx.intents(), 0);
+        let conn = rusqlite::Connection::open(fx.dir.path().join("history.sqlite3")).unwrap();
+        let live: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM archive_entries WHERE id = ?1 AND removed_ms IS NULL",
+                rusqlite::params![entry.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1);
+        if !manual {
+            assert_eq!(fx.history.artifacts_needing_spool().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn no_identity_intent_preserves_same_name_foreign_sentinel() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        crash_at(
+            &fx,
+            &archive,
+            &fx.screenshot(),
+            "archive.before_identity_recorded",
+        );
+        let intent = fx
+            .history
+            .archive_intents_page(None, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(intent.file_identity.is_none());
+        let path = fx.month().join(intent.partial_name());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"user").unwrap(); // shorter than the intended five-byte copy
+        assert_eq!(
+            archive.recover_partials().unwrap(),
+            0,
+            "no durable identity is no deletion authority"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"user");
+        assert_eq!(fx.intents(), 0);
+    }
+
+    #[test]
+    fn legacy_reused_ids_never_authorize_cleanup_of_same_bytes_replacement() {
+        for filesystem in ["FAT", "FAT32", "exFAT", "ReFS", "NTFS", "unknown"] {
+            winfs::identity_queries::with(filesystem, false, || {
+                let fx = Fx::new();
+                let archive = fx.archive();
+                let art = fx.screenshot();
+                let entry = archive.save_finalized(&art, captured()).unwrap();
+                let original = entry.path.with_extension("original");
+                fs::rename(&entry.path, &original).unwrap();
+                fs::write(&entry.path, b"png 1").unwrap();
+                let result = archive.cleanup(&fx.policy(), later()).unwrap();
+                assert_eq!(
+                    result.removed, 0,
+                    "{filesystem}: reusable legacy IDs cannot authorize deletion"
+                );
+                assert_eq!(fs::read(&entry.path).unwrap(), b"png 1");
+                assert_eq!(fs::read(&original).unwrap(), b"png 1");
+                assert_eq!(fs::read(&art.path).unwrap(), b"png 1");
+            });
+        }
+    }
+
+    #[test]
+    fn legacy_reused_ids_never_authorize_crash_recovery_deletion() {
+        for filesystem in ["FAT", "ReFS", "NTFS"] {
+            winfs::identity_queries::with(filesystem, false, || {
+                let fx = Fx::new();
+                let archive = fx.archive();
+                let art = fx.screenshot();
+                crash_at(&fx, &archive, &art, "archive.published");
+                let path = fx.month().join(&art.display_name);
+                fs::rename(&path, path.with_extension("original")).unwrap();
+                fs::write(&path, b"png 1").unwrap();
+                assert_eq!(
+                    archive.recover_partials().unwrap(),
+                    0,
+                    "{filesystem}: same name/bytes/reused ID is not durable ownership proof"
+                );
+                assert_eq!(fs::read(&path).unwrap(), b"png 1");
+            });
+        }
+    }
+
+    #[test]
+    fn unknown_filesystem_modern_id_does_not_authorize_cleanup() {
+        winfs::identity_queries::with("unknown", true, || {
+            let fx = Fx::new();
+            let archive = fx.archive();
+            let entry = archive
+                .save_finalized(&fx.screenshot(), captured())
+                .unwrap();
+            assert_eq!(archive.cleanup(&fx.policy(), later()).unwrap().removed, 0);
+            assert_eq!(fs::read(&entry.path).unwrap(), b"png 1");
+        });
     }
 }
