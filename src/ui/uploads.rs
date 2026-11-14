@@ -49,7 +49,11 @@ pub fn draw(
     }
     for job in &view.jobs {
         ui.push_id(job.id.0, |ui| {
-            ui.strong(&job.artifact.display_name);
+            ui.label(
+                eframe::egui::RichText::new(&job.artifact.display_name)
+                    .strong()
+                    .color(ui.visuals().text_color()),
+            );
             ui.label(format!(
                 "{} · {} · {} bytes",
                 job.destination.label,

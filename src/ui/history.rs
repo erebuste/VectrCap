@@ -24,7 +24,7 @@ pub struct HistoryPane {
     until: String,
     date_error: Option<&'static str>,
     remove: Option<Vec<Uuid>>,
-    delete_local: bool,
+    delete_local: Option<Vec<Uuid>>,
     previews: HistoryPreviews,
     last_layout: Option<HistoryLayout>,
     last_columns: Option<usize>,
@@ -32,6 +32,7 @@ pub struct HistoryPane {
 }
 impl HistoryPane {
     pub fn suspend(&mut self) {
+        self.delete_local = None;
         self.previews.suspend();
     }
     pub fn draw(&mut self, ui: &mut Ui, view: &DesktopView) -> Vec<AppCommand> {
@@ -221,22 +222,29 @@ impl HistoryPane {
                 )
                 .clicked()
             {
-                self.delete_local = true;
+                self.delete_local = Some(self.selection.clone());
             }
             if ui.button("Clear selection").clicked() {
                 self.selection.clear();
                 self.active = None;
             }
         });
-        if self.delete_local {
+        if self
+            .delete_local
+            .as_ref()
+            .is_some_and(|ids| ids != &self.selection)
+        {
+            self.delete_local = None;
+        }
+        if let Some(ids) = self.delete_local.clone() {
             ui.group(|ui| {
                 ui.label("Permanently delete selected app-owned finalized local copies? Imported originals, remote uploads, links and favorites are kept. Active upload sources cannot be deleted.");
                 if ui.button("Confirm local file deletion").clicked() {
-                    commands.push(action(self.selection.clone(), HistoryAction::DeleteLocalFile));
+                    commands.push(action(ids, HistoryAction::DeleteLocalFile));
                     self.previews.suspend();
-                    self.delete_local = false;
+                    self.delete_local = None;
                 }
-                if ui.button("Keep local files").clicked() { self.delete_local = false; }
+                if ui.button("Keep local files").clicked() { self.delete_local = None; }
             });
         }
         if let Some(ids) = self.remove.clone() {
@@ -668,6 +676,23 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn changing_selection_cancels_local_deletion_confirmation() {
+        let view = view();
+        let id = view.history_page.records[0].id;
+        let mut pane = HistoryPane {
+            selection: vec![Uuid::new_v4()],
+            delete_local: Some(vec![id]),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            pane.draw(ui, &view);
+        });
+        output.textures_delta.clear();
+        assert!(pane.delete_local.is_none());
+    }
+
     #[test]
     fn gallery_list_and_responsive_inspector_keep_selection_and_query() {
         let mut view = view();

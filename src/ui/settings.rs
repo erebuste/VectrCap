@@ -20,6 +20,11 @@ pub struct SettingsPane {
     remove: Option<DestinationId>,
     just_opened: bool,
     shortcuts: Option<Vec<crate::app::shortcuts::ShortcutBinding>>,
+    recording: Option<(
+        crate::app::shortcuts::ShortcutAction,
+        Uuid,
+        crate::platform::windows::hotkeys::ShortcutRecorder,
+    )>,
 }
 impl SettingsPane {
     pub fn submission_failed(&mut self, error: AppError) {
@@ -43,6 +48,7 @@ impl SettingsPane {
         self.draft = None;
         self.remove = None;
         self.shortcuts = None;
+        self.recording = None;
         self.error = None;
         egui::text_edit::TextEditState::default().store(ctx, egui::Id::unique("connection-token"));
     }
@@ -72,6 +78,7 @@ impl SettingsPane {
             crate::app::shortcuts::ShortcutAction,
             crate::app::shortcuts::ShortcutStatus,
         )],
+        recorded_shortcut: Option<(Uuid, crate::app::shortcuts::KeyChord)>,
     ) -> Vec<AppCommand> {
         let mut commands = vec![];
         let mut enabled = notifications_enabled;
@@ -121,7 +128,7 @@ impl SettingsPane {
             }
         });
         let shortcut_panel = ui.collapsing("Keyboard shortcuts", |ui| {
-            use crate::app::shortcuts::{KeyChord, KeyCode};
+            use crate::platform::windows::hotkeys::{ShortcutRecorder, chord_label};
             ui.label("Capture and editor assignments are saved for later activation; their keys are not registered yet. Apply validates all assignments together. Conflicts keep the previous settings.");
             let bindings = self.shortcuts.get_or_insert_with(|| settings.shortcuts.effective());
             for binding in bindings.iter_mut() {
@@ -130,18 +137,42 @@ impl SettingsPane {
                     ui.label(format!("{} ({:?}){}", binding.action.label(), binding.scope, if binding.action.is_available_now() { "" } else { " - unavailable until its feature is implemented" }));
                     ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut binding.enabled, "Enabled");
-                        let mut chord = binding.chord.unwrap_or(KeyChord { ctrl: true, alt: false, shift: true, win: false, key: KeyCode::from_vk(0x41).expect("fixed key") });
-                        let mut changed = false;
-                        changed |= ui.checkbox(&mut chord.ctrl, "Ctrl").changed();
-                        changed |= ui.checkbox(&mut chord.alt, "Alt").changed();
-                        changed |= ui.checkbox(&mut chord.shift, "Shift").changed();
-                        changed |= ui.checkbox(&mut chord.win, "Win").changed();
-                        egui::ComboBox::from_id_salt("key").selected_text(binding.chord.map_or_else(|| "Unassigned".into(), |c| format!("VK {:02X}", c.key.vk()))).show_ui(ui, |ui| {
-                            for (vk, label) in (0x41..=0x5A).map(|vk| (vk, char::from_u32(vk).unwrap().to_string())).chain((0x70..=0x87).map(|vk| (vk, format!("F{}", vk - 0x6F)))) {
-                                changed |= ui.selectable_value(&mut chord.key, KeyCode::from_vk(vk).expect("fixed key"), label).changed();
+                        let recording = self.recording.as_ref().is_some_and(|(action, _, _)| *action == binding.action);
+                        let label = if recording { "Press a combination...".to_owned() } else { binding.chord.map(chord_label).unwrap_or_else(|| "Click to assign shortcut".into()) };
+                        let field = ui.button(label);
+                        if field.clicked() {
+                            field.request_focus();
+                            match ShortcutRecorder::start() {
+                                Ok(recorder) => self.recording = Some((binding.action, Uuid::new_v4(), recorder)),
+                                Err(error) => self.error = Some(error),
                             }
-                        });
-                        if changed { binding.chord = Some(chord); }
+                        }
+                        if recording {
+                            if !field.has_focus() || !ui.input(|i| i.focused) {
+                                self.recording = None;
+                            } else if let Some((_, request, recorder)) = &mut self.recording {
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                                let received = recorded_shortcut.filter(|(id, _)| id == request).map(|(_, chord)| chord);
+                                if let Some(chord) = received.or_else(|| recorder.poll()) {
+                                    binding.chord = Some(chord);
+                                    self.recording = None;
+                                    field.surrender_focus();
+                                }
+                            }
+                        }
+                        if binding.action == crate::app::shortcuts::ShortcutAction::UploadFile {
+                            use crate::app::destinations::DestinationSelection;
+                            let label = match binding.destination {
+                                DestinationSelection::Inherit => "Default destination".to_owned(),
+                                DestinationSelection::Specific(id) => settings.destinations.iter().find(|d| d.id == id).map(|d| d.name.clone()).unwrap_or_else(|| "Missing destination".into()),
+                            };
+                            egui::ComboBox::from_id_salt("shortcut-destination").selected_text(label).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut binding.destination, DestinationSelection::Inherit, "Default destination");
+                                for destination in settings.destinations.iter() {
+                                    ui.selectable_value(&mut binding.destination, DestinationSelection::Specific(destination.id), &destination.name);
+                                }
+                            });
+                        }
                         if ui.button("Reset").clicked() {
                             commands.push(AppCommand::ResetShortcuts { actions: Some(vec![binding.action]), revision: settings.revision });
                             *binding = crate::app::shortcuts::ShortcutBinding::unassigned(binding.action);
@@ -158,10 +189,11 @@ impl SettingsPane {
                 self.shortcuts = None;
             }
         });
+        if shortcut_panel.body_response.is_none() {
+            self.recording = None;
+        }
         commands.push(AppCommand::SetShortcutEntryActive(
-            shortcut_panel.body_response.is_some_and(|response| {
-                response.contains_pointer() || ui.ctx().egui_wants_keyboard_input()
-            }),
+            self.recording.as_ref().map(|(_, request, _)| *request),
         ));
         ui.heading(if settings.destinations.is_empty() {
             "Connect to Vectr"
@@ -205,7 +237,11 @@ impl SettingsPane {
         for d in settings.destinations.iter() {
             ui.push_id(d.id.0, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong(&d.name);
+                    ui.label(
+                        eframe::egui::RichText::new(&d.name)
+                            .strong()
+                            .color(ui.visuals().text_color()),
+                    );
                     let default = Some(d.id) == settings.destinations.default_id();
                     if ui.radio(default, "Default").clicked() && !default {
                         commands.push(AppCommand::SetDefault {
@@ -496,7 +532,7 @@ mod tests {
             },
             |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    pane.draw(ui, &settings, true, &[]);
+                    pane.draw(ui, &settings, true, &[], None);
                 });
             },
         );

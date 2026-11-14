@@ -371,7 +371,7 @@ pub enum ShortcutFocus {
 /// carry a secret token), so this type cannot derive them either.
 pub enum ShortcutOutcome {
     Command(crate::app::events::AppCommand),
-    OpenFilePicker,
+    OpenFilePicker(DestinationSelection),
 }
 
 fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
@@ -383,7 +383,9 @@ fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
         ShortcutAction::ShowSettings => {
             Some(ShortcutOutcome::Command(AppCommand::Show(Window::Settings)))
         }
-        ShortcutAction::UploadFile => Some(ShortcutOutcome::OpenFilePicker),
+        ShortcutAction::UploadFile => Some(ShortcutOutcome::OpenFilePicker(
+            DestinationSelection::Inherit,
+        )),
         _ => None,
     }
 }
@@ -542,7 +544,16 @@ impl ShortcutManager {
         if focus != ShortcutFocus::Normal || event.repeat {
             return None;
         }
-        command_for(event.action)
+        let outcome = command_for(event.action)?;
+        match outcome {
+            ShortcutOutcome::OpenFilePicker(_) => Some(ShortcutOutcome::OpenFilePicker(
+                self.bindings
+                    .iter()
+                    .find(|b| b.action == event.action)?
+                    .destination,
+            )),
+            other => Some(other),
+        }
     }
 
     /// A candidate equal to the current bindings except the named actions
@@ -823,6 +834,24 @@ mod tests {
         assert_eq!(
             manager.status(ShortcutAction::ShowSettings),
             ShortcutStatus::Active
+        );
+    }
+
+    #[test]
+    fn upload_shortcut_preserves_explicit_destination_in_picker_outcome() {
+        let destination = crate::app::destinations::DestinationId(uuid::Uuid::new_v4());
+        let mut upload = binding(ShortcutAction::UploadFile, chord(true, false, 0x55), true);
+        upload.destination = DestinationSelection::Specific(destination);
+        let (manager, _) = manager_with(vec![upload]);
+        let outcome = manager.handle(
+            ShortcutEvent {
+                action: ShortcutAction::UploadFile,
+                repeat: false,
+            },
+            ShortcutFocus::Normal,
+        );
+        assert!(
+            matches!(outcome, Some(ShortcutOutcome::OpenFilePicker(DestinationSelection::Specific(id))) if id == destination)
         );
     }
 

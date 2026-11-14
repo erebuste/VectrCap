@@ -16,7 +16,11 @@ pub fn draw(ui: &mut Ui, view: &DesktopView) {
                 ui.separator();
                 return;
             };
-            ui.strong(&job.artifact.display_name);
+            ui.label(
+                eframe::egui::RichText::new(&job.artifact.display_name)
+                    .strong()
+                    .color(ui.visuals().text_color()),
+            );
             ui.label(&job.destination.label);
             ui.label(match &job.status {
                 JobStatus::Completed(_) => "Uploaded",

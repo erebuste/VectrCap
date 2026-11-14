@@ -105,6 +105,10 @@ pub enum AppCommand {
     /// is staged, and reused for every file in the batch regardless of how
     /// long staging takes or whether the default changes meanwhile.
     AcceptFileSelection(Vec<PathBuf>),
+    AcceptFileSelectionFor {
+        paths: Vec<PathBuf>,
+        selection: DestinationSelection,
+    },
     /// The tray's hidden window now exists; native hotkey registration can
     /// begin. Carries its raw `HWND` value (`isize`), never a type that
     /// implies cross-thread ownership of the window itself.
@@ -123,7 +127,7 @@ pub enum AppCommand {
     },
     /// Set by the Hotkeys settings page while its press-to-set field is
     /// focused, so a matching active global hotkey cannot also dispatch.
-    SetShortcutEntryActive(bool),
+    SetShortcutEntryActive(Option<Uuid>),
     SetAppearance {
         appearance: AppearancePreferences,
         revision: u64,
@@ -178,6 +182,10 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    ShortcutRecorded {
+        request: Uuid,
+        chord: super::shortcuts::KeyChord,
+    },
     ShortcutStatuses(
         Vec<(
             super::shortcuts::ShortcutAction,
@@ -191,7 +199,7 @@ pub enum AppEffect {
     },
     /// The Upload-file hotkey fired: the UI thread owns the native picker's
     /// single-flight gate and must open it, exactly like the tray menu item.
-    OpenFilePicker,
+    OpenFilePicker(DestinationSelection),
     Window(Option<Window>),
     SettingsSaved(Settings),
     ConnectionSaved {

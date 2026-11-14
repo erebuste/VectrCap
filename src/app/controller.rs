@@ -175,7 +175,7 @@ pub struct AppController {
     /// shortcut-dependent command degrades to a harmless no-op/busy error
     /// during it rather than panicking or guessing a handle.
     shortcuts: Option<ShortcutManager>,
-    shortcut_entry_active: bool,
+    shortcut_entry_active: Option<Uuid>,
     pub lifecycle: Lifecycle,
     pub window: Option<Window>,
 }
@@ -233,7 +233,7 @@ impl AppController {
             shell,
             clipboard,
             shortcuts: None,
-            shortcut_entry_active: false,
+            shortcut_entry_active: None,
             lifecycle: Lifecycle::Running,
             window,
         })
@@ -454,6 +454,7 @@ impl AppController {
     fn accept_file_selection(
         &mut self,
         paths: Vec<std::path::PathBuf>,
+        selection: DestinationSelection,
     ) -> Result<Vec<AppEffect>, AppError> {
         if paths.is_empty() || paths.len() > super::notifications::MAX_BATCH_ITEMS {
             return Err(AppError::InvalidInput("select 1 to 100 files to upload"));
@@ -466,7 +467,7 @@ impl AppController {
         self.manager.ensure_not_corrupted()?;
         let snapshot = resolve_destination(
             DestinationSelection::Inherit,
-            DestinationSelection::Inherit,
+            selection,
             &self.settings().destinations,
         )?;
         self.store.read(&snapshot.credential)?;
@@ -808,7 +809,7 @@ impl AppController {
             }
             AppCommand::ShowBatchSummary(jobs) => self.show_batch_summary(jobs)?,
             AppCommand::Show(window) => {
-                self.shortcut_entry_active = false;
+                self.shortcut_entry_active = None;
                 self.window = Some(window);
                 let mut effects = vec![AppEffect::Window(self.window)];
                 if window != Window::Settings {
@@ -817,7 +818,7 @@ impl AppController {
                 effects
             }
             AppCommand::CloseWindow => {
-                self.shortcut_entry_active = false;
+                self.shortcut_entry_active = None;
                 self.window = None;
                 vec![AppEffect::Window(None), AppEffect::CancelConnectionTest]
             }
@@ -936,7 +937,12 @@ impl AppController {
                 self.notifications.request(notice, &action)?;
                 self.execute_completion_action(notice, action)?
             }
-            AppCommand::AcceptFileSelection(paths) => self.accept_file_selection(paths)?,
+            AppCommand::AcceptFileSelection(paths) => {
+                self.accept_file_selection(paths, DestinationSelection::Inherit)?
+            }
+            AppCommand::AcceptFileSelectionFor { paths, selection } => {
+                self.accept_file_selection(paths, selection)?
+            }
             AppCommand::AttachHotkeyWindow(hwnd) => {
                 if self.shortcuts.is_none() {
                     let backend = crate::platform::windows::hotkeys::Win32HotkeyBackend::new(hwnd);
@@ -954,9 +960,20 @@ impl AppController {
                 vec![]
             }
             AppCommand::NativeHotkeyFired(id) => {
+                if let Some(request) = self.shortcut_entry_active
+                    && let Some(shortcuts) = &self.shortcuts
+                    && let Some(action) = shortcuts.action_for_id(id)
+                    && let Some(chord) = shortcuts
+                        .bindings()
+                        .iter()
+                        .find(|b| b.action == action)
+                        .and_then(|b| b.chord)
+                {
+                    return Ok(vec![AppEffect::ShortcutRecorded { request, chord }]);
+                }
                 let outcome = self.shortcuts.as_ref().and_then(|shortcuts| {
                     let action = shortcuts.action_for_id(id)?;
-                    let focus = if self.shortcut_entry_active {
+                    let focus = if self.shortcut_entry_active.is_some() {
                         ShortcutFocus::ShortcutEntry
                     } else {
                         ShortcutFocus::Normal
@@ -971,7 +988,9 @@ impl AppController {
                 });
                 match outcome {
                     Some(ShortcutOutcome::Command(cmd)) => self.apply(cmd)?,
-                    Some(ShortcutOutcome::OpenFilePicker) => vec![AppEffect::OpenFilePicker],
+                    Some(ShortcutOutcome::OpenFilePicker(selection)) => {
+                        vec![AppEffect::OpenFilePicker(selection)]
+                    }
                     None => vec![],
                 }
             }

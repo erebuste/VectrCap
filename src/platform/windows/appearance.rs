@@ -210,3 +210,21 @@ impl Drop for AppearanceWake {
         }
     }
 }
+
+/// Bundle the same sans family as Vectr, with egui's defaults retained for glyph fallback.
+pub fn install_fonts(context: &eframe::egui::Context) {
+    use eframe::egui::{FontData, FontDefinitions, FontFamily};
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "Geist".into(),
+        std::sync::Arc::new(FontData::from_static(include_bytes!(
+            "../../../assets/fonts/Geist-Regular.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Geist".into());
+    context.set_fonts(fonts);
+}

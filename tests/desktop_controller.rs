@@ -956,3 +956,58 @@ fn failed_file_admission_rolls_back_only_its_unregistered_spool() {
     assert!(!path.exists());
     assert_eq!(std::fs::read(source).unwrap(), b"synthetic");
 }
+
+#[test]
+fn explicit_picker_destination_overrides_default_without_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store);
+    let chosen = seed(
+        &mut app,
+        "Chosen",
+        ServerOrigin::parse("https://chosen.invalid").unwrap(),
+        "synthetic-a",
+    );
+    let default = seed(
+        &mut app,
+        "Default",
+        ServerOrigin::parse("https://default.invalid").unwrap(),
+        "synthetic-b",
+    );
+    app.dispatch(AppCommand::SetDefault {
+        id: default,
+        revision: app.settings().revision,
+    });
+    let source = dir.path().join("fixture.txt");
+    std::fs::write(&source, b"fixture").unwrap();
+    let effects = app.dispatch(AppCommand::AcceptFileSelectionFor {
+        paths: vec![source.clone()],
+        selection: DestinationSelection::Specific(chosen),
+    });
+    let batch = effects
+        .iter()
+        .find_map(|effect| match effect {
+            AppEffect::StageFiles { batch, .. } => Some(*batch),
+            _ => None,
+        })
+        .expect("accepted");
+    let artifacts = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    stage_and_feed(&mut app, &artifacts, batch, 0, &source);
+    let jobs = History::open(&dir.path().join("history.db"))
+        .unwrap()
+        .shell_jobs()
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].destination.id, chosen);
+    let effects = app.dispatch(AppCommand::AcceptFileSelectionFor {
+        paths: vec![source],
+        selection: DestinationSelection::Specific(vectrcap::app::destinations::DestinationId(
+            uuid::Uuid::new_v4(),
+        )),
+    });
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, AppEffect::StageFiles { .. }))
+    );
+}

@@ -122,6 +122,13 @@ impl PickerGate {
 /// Opens the native picker on a dedicated thread and, on a non-empty
 /// selection, hands the paths to the controller as one accepted batch.
 /// Never blocks the calling (egui/UI or tray) thread.
+pub fn spawn_pick_and_upload_for(
+    client: DesktopClient,
+    gate: PickerGate,
+    selection: crate::app::destinations::DestinationSelection,
+) {
+    spawn_pick_with_selection(client, gate, selection, pick_existing_files);
+}
 pub fn spawn_pick_and_upload(client: DesktopClient, gate: PickerGate) {
     spawn_pick_with(client, gate, pick_existing_files);
 }
@@ -131,6 +138,21 @@ pub fn spawn_pick_and_upload(client: DesktopClient, gate: PickerGate) {
 /// tests without a real native dialog.
 pub fn spawn_pick_with<P>(client: DesktopClient, gate: PickerGate, picker: P)
 where
+    P: FnOnce() -> Result<Option<Vec<PathBuf>>, AppError> + Send + 'static,
+{
+    spawn_pick_with_selection(
+        client,
+        gate,
+        crate::app::destinations::DestinationSelection::Inherit,
+        picker,
+    );
+}
+pub fn spawn_pick_with_selection<P>(
+    client: DesktopClient,
+    gate: PickerGate,
+    selection: crate::app::destinations::DestinationSelection,
+    picker: P,
+) where
     P: FnOnce() -> Result<Option<Vec<PathBuf>>, AppError> + Send + 'static,
 {
     // Shutting down: never open a dialog, never touch a file.
@@ -158,7 +180,8 @@ where
             match result {
                 Ok(None) => {}
                 Ok(Some(paths)) => {
-                    if let Err(submit_error) = client.submit(AppCommand::AcceptFileSelection(paths))
+                    if let Err(submit_error) =
+                        client.submit(AppCommand::AcceptFileSelectionFor { paths, selection })
                     {
                         client.report_error(submit_error);
                     }

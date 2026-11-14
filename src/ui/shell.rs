@@ -37,6 +37,7 @@ impl Shell {
         focus_requested: Arc<AtomicBool>,
         context: egui::Context,
     ) -> Result<Self, AppError> {
+        appearance::install_fonts(&context);
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
@@ -86,9 +87,10 @@ impl eframe::App for Shell {
         self.view = self.client.snapshot();
         if self.picker_requests != self.view.picker_requests {
             self.picker_requests = self.view.picker_requests;
-            crate::platform::windows::file_dialog::spawn_pick_and_upload(
+            crate::platform::windows::file_dialog::spawn_pick_and_upload_for(
                 self.client.clone(),
                 self.picker_gate.clone(),
+                self.view.picker_selection,
             );
         }
         if let Some(settings) = &self.view.settings {
@@ -193,7 +195,11 @@ impl eframe::App for Shell {
             .inner_margin(18.0)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong("VectrCap");
+                    ui.label(
+                        eframe::egui::RichText::new("VectrCap")
+                            .strong()
+                            .color(ui.visuals().text_color()),
+                    );
                     if ui
                         .selectable_label(self.view.window == Some(Window::Uploads), "Uploads")
                         .clicked()
@@ -251,6 +257,7 @@ impl eframe::App for Shell {
                                     settings,
                                     self.view.notifications_enabled,
                                     &self.view.shortcut_statuses,
+                                    self.view.recorded_shortcut,
                                 ))
                             }
                             (Some(Window::History), Some(_)) => {
