@@ -51,6 +51,8 @@ CREATE TABLE jobs (
     receipt_url TEXT,
     receipt_name TEXT,
     paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+    -- Number of times the job entered 'running'; results name the attempt that produced them.
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
 ) STRICT;
@@ -78,7 +80,7 @@ INSERT INTO meta (key, value) VALUES ('queue_paused', 0);
 
 const JOB_SELECT: &str = "SELECT j.id, j.session_id, j.status, j.failure_code, j.receipt_url, j.receipt_name, \
      j.paused, j.dest_id, j.dest_label, j.dest_origin, j.dest_credential_generation, j.dest_link_domain, \
-     a.id, a.path, a.display_name, a.kind, a.size, a.sha256 \
+     a.id, a.path, a.display_name, a.kind, a.size, a.sha256, j.attempt \
      FROM jobs j JOIN artifacts a ON a.id = j.artifact_id";
 
 const UNFINISHED: &str = "status NOT IN ('completed', 'cancelled')";
@@ -118,20 +120,19 @@ impl JobStatus {
 }
 
 /// Allowed status changes. Completed/cancelled are terminal: a confirmed
-/// receipt is never downgraded and a cancelled job never restarts.
+/// receipt is never downgraded and a cancelled job never restarts. Entering
+/// `completed` is not a transition: it goes through `History::record_receipt`,
+/// which binds the result to the job's session and attempt.
 fn transition_allowed(from: &str, to: &str) -> bool {
     matches!(
         (from, to),
         ("pending", "running" | "cancelled")
             | (
                 "running",
-                "pending" | "interrupted" | "uncertain" | "failed" | "completed" | "cancelled"
+                "pending" | "interrupted" | "uncertain" | "failed" | "cancelled"
             )
             | ("interrupted", "running" | "failed" | "cancelled")
-            | (
-                "uncertain",
-                "pending" | "running" | "failed" | "completed" | "cancelled"
-            )
+            | ("uncertain", "pending" | "running" | "failed" | "cancelled")
             | ("failed", "pending" | "cancelled")
     )
 }
@@ -145,6 +146,7 @@ pub struct UploadJob {
     pub session: Option<Uuid>,
     pub status: JobStatus,
     pub paused: bool,
+    pub attempt: u32,
 }
 
 /// SQLite-backed durable jobs and local history. All SQL is parameterized.
@@ -188,6 +190,7 @@ impl History {
             session: None,
             status: JobStatus::Pending,
             paused: false,
+            attempt: 0,
         };
         let now = now_ms();
         let mut conn = self.lock()?;
@@ -224,15 +227,20 @@ impl History {
         raw.map(RawJob::into_job).transpose()
     }
 
-    /// Applies one validated status change atomically.
+    /// Applies one validated status change atomically. Entering `Running`
+    /// starts a new attempt. `Completed` is refused here; use `record_receipt`.
     pub fn transition(&self, id: JobId, to: JobStatus) -> Result<(), AppError> {
-        if let JobStatus::Failed { code } = &to {
-            validate_failure_code(code)?;
-        }
-        let (code, url, name) = match &to {
-            JobStatus::Failed { code } => (Some(code.as_str()), None, None),
-            JobStatus::Completed(receipt) => (None, Some(receipt.url()), Some(receipt.name())),
-            _ => (None, None, None),
+        let code = match &to {
+            JobStatus::Failed { code } => {
+                validate_failure_code(code)?;
+                Some(code.as_str())
+            }
+            JobStatus::Completed(_) => {
+                return Err(AppError::InvalidInput(
+                    "a confirmed result is recorded with its session and attempt",
+                ));
+            }
+            _ => None,
         };
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -250,9 +258,63 @@ impl History {
             ));
         }
         tx.execute(
-            "UPDATE jobs SET status = ?2, failure_code = ?3, receipt_url = ?4, receipt_name = ?5, updated_ms = ?6 \
-             WHERE id = ?1",
-            params![id.0.to_string(), to.tag(), code, url, name, now_ms()],
+            "UPDATE jobs SET status = ?2, failure_code = ?3, updated_ms = ?4, \
+             attempt = attempt + (?2 = 'running') WHERE id = ?1",
+            params![id.0.to_string(), to.tag(), code, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a confirmed Vectr result for one started attempt of a job, even
+    /// if the job was cancelled, failed, or interrupted while the request was in
+    /// flight (remote success is authoritative; no work restarts). The result
+    /// must name the job's recorded session (`None` for a sessionless empty-file
+    /// upload) and an attempt that actually started. Recording the same receipt
+    /// again is a no-op; a different receipt for a completed job is refused.
+    pub fn record_receipt(
+        &self,
+        id: JobId,
+        attempt: u32,
+        session: Option<Uuid>,
+        receipt: &UploadReceipt,
+    ) -> Result<(), AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, i64, Option<String>, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT status, attempt, session_id, receipt_url, receipt_name FROM jobs WHERE id = ?1",
+                params![id.0.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let (status, started, stored_session, url, name) =
+            row.ok_or(AppError::InvalidInput("unknown upload job"))?;
+        if attempt == 0 || i64::from(attempt) > started {
+            return Err(AppError::InvalidInput(
+                "result does not belong to a started upload attempt",
+            ));
+        }
+        if stored_session != session.map(|s| s.to_string()) {
+            return Err(AppError::InvalidInput(
+                "result belongs to a different upload session",
+            ));
+        }
+        if status == "completed" {
+            return if url.as_deref() == Some(receipt.url())
+                && name.as_deref() == Some(receipt.name())
+            {
+                Ok(())
+            } else {
+                Err(AppError::InvalidInput(
+                    "a different result is already recorded for this upload",
+                ))
+            };
+        }
+        tx.execute(
+            "UPDATE jobs SET status = 'completed', failure_code = NULL, receipt_url = ?2, \
+             receipt_name = ?3, updated_ms = ?4 WHERE id = ?1",
+            params![id.0.to_string(), receipt.url(), receipt.name(), now_ms()],
         )?;
         tx.commit()?;
         Ok(())
@@ -607,6 +669,7 @@ struct RawJob {
     kind: String,
     size: i64,
     sha256: Vec<u8>,
+    attempt: i64,
 }
 
 impl RawJob {
@@ -630,6 +693,7 @@ impl RawJob {
             kind: r.get(15)?,
             size: r.get(16)?,
             sha256: r.get(17)?,
+            attempt: r.get(18)?,
         })
     }
 
@@ -689,6 +753,7 @@ impl RawJob {
             session: self.session.map(|s| parse_uuid(&s)).transpose()?,
             status,
             paused: self.paused,
+            attempt: u32::try_from(self.attempt).map_err(|_| corrupt())?,
         })
     }
 }

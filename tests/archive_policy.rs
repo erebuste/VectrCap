@@ -76,7 +76,13 @@ impl Fixture {
         .unwrap();
         let job = self.history.create_job(artifact, &dest).unwrap();
         for s in status {
-            self.history.transition(job.id, s.clone()).unwrap();
+            match s {
+                JobStatus::Completed(r) => {
+                    let attempt = self.history.job(job.id).unwrap().unwrap().attempt;
+                    self.history.record_receipt(job.id, attempt, None, r).unwrap();
+                }
+                s => self.history.transition(job.id, s.clone()).unwrap(),
+            }
         }
         job.id
     }

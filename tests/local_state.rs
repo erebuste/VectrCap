@@ -265,9 +265,7 @@ fn reopens_pending_jobs() {
         history.set_job_paused(paused.id, true).unwrap();
         history.transition(done.id, JobStatus::Running).unwrap();
         let receipt = UploadReceipt::new("https://i.example/f/d.bin", "d.bin").unwrap();
-        history
-            .transition(done.id, JobStatus::Completed(receipt))
-            .unwrap();
+        history.record_receipt(done.id, 1, None, &receipt).unwrap();
         (resumable, uncertain, paused, done)
     }; // process "exits" here
 
@@ -343,9 +341,8 @@ fn job_transitions_are_validated_and_sanitized() {
     history.transition(job.id, JobStatus::Pending).unwrap();
     history.transition(job.id, JobStatus::Running).unwrap();
     let receipt = UploadReceipt::new("https://i.example/f/a.bin", "a.bin").unwrap();
-    history
-        .transition(job.id, JobStatus::Completed(receipt))
-        .unwrap();
+    assert_eq!(history.job(job.id).unwrap().unwrap().attempt, 2);
+    history.record_receipt(job.id, 2, None, &receipt).unwrap();
 
     // A confirmed receipt is terminal and never downgraded.
     for next in [
@@ -438,6 +435,100 @@ fn session_has_one_owner_per_server() {
         .filter(|j| history.job(**j).unwrap().unwrap().session == Some(t))
         .count();
     assert_eq!(owners, 1);
+}
+
+#[test]
+fn late_receipt_after_cancel_fail_or_interrupt_is_kept_and_bound() {
+    let dir = TempDir::new().unwrap();
+    let store = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let db = dir.path().join("history.sqlite3");
+    let receipt = |n: &str| UploadReceipt::new(&format!("https://i.example/f/{n}"), n).unwrap();
+    let [s_cancel, s_fail, s_interrupt] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+    let (cancelled, failed, interrupted, empty) = {
+        let history = History::open(&db).unwrap();
+        let mut n = 0;
+        let mut running = |session: Option<Uuid>| {
+            n += 1;
+            let name = format!("{n}.bin");
+            let art = store
+                .stage_file(&write(dir.path(), &name, name.as_bytes()), ArtifactKind::File)
+                .unwrap();
+            let job = history.create_job(&art, &snapshot()).unwrap();
+            assert_eq!(job.attempt, 0, "no attempt has started yet");
+            history.transition(job.id, JobStatus::Running).unwrap();
+            if let Some(s) = session {
+                history.set_session(job.id, s).unwrap();
+            }
+            job.id
+        };
+        let cancelled = running(Some(s_cancel));
+        let failed = running(Some(s_fail));
+        let interrupted = running(Some(s_interrupt));
+        let empty = running(None); // zero-byte single upload: no session
+
+        // Completion goes through the bound receipt API only.
+        assert!(
+            history
+                .transition(cancelled, JobStatus::Completed(receipt("x")))
+                .is_err()
+        );
+        history.transition(cancelled, JobStatus::Cancelled).unwrap();
+        let code = "http.timeout".to_string();
+        history
+            .transition(failed, JobStatus::Failed { code })
+            .unwrap();
+        history.transition(empty, JobStatus::Cancelled).unwrap();
+        assert_eq!(history.job(cancelled).unwrap().unwrap().attempt, 1);
+        (cancelled, failed, interrupted, empty)
+    }; // process exits with `interrupted` still running
+
+    let history = History::open(&db).unwrap();
+    history.recover_jobs().unwrap();
+    assert_eq!(
+        history.job(interrupted).unwrap().unwrap().status,
+        JobStatus::Interrupted
+    );
+
+    // Wrong session or an attempt that never started is refused, state unchanged.
+    let invalid = |r: Result<(), AppError>| matches!(r, Err(AppError::InvalidInput(_)));
+    assert!(invalid(history.record_receipt(cancelled, 1, Some(s_fail), &receipt("a"))));
+    assert!(invalid(history.record_receipt(cancelled, 1, None, &receipt("a"))));
+    assert!(invalid(history.record_receipt(cancelled, 2, Some(s_cancel), &receipt("a"))));
+    assert!(invalid(history.record_receipt(cancelled, 0, Some(s_cancel), &receipt("a"))));
+    assert!(invalid(history.record_receipt(empty, 1, Some(s_cancel), &receipt("e"))));
+    assert_eq!(
+        history.job(cancelled).unwrap().unwrap().status,
+        JobStatus::Cancelled
+    );
+
+    // Matching late results settle each job without restarting work.
+    history
+        .record_receipt(cancelled, 1, Some(s_cancel), &receipt("a"))
+        .unwrap();
+    history
+        .record_receipt(failed, 1, Some(s_fail), &receipt("b"))
+        .unwrap();
+    history
+        .record_receipt(interrupted, 1, Some(s_interrupt), &receipt("c"))
+        .unwrap();
+    history.record_receipt(empty, 1, None, &receipt("e")).unwrap();
+
+    // Same receipt again is idempotent; a conflicting one is refused.
+    history
+        .record_receipt(cancelled, 1, Some(s_cancel), &receipt("a"))
+        .unwrap();
+    assert!(invalid(history.record_receipt(cancelled, 1, Some(s_cancel), &receipt("z"))));
+
+    drop(history);
+    let history = History::open(&db).unwrap();
+    assert!(history.recover_jobs().unwrap().is_empty(), "all settled");
+    for (job, name) in [(cancelled, "a"), (failed, "b"), (interrupted, "c"), (empty, "e")] {
+        assert_eq!(
+            history.job(job).unwrap().unwrap().status,
+            JobStatus::Completed(receipt(name))
+        );
+    }
 }
 
 #[test]
