@@ -363,6 +363,83 @@ fn job_transitions_are_validated_and_sanitized() {
     assert!(history.set_session(job.id, Uuid::new_v4()).is_err());
 }
 
+/// Two destinations on one server plus one on another, all with bound credentials.
+fn three_destinations() -> [DestinationSnapshot; 3] {
+    let mut d = Destinations::default();
+    let shared = ServerOrigin::parse("https://vectr.example").unwrap();
+    let a = d.add("Phone", shared.clone(), None).unwrap();
+    let b = d.add("Laptop", shared, None).unwrap();
+    let c = d
+        .add(
+            "Other",
+            ServerOrigin::parse("https://other.example").unwrap(),
+            None,
+        )
+        .unwrap();
+    [a, b, c].map(|id| {
+        d.bind_credential(id, &HashSet::new()).unwrap();
+        resolve_destination(
+            DestinationSelection::Specific(id),
+            DestinationSelection::Inherit,
+            &d,
+        )
+        .unwrap()
+    })
+}
+
+#[test]
+fn session_has_one_owner_per_server() {
+    let dir = TempDir::new().unwrap();
+    let store = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let db = dir.path().join("history.sqlite3");
+    let history = History::open(&db).unwrap();
+    let dests = three_destinations();
+    let mut n = 0;
+    let mut running = |dest: &DestinationSnapshot| {
+        n += 1;
+        let name = format!("{n}.bin");
+        let art = store
+            .stage_file(&write(dir.path(), &name, name.as_bytes()), ArtifactKind::File)
+            .unwrap();
+        let job = history.create_job(&art, dest).unwrap();
+        history.transition(job.id, JobStatus::Running).unwrap();
+        job.id
+    };
+    let (a, b, c) = (running(&dests[0]), running(&dests[1]), running(&dests[2]));
+    let (d, e) = (running(&dests[0]), running(&dests[1]));
+
+    let s = Uuid::new_v4();
+    history.set_session(a, s).unwrap();
+    history.set_session(a, s).unwrap(); // same owner: idempotent
+    assert!(
+        matches!(history.set_session(b, s), Err(AppError::InvalidInput(_))),
+        "another destination on the same server cannot claim the session"
+    );
+    assert_eq!(history.job(b).unwrap().unwrap().session, None);
+    history.set_session(c, s).unwrap(); // independent server, same UUID
+
+    // Concurrent claims from two connections: exactly one owner wins.
+    let t = Uuid::new_v4();
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let claims = [d, e].map(|job| {
+            let (db, barrier) = (&db, &barrier);
+            scope.spawn(move || {
+                let h = History::open(db).unwrap();
+                barrier.wait();
+                h.set_session(job, t)
+            })
+        });
+        claims.map(|c| c.join().unwrap())
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+    let owners = [d, e]
+        .iter()
+        .filter(|j| history.job(**j).unwrap().unwrap().session == Some(t))
+        .count();
+    assert_eq!(owners, 1);
+}
+
 #[test]
 fn pause_and_favorite_intents_default_false_and_persist() {
     let dir = TempDir::new().unwrap();

@@ -55,6 +55,8 @@ CREATE TABLE jobs (
     updated_ms INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX jobs_by_status ON jobs(status);
+-- A server session has exactly one owning job per normalized server origin.
+CREATE UNIQUE INDEX jobs_session_owner ON jobs(dest_origin, session_id) WHERE session_id IS NOT NULL;
 CREATE INDEX jobs_by_artifact ON jobs(artifact_id);
 
 CREATE TABLE archive_entries (
@@ -256,7 +258,10 @@ impl History {
         Ok(())
     }
 
-    /// Records the server session for a running job, exactly once.
+    /// Records the server session for a running job, exactly once. A session
+    /// belongs to one job per server origin (enforced by a unique index, so
+    /// concurrent claims from other connections cannot both succeed);
+    /// re-recording the same session on its owner is idempotent.
     pub fn set_session(&self, id: JobId, session: Uuid) -> Result<(), AppError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -277,7 +282,13 @@ impl History {
         tx.execute(
             "UPDATE jobs SET session_id = ?2, updated_ms = ?3 WHERE id = ?1",
             params![id.0.to_string(), session_text, now_ms()],
-        )?;
+        )
+        .map_err(|e| match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::ConstraintViolation) => {
+                AppError::InvalidInput("this upload session belongs to another job")
+            }
+            _ => e.into(),
+        })?;
         tx.commit()?;
         Ok(())
     }
