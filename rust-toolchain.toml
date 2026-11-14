@@ -1,8 +1,9 @@
-# Verified host toolchain on 2026-11-14: stable == rustc 1.98.1 (48a229cea), MSVC.
-# An exact `channel = "1.98.1"` would make rustup auto-install a second, identical
-# toolchain; Cargo.toml `rust-version` enforces the 1.98.1 floor instead.
+# Exact compiler verified for this checkout: rustc 1.98.1 (48a229cea 2026-09-01), MSVC host.
+# Provisioning is explicit: `rustup toolchain install 1.98.1 --profile minimal -c rustfmt,clippy`.
+# Verification commands run with RUSTUP_AUTO_INSTALL=0 so a missing toolchain fails instead of
+# installing silently (see docs/verification/foundation-report.md, "Toolchain").
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-pc-windows-msvc"]
 profile = "minimal"
