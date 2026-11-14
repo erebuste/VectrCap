@@ -21,9 +21,17 @@ thiserror = "2.0.21"
 url = "2.5.8"
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
 
-# Already in the tree via dirs/tempfile; used for one free-space query.
+# Already in the tree via dirs/tempfile. Handle-based file operations: directory-relative
+# NtCreateFile opens, rename/delete/identity by handle, final-path checks, free space.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [lints.rust]
 unsafe_code = "deny"

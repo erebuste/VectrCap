@@ -14,6 +14,7 @@ pub mod artifacts;
 pub mod filename;
 pub mod history;
 pub mod settings;
+pub(crate) mod winfs;
 
 /// Prefix of in-progress files the app writes before an atomic rename.
 pub(crate) const PARTIAL_PREFIX: &str = ".vectrcap-partial-";
@@ -30,6 +31,88 @@ pub fn default_archive_root() -> Result<PathBuf, AppError> {
             stage: "resolving the Pictures folder",
             kind: io::ErrorKind::NotFound,
         })
+}
+
+/// Named interleaving point. Unit tests attach a closure to run another
+/// "process" exactly here; in normal builds this compiles to nothing.
+#[inline]
+pub(crate) fn hook(_point: &'static str) {
+    #[cfg(test)]
+    test_support::fire(_point);
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&'static str)>;
+    thread_local!(static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) });
+
+    pub(crate) fn set_hook(f: impl FnMut(&'static str) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(crate) fn clear_hook() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(super) fn fire(point: &'static str) {
+        // Taken out while running so the hook may call back into the library.
+        let Some(mut f) = HOOK.with(|h| h.borrow_mut().take()) else {
+            return;
+        };
+        f(point);
+        HOOK.with(|h| {
+            h.borrow_mut().get_or_insert(f);
+        });
+    }
+
+    /// Directory junction (no elevation needed), the Windows fixture for
+    /// redirected roots and descendant escapes.
+    pub(crate) fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    /// Clears the read-only attribute (attribute writes are not subject to
+    /// share modes, so this works even while another handle is open).
+    pub(crate) fn make_writable(path: &Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Open-for-write, rename, and delete attempts by another opener.
+    pub(crate) fn mutation_attempts(path: &Path) -> Vec<std::io::Result<()>> {
+        use std::io::Write;
+        vec![
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|mut f| f.write_all(b"XX")),
+            std::fs::rename(path, path.with_extension("moved")),
+            std::fs::remove_file(path),
+        ]
+    }
+
+    pub(crate) fn assert_sharing_violations(results: &[std::io::Result<()>]) {
+        assert_eq!(results.len(), 3, "the interleaving point was not reached");
+        for r in results {
+            assert_eq!(
+                r.as_ref().err().and_then(std::io::Error::raw_os_error),
+                Some(32),
+                "expected ERROR_SHARING_VIOLATION, got {r:?}"
+            );
+        }
+    }
 }
 
 pub(crate) fn now_ms() -> i64 {

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -8,10 +8,21 @@ use uuid::Uuid;
 
 use crate::app::error::AppError;
 use crate::app::types::{Artifact, ArtifactId, ArtifactKind};
-use crate::persistence::{
-    PARTIAL_PREFIX, copy_hashing, ensure_free_space, fingerprint, mark_readonly, open_no_follow,
-    remove_owned_file,
-};
+use crate::persistence::winfs::{self, ERROR_SHARING_VIOLATION};
+use crate::persistence::{PARTIAL_PREFIX, copy_hashing, ensure_free_space, hook};
+
+const IN_USE: AppError =
+    AppError::InUse("the file is open for writing in another program; close it and try again");
+
+/// Maps a failed exclusive open: an existing writer/deleter is reported as
+/// in-use instead of being silently tolerated.
+fn open_error(stage: &'static str, e: &io::Error) -> AppError {
+    if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+        IN_USE
+    } else {
+        AppError::io(stage, e)
+    }
+}
 
 const SPOOL_EXTENSION: &str = "spool";
 const MAX_DISPLAY_NAME_UTF16: usize = 255;
@@ -44,26 +55,37 @@ impl ArtifactStore {
     }
 
     /// Copies a regular local file into the spool and records its size and
-    /// SHA-256. The original is only read. A source that changes while being
-    /// copied is refused instead of producing inconsistent bytes.
+    /// SHA-256. The original is only read, through a handle that denies other
+    /// writers, renames, and deletes for the whole copy; a source already open
+    /// for writing is refused (`InUse`) rather than copied inconsistently.
     pub fn stage_file(&self, source: &Path, kind: ArtifactKind) -> Result<Artifact, AppError> {
         const NOT_REGULAR: AppError =
             AppError::InvalidInput("only regular local files can be uploaded");
+        const READING: &str = "reading the source file";
         let display_name = display_name_of(source)?;
         check_source_path(source)?;
-        let meta = fs::symlink_metadata(source)
-            .map_err(|e| AppError::io("reading the source file", &e))?;
-        if !meta.is_file() {
-            return Err(NOT_REGULAR);
-        }
-        let mut src = open_no_follow(source).map_err(|e| match e.kind() {
-            io::ErrorKind::InvalidInput => NOT_REGULAR,
-            _ => AppError::io("opening the source file", &e),
+        let mut src = winfs::open_read_exclusive(source).map_err(|e| {
+            // Directories fail to open as files with access-denied; the lookup
+            // only classifies the error, the handle check is authoritative.
+            let not_file = fs::symlink_metadata(source).is_ok_and(|m| !m.is_file());
+            if e.kind() == io::ErrorKind::InvalidInput || not_file {
+                NOT_REGULAR
+            } else {
+                open_error("opening the source file", &e)
+            }
         })?;
-        let before = src
-            .metadata()
-            .map_err(|e| AppError::io("reading the source file", &e))?;
+        hook("stage.source_open");
+        // Policy is checked on what the handle actually resolved to (mapped
+        // drives, junctions, and symlinked folders included), not the input text.
+        let resolved = winfs::final_path(&src).map_err(|e| AppError::io(READING, &e))?;
+        if !is_local_final_path(&resolved) {
+            return Err(AppError::InvalidInput(
+                "network and device paths are not supported",
+            ));
+        }
+        let before = src.metadata().map_err(|e| AppError::io(READING, &e))?;
         let size = before.len();
+        let modified = before.modified().map_err(|e| AppError::io(READING, &e))?;
 
         let _guard = self
             .staging
@@ -77,9 +99,11 @@ impl ArtifactStore {
             .map_err(|e| AppError::io(STAGE, &e))?;
         let (copied, sha256) =
             copy_hashing(&mut src, tmp.as_file_mut(), size).map_err(|e| AppError::io(STAGE, &e))?;
+        // Defense in depth: writers are excluded, so these can only differ if
+        // that guarantee failed. Metadata errors fail instead of matching.
         let after = src.metadata().map_err(|e| AppError::io(STAGE, &e))?;
-        if copied != size || after.len() != size || after.modified().ok() != before.modified().ok()
-        {
+        let modified_after = after.modified().map_err(|e| AppError::io(STAGE, &e))?;
+        if copied != size || after.len() != size || modified_after != modified {
             return Err(AppError::InvalidInput(
                 "the file changed while it was being staged; try again",
             ));
@@ -89,12 +113,19 @@ impl ArtifactStore {
             .map_err(|e| AppError::io(STAGE, &e))?;
 
         let id = ArtifactId::new_random();
-        let path = self
-            .root
-            .join(format!("{}.{SPOOL_EXTENSION}", id.0.simple()));
-        tmp.persist_noclobber(&path)
+        let path = self.spool_path(id);
+        // Persisting rewrites the temp file's attributes, so read-only is set
+        // afterwards, through the same still-open handle.
+        let file = tmp
+            .persist_noclobber(&path)
             .map_err(|e| AppError::io(STAGE, &e.error))?;
-        mark_readonly(&path).map_err(|e| AppError::io(STAGE, &e))?;
+        let mut perms = file
+            .metadata()
+            .map_err(|e| AppError::io(STAGE, &e))?
+            .permissions();
+        perms.set_readonly(true);
+        file.set_permissions(perms)
+            .map_err(|e| AppError::io(STAGE, &e))?;
         Ok(Artifact {
             id,
             path,
@@ -105,19 +136,51 @@ impl ArtifactStore {
         })
     }
 
-    /// Confirms the staged bytes still match what was recorded at staging time.
+    fn spool_path(&self, id: ArtifactId) -> PathBuf {
+        self.root
+            .join(format!("{}.{SPOOL_EXTENSION}", id.0.simple()))
+    }
+
+    /// Informational check that the staged bytes still match their record.
+    /// This is not an upload primitive: the handle is released on return. Use
+    /// `open_verified` to read bytes that are guaranteed to be the verified ones.
     pub fn verify(&self, artifact: &Artifact) -> Result<(), AppError> {
-        if artifact.path.parent() != Some(self.root.as_path()) {
+        self.open_verified(artifact).map(drop)
+    }
+
+    /// Opens the artifact's own spool file, hashes it, and returns the same
+    /// handle rewound to offset 0. The handle denies writers, renames, and
+    /// deletes, so every read through the returned guard yields exactly the
+    /// verified bytes until it is dropped.
+    pub fn open_verified(&self, artifact: &Artifact) -> Result<VerifiedSource, AppError> {
+        const STAGE: &str = "verifying the staged file";
+        if artifact.path != self.spool_path(artifact.id) {
             return Err(AppError::InvalidInput(
-                "artifact is not in this staging folder",
+                "artifact is not this store's spool file for its ID",
             ));
         }
-        match fingerprint(&artifact.path) {
-            Ok((size, hash)) if size == artifact.size && hash == artifact.sha256 => Ok(()),
-            Ok(_) => Err(AppError::ArtifactChanged),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Err(AppError::ArtifactChanged),
-            Err(e) => Err(AppError::io("verifying the staged file", &e)),
+        let mut file = winfs::open_read_exclusive(&artifact.path).map_err(|e| match e.kind() {
+            io::ErrorKind::InvalidInput => AppError::ArtifactChanged,
+            _ => open_error(STAGE, &e),
+        })?;
+        hook("verify.open");
+        let len = file.metadata().map_err(|e| AppError::io(STAGE, &e))?.len();
+        if len != artifact.size {
+            return Err(AppError::ArtifactChanged);
         }
+        let (read, sha256) =
+            copy_hashing(&mut file, &mut io::sink(), len).map_err(|e| AppError::io(STAGE, &e))?;
+        if read != artifact.size || sha256 != artifact.sha256 {
+            return Err(AppError::ArtifactChanged);
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| AppError::io(STAGE, &e))?;
+        Ok(VerifiedSource {
+            file,
+            artifact_id: artifact.id,
+            size: read,
+            sha256,
+        })
     }
 
     /// Startup recovery: removes interrupted partial files and spool files no
@@ -142,13 +205,72 @@ impl ArtifactStore {
             let Some(name) = name.to_str() else { continue };
             let orphan = name.starts_with(PARTIAL_PREFIX)
                 || spool_id(name).is_some_and(|id| !needed.contains(&id));
-            if orphan {
-                remove_owned_file(&entry.path()).map_err(|e| AppError::io(STAGE, &e))?;
-                removed += 1;
+            if !orphan {
+                continue;
             }
+            // Deleted through the handle that was checked to be a regular file;
+            // a file someone still has open is left for the next startup.
+            let file = match winfs::open_owned_by_path(&entry.path()) {
+                Ok(file) => file,
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => continue,
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => continue,
+                Err(e) => return Err(AppError::io(STAGE, &e)),
+            };
+            winfs::delete_by_handle(&file).map_err(|e| AppError::io(STAGE, &e))?;
+            removed += 1;
         }
         Ok(removed)
     }
+}
+
+/// Upload source guard from `ArtifactStore::open_verified`: an open spool
+/// handle whose bytes were hashed against the artifact record and cannot be
+/// modified, renamed, or deleted while this value lives. Uploads read (and
+/// seek for chunk offsets) through it instead of reopening `Artifact::path`.
+pub struct VerifiedSource {
+    file: fs::File,
+    artifact_id: ArtifactId,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+impl VerifiedSource {
+    pub fn artifact_id(&self) -> ArtifactId {
+        self.artifact_id
+    }
+
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    pub fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+}
+
+impl Read for VerifiedSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for VerifiedSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// `\\?\X:\...` only: rejects `\\?\UNC\...` (network shares, including mapped
+/// drives), volume-GUID, and device namespaces.
+fn is_local_final_path(final_path: &str) -> bool {
+    let Some(rest) = final_path.strip_prefix(r"\\?\") else {
+        return false;
+    };
+    matches!(rest.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
 /// Parses `<32-hex-uuid>.spool`, the only spool names this store generates.
@@ -200,4 +322,155 @@ fn check_source_path(source: &Path) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::rc::Rc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::persistence::test_support::{
+        assert_sharing_violations, clear_hook, junction, make_writable, mutation_attempts,
+        set_hook,
+    };
+
+    fn fixture() -> (TempDir, ArtifactStore) {
+        let dir = TempDir::new().unwrap();
+        let store = ArtifactStore::new(dir.path().join("spool")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn existing_writer_blocks_staging() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("live.log");
+        fs::write(&src, b"v1").unwrap();
+        // std's default share mode is read|write|delete: a typical concurrent writer.
+        let writer = fs::OpenOptions::new().write(true).open(&src).unwrap();
+        assert!(matches!(
+            store.stage_file(&src, ArtifactKind::File),
+            Err(AppError::InUse(_))
+        ));
+        drop(writer);
+        store.stage_file(&src, ArtifactKind::File).unwrap();
+    }
+
+    #[test]
+    fn staging_excludes_writers_renames_and_deletes_during_copy() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("big.bin");
+        let original = vec![7u8; 3 * 64 * 1024 + 5];
+        fs::write(&src, &original).unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (s, p) = (seen.clone(), src.clone());
+        set_hook(move |point| {
+            if point == "stage.source_open" {
+                *s.borrow_mut() = mutation_attempts(&p);
+            }
+        });
+        let art = store.stage_file(&src, ArtifactKind::File);
+        clear_hook();
+        assert_sharing_violations(&seen.borrow());
+        let art = art.unwrap();
+        assert_eq!(fs::read(&art.path).unwrap(), original);
+        assert_eq!(fs::read(&src).unwrap(), original);
+    }
+
+    #[test]
+    fn verified_source_holds_its_bytes_until_dropped() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("a.bin");
+        let original: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &original).unwrap();
+        let art = store.stage_file(&src, ArtifactKind::File).unwrap();
+
+        let mut v = store.open_verified(&art).unwrap();
+        assert_eq!((v.len(), v.sha256()), (art.size, &art.sha256));
+        make_writable(&art.path);
+        assert_sharing_violations(&mutation_attempts(&art.path));
+        let mut first = Vec::new();
+        v.read_to_end(&mut first).unwrap();
+        assert_eq!(first, original, "verified handle starts at offset 0");
+        v.seek(SeekFrom::Start(100)).unwrap();
+        let mut tail = Vec::new();
+        v.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, original[100..]);
+        drop(v);
+
+        // Once released, tampering is possible again and is detected on reopen.
+        fs::write(&art.path, b"tampered").unwrap();
+        assert!(matches!(
+            store.open_verified(&art),
+            Err(AppError::ArtifactChanged)
+        ));
+    }
+
+    #[test]
+    fn verification_hashes_while_excluding_writers() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("a.bin");
+        fs::write(&src, b"payload").unwrap();
+        let art = store.stage_file(&src, ArtifactKind::File).unwrap();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let (s, p) = (seen.clone(), art.path.clone());
+        set_hook(move |point| {
+            if point == "verify.open" {
+                make_writable(&p);
+                *s.borrow_mut() = mutation_attempts(&p);
+            }
+        });
+        let verified = store.open_verified(&art);
+        clear_hook();
+        assert_sharing_violations(&seen.borrow());
+        let mut bytes = Vec::new();
+        verified.unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+    }
+
+    #[test]
+    fn verified_source_rejects_paths_outside_its_spool_name() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("a.bin");
+        fs::write(&src, b"a").unwrap();
+        let art = store.stage_file(&src, ArtifactKind::File).unwrap();
+        let other = store.stage_file(&src, ArtifactKind::File).unwrap();
+        let swapped = Artifact {
+            path: other.path.clone(),
+            ..art.clone()
+        };
+        assert!(matches!(
+            store.open_verified(&swapped),
+            Err(AppError::InvalidInput(_))
+        ));
+        let outside = Artifact {
+            path: src.clone(),
+            ..art
+        };
+        assert!(store.open_verified(&outside).is_err());
+    }
+
+    #[test]
+    fn local_source_policy_uses_the_resolved_path() {
+        assert!(is_local_final_path(r"\\?\C:\Users\me\a.png"));
+        assert!(is_local_final_path(r"\\?\d:\x"));
+        assert!(!is_local_final_path(r"\\?\UNC\server\share\a.png"));
+        assert!(!is_local_final_path(r"\\?\Volume{0f1e2d3c-0000-0000-0000-000000000000}\a"));
+        assert!(!is_local_final_path(r"\\?\GLOBALROOT\Device\X\a"));
+        assert!(!is_local_final_path(r"C:\not-normalized"));
+
+        // A local junction is a legitimate parent: its resolved path is still local.
+        let (dir, store) = fixture();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("a.bin"), b"a").unwrap();
+        junction(&dir.path().join("via"), &real);
+        let art = store
+            .stage_file(&dir.path().join("via").join("a.bin"), ArtifactKind::File)
+            .unwrap();
+        assert_eq!(art.size, 1);
+    }
 }
