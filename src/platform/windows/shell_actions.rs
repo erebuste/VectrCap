@@ -102,8 +102,11 @@ mod tests {
     fn opens_a_real_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("smoke.txt");
-        std::fs::write(&path, b"x").unwrap();
+        std::fs::write(&path, b"VectrCap native shell smoke test").unwrap();
         WindowsShellActions.open_path(&path).unwrap();
+        // ShellExecute returns before the viewer reads the file. Keep the
+        // fixture alive long enough for the manual native observation.
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
     #[test]
     fn explorer_path_is_absolute_and_not_a_bare_name() {
