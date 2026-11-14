@@ -251,6 +251,9 @@ impl RecordingLimits {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub version: u32,
+    /// Local optimistic-concurrency version, never a secret or export identity.
+    #[serde(default)]
+    pub revision: u64,
     pub destinations: Destinations,
     pub archive: ArchivePolicy,
     pub filename: FilenamePreset,
@@ -261,6 +264,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             version: SETTINGS_VERSION,
+            revision: 0,
             destinations: Destinations::default(),
             archive: ArchivePolicy::default(),
             filename: FilenamePreset::default(),
@@ -300,25 +304,68 @@ impl Settings {
 
     /// Validates, then atomically replaces the file; a failed save keeps the old one.
     pub fn save(&self, path: &Path) -> Result<(), AppError> {
-        const STAGE: &str = "saving settings";
         self.validate()?;
-        let dir = path
-            .parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .ok_or(AppError::InvalidInput("settings path has no parent folder"))?;
-        fs::create_dir_all(dir).map_err(|e| AppError::io(STAGE, &e))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(PARTIAL_PREFIX)
-            .tempfile_in(dir)
-            .map_err(|e| AppError::io(STAGE, &e))?;
-        serde_json::to_writer_pretty(&mut tmp, self)
-            .map_err(|_| AppError::Persistence("settings could not be encoded"))?;
-        tmp.flush().map_err(|e| AppError::io(STAGE, &e))?;
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| AppError::io(STAGE, &e))?;
-        tmp.persist(path)
-            .map_err(|e| AppError::io(STAGE, &e.error))?;
-        Ok(())
+        save_json(self, path)
     }
+}
+
+pub(crate) fn save_json(value: &impl Serialize, path: &Path) -> Result<(), AppError> {
+    const STAGE: &str = "saving local settings";
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|_| AppError::Persistence("local settings could not be encoded"))?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err(AppError::Persistence("local settings exceed capacity"));
+    }
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or(AppError::InvalidInput("settings path has no parent folder"))?;
+    fs::create_dir_all(dir).map_err(|e| AppError::io(STAGE, &e))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(PARTIAL_PREFIX)
+        .tempfile_in(dir)
+        .map_err(|e| AppError::io(STAGE, &e))?;
+    tmp.write_all(&bytes).map_err(|e| AppError::io(STAGE, &e))?;
+    tmp.flush().map_err(|e| AppError::io(STAGE, &e))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| AppError::io(STAGE, &e))?;
+    replace_write_through(tmp.path(), path)?;
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn replace_write_through(source: &Path, destination: &Path) -> Result<(), AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let wide = |p: &Path| -> Result<Vec<u16>, AppError> {
+        let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if v.contains(&0) {
+            return Err(AppError::InvalidInput("local settings path is invalid"));
+        }
+        v.push(0);
+        Ok(v)
+    };
+    let source = wide(source)?;
+    let destination = wide(destination)?;
+    // SAFETY: both NUL-terminated paths live for this synchronous call. Same
+    // directory/volume, no copy fallback, reboot scheduling or elevated flags.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(AppError::io(
+            "committing local settings",
+            &std::io::Error::last_os_error(),
+        ));
+    }
+    // No fallible operation after the commit point: callers may now retire old
+    // credentials. Tempfile drop only removes the no-longer-existing old name.
+    Ok(())
 }

@@ -7,7 +7,7 @@ description = "Windows tray capture and Vectr upload utility"
 license = "UNLICENSED"
 publish = false
 
-# Foundation and Task 2 only; GUI, tray, capture and media belong to later tasks.
+# Foundation, upload library and Task 3A credentials only; desktop/media pending.
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "7.0.0"
@@ -42,6 +42,7 @@ windows-sys = { version = "0.61.2", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
 ] }

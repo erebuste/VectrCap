@@ -186,6 +186,23 @@ impl Destinations {
         Ok(key)
     }
 
+    /// Transaction coordinator reserves generations durably, including failed
+    /// installations, before issuing a binding. Never lower or reuse one.
+    pub(crate) fn bind_reserved_credential(
+        &mut self,
+        id: DestinationId,
+        generation: u32,
+    ) -> Result<CredentialKey, AppError> {
+        let d = self.get_mut(id)?;
+        if generation <= d.credential_generation {
+            return Err(AppError::InvalidInput("credential generation is not fresh"));
+        }
+        let key = CredentialKey::new(id, d.origin.clone(), generation);
+        d.credential_generation = generation;
+        d.credential_ref = Some(key.clone());
+        Ok(key)
+    }
+
     /// Changes the server origin. The old token binding is dropped, never carried
     /// to the new origin.
     pub fn change_origin(
@@ -243,6 +260,11 @@ impl Destinations {
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
         for d in &self.items {
+            if d.id.0.is_nil() {
+                return Err(AppError::InvalidInput(
+                    "destination identifier must be nonzero",
+                ));
+            }
             if !ids.insert(d.id) {
                 return Err(AppError::InvalidInput(
                     "destination identifiers must be unique",

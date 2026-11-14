@@ -68,6 +68,11 @@ impl fmt::Debug for UploadToken {
     }
 }
 impl UploadToken {
+    /// Raw ASCII UTF-8 transport bytes, only exposed within the crate to the
+    /// protected credential adapter. No serialization or plaintext fallback.
+    pub(crate) fn encoded(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
     pub fn new(value: String) -> Result<Self, AppError> {
         let value = Zeroizing::new(value);
         if value.is_empty()
