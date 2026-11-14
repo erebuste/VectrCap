@@ -128,3 +128,38 @@ fn metadata_from_previous_settings_revision_cannot_verify_current_form() {
     assert!(draft.metadata.is_none());
     assert!(draft.pending_test.is_none());
 }
+
+#[test]
+fn notice_expiration_includes_boundary_and_handles_future_start() {
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+    use vectrcap::app::{
+        notifications::{CompletionNotice, CompletionStatus, JobCompletion, NotificationCenter},
+        types::JobId,
+    };
+    use vectrcap::ui::completion_notification::expired_notice_ids;
+    let mut center = NotificationCenter::new();
+    center
+        .record(CompletionNotice::Job(
+            JobCompletion::try_new(
+                JobId(uuid::Uuid::new_v4()),
+                "file.txt",
+                true,
+                true,
+                None,
+                CompletionStatus::local_only(),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let id = center.visible()[0].id();
+    let now = Instant::now();
+    let ttl = Duration::from_secs(6);
+    assert_eq!(
+        expired_notice_ids(&HashMap::from([(id, now - ttl)]), now, ttl),
+        vec![id]
+    );
+    assert!(expired_notice_ids(&HashMap::from([(id, now + ttl)]), now, ttl).is_empty());
+}

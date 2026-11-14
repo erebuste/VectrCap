@@ -61,8 +61,20 @@ impl SettingsPane {
             }
         }
     }
-    pub fn draw(&mut self, ui: &mut Ui, settings: &Settings) -> Vec<AppCommand> {
+    pub fn draw(
+        &mut self,
+        ui: &mut Ui,
+        settings: &Settings,
+        notifications_enabled: bool,
+    ) -> Vec<AppCommand> {
         let mut commands = vec![];
+        let mut enabled = notifications_enabled;
+        if ui
+            .checkbox(&mut enabled, "Show completion notifications")
+            .changed()
+        {
+            commands.push(AppCommand::SetNotificationsEnabled(enabled));
+        }
         ui.heading(if settings.destinations.is_empty() {
             "Connect to Vectr"
         } else {

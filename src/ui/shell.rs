@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
+    shown_since: std::collections::HashMap<crate::app::notifications::NoticeId, std::time::Instant>,
     client: DesktopClient,
     view: DesktopView,
     tray: Tray,
@@ -33,6 +34,7 @@ impl Shell {
             client,
             tray,
             pane: SettingsPane::default(),
+            shown_since: Default::default(),
             focus_revision: 0,
             current_window: None,
             focus_requested,
@@ -100,7 +102,8 @@ impl eframe::App for Shell {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut commands = vec![];
+        let mut commands =
+            super::completion_notification::draw(ui, &self.view, &mut self.shown_since);
         egui::Frame::central_panel(ui.style())
             .inner_margin(18.0)
             .show(ui, |ui| {
@@ -141,9 +144,10 @@ impl eframe::App for Shell {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match (self.view.window, &self.view.settings) {
-                            (Some(Window::Settings), Some(settings)) => {
-                                commands.extend(self.pane.draw(ui, settings))
-                            }
+                            (Some(Window::Settings), Some(settings)) => commands.extend(
+                                self.pane
+                                    .draw(ui, settings, self.view.notifications_enabled),
+                            ),
                             (Some(Window::Uploads), Some(_)) => {
                                 commands.extend(super::uploads::draw(ui, &self.view))
                             }

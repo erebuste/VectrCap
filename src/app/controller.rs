@@ -19,7 +19,10 @@ use crate::{
         history::{History, JobStatus, UploadJob},
         settings::{ServerOrigin, Settings},
     },
-    platform::CredentialStore,
+    platform::{
+        CredentialStore,
+        windows::{clipboard::ClipboardWriter, shell_actions::ShellActions},
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -63,6 +66,7 @@ impl DestinationReferences for References {
     }
 }
 /// One visible completion notice paired with its currently offered actions.
+#[derive(Clone)]
 pub struct NoticeDisplay {
     pub view: NoticeView,
     pub actions: Vec<RequestedCompletionAction>,
@@ -110,6 +114,8 @@ pub struct AppController {
     references: Arc<References>,
     workflows: HashMap<Uuid, DestinationSnapshot>,
     notifications: NotificationCenter,
+    shell: Arc<dyn ShellActions>,
+    clipboard: Arc<dyn ClipboardWriter>,
     pub lifecycle: Lifecycle,
     pub window: Option<Window>,
 }
@@ -119,6 +125,8 @@ impl AppController {
         history: Arc<History>,
         store: Arc<dyn CredentialStore>,
         artifacts: Arc<ArtifactStore>,
+        shell: Arc<dyn ShellActions>,
+        clipboard: Arc<dyn ClipboardWriter>,
     ) -> Result<Self, AppError> {
         let references = Arc::new(References::default());
         let manager = DestinationManager::open(
@@ -140,6 +148,8 @@ impl AppController {
             references,
             workflows: HashMap::new(),
             notifications: NotificationCenter::new(),
+            shell,
+            clipboard,
             lifecycle: Lifecycle::Running,
             window,
         })
@@ -190,9 +200,91 @@ impl AppController {
             .iter()
             .any(|known| known.eq_ignore_ascii_case(extension))
     }
+    /// Re-reads the job fresh from History and confirms its current state
+    /// still supports `action`, independent of whatever the notice snapshot
+    /// said when it was recorded.
+    fn resolve_for_action(
+        &self,
+        action: &RequestedCompletionAction,
+        id: crate::app::types::JobId,
+    ) -> Result<UploadJob, AppError> {
+        let job = self.history.job(id)?.ok_or(AppError::InvalidInput(
+            "completion action is no longer available",
+        ))?;
+        let ok = match action {
+            RequestedCompletionAction::OpenLocal(_) | RequestedCompletionAction::ShowFolder(_) => {
+                job.artifact.path.exists()
+            }
+            RequestedCompletionAction::OpenLink(_)
+            | RequestedCompletionAction::CopyLink(_)
+            | RequestedCompletionAction::CopyAgain(_) => {
+                matches!(job.status, JobStatus::Completed(_))
+            }
+            RequestedCompletionAction::OpenBatchSummary { .. }
+            | RequestedCompletionAction::CopySuccessfulLinks { .. } => true,
+        };
+        if !ok {
+            return Err(AppError::InvalidInput(
+                "completion action is no longer available",
+            ));
+        }
+        Ok(job)
+    }
+    fn execute_completion_action(
+        &mut self,
+        notice: crate::app::notifications::NoticeId,
+        action: RequestedCompletionAction,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        match &action {
+            RequestedCompletionAction::OpenLocal(id) => {
+                let job = self.resolve_for_action(&action, *id)?;
+                self.shell.open_path(&job.artifact.path)?;
+            }
+            RequestedCompletionAction::ShowFolder(id) => {
+                let job = self.resolve_for_action(&action, *id)?;
+                self.shell.reveal_path(&job.artifact.path)?;
+            }
+            RequestedCompletionAction::OpenLink(id) => {
+                let job = self.resolve_for_action(&action, *id)?;
+                let JobStatus::Completed(receipt) = &job.status else {
+                    return Err(AppError::InvalidInput(
+                        "completion action is no longer available",
+                    ));
+                };
+                self.shell.open_url(receipt.url())?;
+            }
+            RequestedCompletionAction::CopyLink(id) | RequestedCompletionAction::CopyAgain(id) => {
+                let job = self.resolve_for_action(&action, *id)?;
+                let JobStatus::Completed(receipt) = &job.status else {
+                    return Err(AppError::InvalidInput(
+                        "completion action is no longer available",
+                    ));
+                };
+                self.clipboard.write_text(receipt.url()).inspect_err(|_| {
+                    // The receipt itself is still valid; only the clipboard
+                    // write failed, so this must offer a retry, not vanish.
+                    let _ = self.notifications.note_copy_failed(notice, *id);
+                })?;
+            }
+            RequestedCompletionAction::OpenBatchSummary { .. } => {
+                return Ok(vec![AppEffect::Window(Some(Window::Uploads))]);
+            }
+            RequestedCompletionAction::CopySuccessfulLinks { jobs } => {
+                let mut links = Vec::new();
+                for id in jobs {
+                    let job = self.resolve_for_action(&action, *id)?;
+                    if let JobStatus::Completed(receipt) = &job.status {
+                        links.push(receipt.url().to_owned());
+                    }
+                }
+                self.clipboard.write_text(&links.join("\n"))?;
+            }
+        }
+        Ok(vec![])
+    }
     fn completion_for(&self, job: &UploadJob) -> Result<Option<CompletionNotice>, AppError> {
         let local_available = job.artifact.path.exists();
-        let safe_to_open = Self::is_safe_to_open(&job.artifact);
+        let safe_to_open = local_available && Self::is_safe_to_open(&job.artifact);
         let notice = match &job.status {
             JobStatus::Completed(receipt) => Some(CompletionNotice::Job(JobCompletion::try_new(
                 job.id,
@@ -368,6 +460,10 @@ impl AppController {
             AppCommand::SetNotificationsEnabled(enabled) => {
                 self.notifications.set_notifications_enabled(enabled);
                 vec![]
+            }
+            AppCommand::ExecuteCompletionAction { notice, action } => {
+                self.notifications.request(notice, &action)?;
+                self.execute_completion_action(notice, action)?
             }
             AppCommand::Quit => {
                 self.lifecycle = Lifecycle::Draining;

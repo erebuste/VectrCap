@@ -68,6 +68,10 @@ pub enum AppCommand {
     CancelConnectionTest,
     DismissNotice(crate::app::notifications::NoticeId),
     SetNotificationsEnabled(bool),
+    ExecuteCompletionAction {
+        notice: crate::app::notifications::NoticeId,
+        action: crate::app::notifications::RequestedCompletionAction,
+    },
     Quit,
 }
 #[derive(Debug, Clone, Copy)]

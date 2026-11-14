@@ -11,9 +11,31 @@ use vectrcap::{
         events::*,
     },
     persistence::{history::History, settings::ServerOrigin},
-    platform::CredentialStore,
+    platform::{
+        CredentialStore,
+        windows::{clipboard::ClipboardWriter, shell_actions::ShellActions},
+    },
     vectr::client::UploadToken,
 };
+
+struct NoopShell;
+impl ShellActions for NoopShell {
+    fn open_path(&self, _path: &std::path::Path) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn open_url(&self, _url: &str) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn reveal_path(&self, _path: &std::path::Path) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+struct NoopClipboard;
+impl ClipboardWriter for NoopClipboard {
+    fn write_text(&self, _text: &str) -> Result<(), AppError> {
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct Store(Mutex<HashMap<CredentialKey, String>>);
@@ -50,6 +72,8 @@ fn app() -> (tempfile::TempDir, AppController) {
         history,
         store,
         artifacts,
+        Arc::new(NoopShell),
+        Arc::new(NoopClipboard),
     )
     .unwrap();
     (dir, app)

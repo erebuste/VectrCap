@@ -19,6 +19,7 @@ use vectrcap::{
         history::{History, JobStatus},
         settings::ServerOrigin,
     },
+    platform::windows::{clipboard::ClipboardWriter, shell_actions::ShellActions},
     platform::{
         CredentialClientFactory, CredentialStore,
         windows::credentials::{CredentialBackend, CredentialRecord, WindowsCredentialStore},
@@ -94,12 +95,32 @@ type Store = WindowsCredentialStore<Backend>;
 fn token(s: &str) -> UploadToken {
     UploadToken::new(s.into()).unwrap()
 }
+struct NoopShell;
+impl ShellActions for NoopShell {
+    fn open_path(&self, _path: &std::path::Path) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn open_url(&self, _url: &str) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn reveal_path(&self, _path: &std::path::Path) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+struct NoopClipboard;
+impl ClipboardWriter for NoopClipboard {
+    fn write_text(&self, _text: &str) -> Result<(), AppError> {
+        Ok(())
+    }
+}
 fn controller(root: &std::path::Path, store: Arc<Store>) -> AppController {
     AppController::open(
         Box::new(FileDestinationRepository::open(&root.join("settings.json")).unwrap()),
         Arc::new(History::open(&root.join("history.db")).unwrap()),
         store,
         Arc::new(ArtifactStore::new(root.join("spool")).unwrap()),
+        Arc::new(NoopShell),
+        Arc::new(NoopClipboard),
     )
     .unwrap()
 }

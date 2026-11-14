@@ -38,6 +38,8 @@ pub struct DesktopView {
     pub saved: u64,
     pub save_result: Option<(uuid::Uuid, Result<(), AppError>)>,
     pub accepted_workflows: usize,
+    pub notices: Vec<super::controller::NoticeDisplay>,
+    pub notifications_enabled: bool,
     pub connection: Option<(
         uuid::Uuid,
         Result<crate::vectr::uploader_info::UploaderInfoSupport, AppError>,
@@ -58,6 +60,8 @@ impl Default for DesktopView {
             saved: 0,
             save_result: None,
             accepted_workflows: 0,
+            notices: vec![],
+            notifications_enabled: true,
             connection: None,
         }
     }
@@ -288,6 +292,8 @@ async fn serve(
         history.clone(),
         store,
         artifacts.clone(),
+        Arc::new(crate::platform::windows::shell_actions::WindowsShellActions),
+        Arc::new(crate::platform::windows::clipboard::WindowsClipboard),
     )?;
     let queue = QueueController::new(history.clone())?;
     let uploader = Arc::new(Uploader::new(history.clone(), artifacts, factory));
@@ -338,6 +344,8 @@ async fn serve(
             }
         };
         effects.state.accepted_workflows = controller.active_workflow_count();
+        effects.state.notices = controller.visible_notices();
+        effects.state.notifications_enabled = controller.notifications_enabled();
         if let Err(error) = effects.apply(results, &history).await {
             break Err(error);
         }
