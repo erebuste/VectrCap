@@ -174,6 +174,16 @@ impl eframe::App for Shell {
                     {
                         commands.push(AppCommand::Show(Window::Settings));
                     }
+                    if !self.view.batch_summary.is_empty()
+                        && ui
+                            .selectable_label(
+                                self.view.window == Some(Window::BatchSummary),
+                                "Batch summary",
+                            )
+                            .clicked()
+                    {
+                        commands.push(AppCommand::Show(Window::BatchSummary));
+                    }
                     if ui.button("Return to tray").clicked() {
                         commands.push(AppCommand::CloseWindow);
                     }
@@ -201,6 +211,9 @@ impl eframe::App for Shell {
                                 self.pane
                                     .draw(ui, settings, self.view.notifications_enabled),
                             ),
+                            (Some(Window::BatchSummary), Some(_)) => {
+                                super::batch_summary::draw(ui, &self.view);
+                            }
                             (Some(Window::Uploads), Some(_)) => {
                                 commands.extend(super::uploads::draw(ui, &self.view))
                             }

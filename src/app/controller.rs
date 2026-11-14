@@ -106,7 +106,14 @@ const EXECUTABLE_EXTENSIONS: &[&str] = &[
     "application",
     "hta",
 ];
+#[derive(Clone)]
+pub struct BatchSummaryRow {
+    pub id: super::types::JobId,
+    pub job: Option<UploadJob>,
+    pub local_available: bool,
+}
 pub struct AppController {
+    batch_jobs: Vec<super::types::JobId>,
     manager: DestinationManager,
     history: Arc<History>,
     store: Arc<dyn CredentialStore>,
@@ -149,6 +156,7 @@ impl AppController {
             artifacts,
             references,
             workflows: HashMap::new(),
+            batch_jobs: vec![],
             notifications,
             shell,
             clipboard,
@@ -158,6 +166,46 @@ impl AppController {
     }
     pub fn settings(&self) -> &Settings {
         self.manager.settings()
+    }
+    /// Resolve exactly the selected IDs, never the bounded queue snapshot.
+    pub fn batch_summary(&self) -> Result<Vec<BatchSummaryRow>, AppError> {
+        self.batch_jobs
+            .iter()
+            .map(|id| {
+                let job = self.history.job(*id)?;
+                let local_available = job.as_ref().is_some_and(|j| j.artifact.path.is_file());
+                Ok(BatchSummaryRow {
+                    id: *id,
+                    job,
+                    local_available,
+                })
+            })
+            .collect()
+    }
+    fn show_batch_summary(
+        &mut self,
+        jobs: Vec<super::types::JobId>,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        let mut seen = HashSet::new();
+        if jobs.is_empty()
+            || jobs.len() > super::notifications::MAX_BATCH_ITEMS
+            || jobs.iter().any(|id| id.0.is_nil() || !seen.insert(*id))
+        {
+            return Err(AppError::InvalidInput(
+                "batch selection must contain 1 to 100 distinct job IDs",
+            ));
+        }
+        // Validate reads before changing the active selection. Missing records
+        // retain their place and are explicitly rendered as unavailable.
+        for id in &jobs {
+            self.history.job(*id)?;
+        }
+        self.batch_jobs = jobs;
+        self.window = Some(Window::BatchSummary);
+        Ok(vec![
+            AppEffect::Window(self.window),
+            AppEffect::CancelConnectionTest,
+        ])
     }
     pub fn active_workflow_count(&self) -> usize {
         self.workflows.len()
@@ -268,8 +316,8 @@ impl AppController {
                     let _ = self.notifications.note_copy_failed(notice, *id);
                 })?;
             }
-            RequestedCompletionAction::OpenBatchSummary { .. } => {
-                return Ok(vec![AppEffect::Window(Some(Window::Uploads))]);
+            RequestedCompletionAction::OpenBatchSummary { jobs } => {
+                return self.show_batch_summary(jobs.clone());
             }
             RequestedCompletionAction::CopySuccessfulLinks { jobs } => {
                 let mut links = Vec::new();
@@ -341,6 +389,7 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::ShowBatchSummary(jobs) => self.show_batch_summary(jobs)?,
             AppCommand::Show(window) => {
                 self.window = Some(window);
                 let mut effects = vec![AppEffect::Window(self.window)];

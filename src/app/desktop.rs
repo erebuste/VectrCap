@@ -32,6 +32,7 @@ pub struct DesktopView {
     pub lifecycle: Lifecycle,
     pub exit_requested: bool,
     pub jobs: Vec<UploadJob>,
+    pub batch_summary: Vec<super::controller::BatchSummaryRow>,
     pub transfers: HashMap<crate::app::types::JobId, (u64, Option<f64>)>,
     pub queue_paused: bool,
     pub error: Option<AppError>,
@@ -54,6 +55,7 @@ impl Default for DesktopView {
             lifecycle: Lifecycle::Running,
             exit_requested: false,
             jobs: vec![],
+            batch_summary: vec![],
             transfers: HashMap::new(),
             queue_paused: false,
             error: None,
@@ -345,6 +347,10 @@ async fn serve(
             }
         };
         effects.state.accepted_workflows = controller.active_workflow_count();
+        effects.state.batch_summary = match controller.batch_summary() {
+            Ok(rows) => rows,
+            Err(error) => break Err(error),
+        };
         effects.state.notices = controller.visible_notices();
         effects.state.notifications_enabled = controller.notifications_enabled();
         if let Err(error) = effects.apply(results, &history).await {

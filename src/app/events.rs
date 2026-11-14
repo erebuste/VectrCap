@@ -20,6 +20,7 @@ use uuid::Uuid;
 pub enum Window {
     Settings,
     Uploads,
+    BatchSummary,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
@@ -31,6 +32,7 @@ pub enum Lifecycle {
 pub enum AppCommand {
     Show(Window),
     CloseWindow,
+    ShowBatchSummary(Vec<crate::app::types::JobId>),
     ApplyDestinations {
         edit: DestinationEdit,
         revision: u64,

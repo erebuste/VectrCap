@@ -575,3 +575,134 @@ fn preference_update_rejects_external_edits_and_repeated_value_preserves_revisio
         external
     );
 }
+
+#[test]
+fn batch_summary_preserves_exact_order_and_resolves_current_history() {
+    use vectrcap::app::types::JobId;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let first = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "first.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let second = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "second.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let missing = JobId(uuid::Uuid::new_v4());
+    let effects = app.dispatch(AppCommand::ShowBatchSummary(vec![second, missing, first]));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::BatchSummary))))
+    );
+    assert_eq!(app.window, Some(Window::BatchSummary));
+    let rows = app.batch_summary().unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![second, missing, first]
+    );
+    assert!(rows[1].job.is_none());
+    assert!(rows[0].local_available);
+    std::fs::remove_file(&rows[0].job.as_ref().unwrap().artifact.path).unwrap();
+    let refreshed = app.batch_summary().unwrap();
+    assert!(!refreshed[0].local_available);
+    assert!(refreshed[0].job.is_some());
+    app.dispatch(AppCommand::Show(Window::Uploads));
+    app.dispatch(AppCommand::Show(Window::BatchSummary));
+    assert_eq!(
+        app.batch_summary()
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec![second, missing, first]
+    );
+}
+
+#[test]
+fn invalid_batch_selection_does_not_replace_the_previous_summary() {
+    use vectrcap::app::types::JobId;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, ..) = open(dir.path());
+    let id = JobId(uuid::Uuid::new_v4());
+    app.dispatch(AppCommand::ShowBatchSummary(vec![id]));
+    for invalid in [
+        vec![],
+        vec![id, id],
+        vec![JobId(uuid::Uuid::nil())],
+        (0..101).map(|_| JobId(uuid::Uuid::new_v4())).collect(),
+    ] {
+        let effects = app.dispatch(AppCommand::ShowBatchSummary(invalid));
+        assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        assert_eq!(app.batch_summary().unwrap()[0].id, id);
+    }
+}
+
+#[test]
+fn a_notice_cannot_navigate_to_jobs_it_does_not_authorize() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let id = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "single.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let notice = app.visible_notices()[0].view.id();
+    let effects = app.dispatch(AppCommand::ExecuteCompletionAction {
+        notice,
+        action: RequestedCompletionAction::OpenBatchSummary { jobs: vec![id] },
+    });
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert!(app.batch_summary().unwrap().is_empty());
+}
+
+#[test]
+fn batch_navigation_can_resolve_a_job_outside_the_queue_snapshot() {
+    use vectrcap::app::types::UploadReceipt;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, _) = open(dir.path());
+    seed(&mut app);
+    let selected = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "selected.txt",
+        ArtifactKind::File,
+        Ok(UploadReceipt::new("https://links.example/selected", "selected.txt").unwrap()),
+    );
+    for i in 0..101 {
+        accept_and_settle(
+            &mut app,
+            &history,
+            &artifacts,
+            &format!("other-{i}.txt"),
+            ArtifactKind::File,
+            Err(AppError::Network),
+        );
+    }
+    assert!(
+        !history
+            .shell_jobs()
+            .unwrap()
+            .iter()
+            .any(|j| j.id == selected)
+    );
+    app.dispatch(AppCommand::ShowBatchSummary(vec![selected]));
+    let rows = app.batch_summary().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].job.as_ref().unwrap().id, selected);
+}
