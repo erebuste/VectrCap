@@ -73,6 +73,9 @@ CREATE TABLE archive_entries (
     removed_ms INTEGER
 ) STRICT;
 CREATE UNIQUE INDEX archive_live_path ON archive_entries(path) WHERE removed_ms IS NULL;
+-- Release passes page live automatic entries per root in (created_ms, id) order.
+CREATE INDEX archive_live_auto ON archive_entries(root, created_ms, id)
+    WHERE removed_ms IS NULL AND origin = 'automatic';
 
 CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value INTEGER NOT NULL) STRICT;
 INSERT INTO meta (key, value) VALUES ('queue_paused', 0);
@@ -465,70 +468,97 @@ impl History {
         Ok(())
     }
 
-    /// Live archive entries created at or before `created_before_ms`, with
-    /// whether their artifact has unfinished or completed jobs.
-    // ponytail: loads all matching rows; page by created_ms if archives reach ~10^5 entries.
-    pub(crate) fn archive_candidates(
+    /// One bounded page of live automatic entries under `root` that `rule`
+    /// currently nominates, after the `(created_ms, id)` keyset `after`.
+    pub(crate) fn archive_page(
         &self,
-        created_before_ms: i64,
+        root: &str,
+        rule: ReleaseRule,
+        after: Option<(i64, ArchiveEntryId)>,
+        limit: usize,
     ) -> Result<Vec<ArchiveCandidate>, AppError> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT e.id, e.artifact_id, e.root, e.path, e.origin, e.size, e.sha256, e.created_ms, \
-             EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id AND j.{UNFINISHED}), \
-             EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id AND j.status = 'completed') \
-             FROM archive_entries e WHERE e.removed_ms IS NULL AND e.created_ms <= ?1 ORDER BY e.created_ms, e.id"
-        ))?;
-        let rows = stmt
-            .query_map(params![created_before_ms], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, Vec<u8>>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, bool>(8)?,
-                    r.get::<_, bool>(9)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let (after_ms, after_id) =
+            after.map_or((i64::MIN, String::new()), |(ms, id)| (ms, id.0.to_string()));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = {
+            let conn = self.lock()?;
+            let mut stmt = conn.prepare_cached(ARCHIVE_PAGE_SQL)?;
+            stmt.query_map(
+                params![
+                    root,
+                    rule.created_at_or_before_ms,
+                    rule.require_uploaded,
+                    after_ms,
+                    after_id,
+                    limit
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Vec<u8>>(5)?,
+                        r.get::<_, i64>(6)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        };
         rows.into_iter()
-            .map(
-                |(id, artifact, root, path, origin, size, sha, created, active, uploaded)| {
-                    let origin = match origin.as_str() {
-                        "automatic" => ArchiveOrigin::Automatic,
-                        "manual" => ArchiveOrigin::Manual,
-                        _ => return Err(corrupt()),
-                    };
-                    let entry = ArchiveEntry {
+            .map(|(id, artifact, root, path, size, sha, created)| {
+                Ok(ArchiveCandidate {
+                    created_ms: created,
+                    entry: ArchiveEntry {
                         id: ArchiveEntryId(parse_uuid(&id)?),
                         artifact_id: ArtifactId(parse_uuid(&artifact)?),
                         root: PathBuf::from(root),
                         path: PathBuf::from(path),
-                        origin,
+                        origin: ArchiveOrigin::Automatic,
                         created_at: local_from_ms(created)?,
                         size: u64::try_from(size).map_err(|_| corrupt())?,
                         sha256: sha.try_into().map_err(|_| corrupt())?,
-                    };
-                    Ok(ArchiveCandidate {
-                        entry,
-                        active,
-                        uploaded,
-                    })
-                },
-            )
+                    },
+                })
+            })
             .collect()
     }
 
-    pub(crate) fn mark_archive_removed(&self, id: ArchiveEntryId) -> Result<(), AppError> {
-        self.lock()?.execute(
-            "UPDATE archive_entries SET removed_ms = ?2 WHERE id = ?1 AND removed_ms IS NULL",
+    /// Destructive commit for one archive entry. Under the database write
+    /// lock it rechecks that the entry is still live, automatic, unreferenced
+    /// by any unfinished job (and uploaded, if required); only then runs
+    /// `delete` and records the removal in the same transaction. A job created
+    /// concurrently is ordered either before (entry kept, `Ok(false)`) or after
+    /// the commit. `delete` must act on an already-validated file handle.
+    pub(crate) fn commit_archive_removal(
+        &self,
+        id: ArchiveEntryId,
+        require_uploaded: bool,
+        delete: impl FnOnce() -> Result<(), AppError>,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM archive_entries e \
+             WHERE e.id = ?1 AND e.removed_ms IS NULL AND e.origin = 'automatic' \
+             AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
+                 AND j.status NOT IN ('completed', 'cancelled')) \
+             AND (?2 = 0 OR EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
+                 AND j.status = 'completed')))",
+            params![id.0.to_string(), require_uploaded],
+            |r| r.get(0),
+        )?;
+        if !eligible {
+            return Ok(false);
+        }
+        delete()?;
+        tx.execute(
+            "UPDATE archive_entries SET removed_ms = ?2 WHERE id = ?1",
             params![id.0.to_string(), now_ms()],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(true)
     }
 
     fn uuid_set(&self, sql: &str) -> Result<HashSet<Uuid>, AppError> {
@@ -547,12 +577,31 @@ impl History {
     }
 }
 
+/// Which live automatic entries a release pass may consider.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReleaseRule {
+    pub created_at_or_before_ms: i64,
+    /// Only entries whose artifact has a confirmed upload.
+    pub require_uploaded: bool,
+}
+
+/// Params: ?1 root, ?2 created_ms cutoff, ?3 require uploaded, ?4/?5 keyset
+/// after `(created_ms, id)`, ?6 limit. Served by `archive_live_auto` in
+/// `(root, created_ms, id)` order, so no sort or full scan is needed.
+pub(crate) const ARCHIVE_PAGE_SQL: &str = "SELECT e.id, e.artifact_id, e.root, e.path, e.size, e.sha256, e.created_ms \
+     FROM archive_entries e \
+     WHERE e.removed_ms IS NULL AND e.origin = 'automatic' AND e.root = ?1 AND e.created_ms <= ?2 \
+     AND (e.created_ms, e.id) > (?4, ?5) \
+     AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
+         AND j.status NOT IN ('completed', 'cancelled')) \
+     AND (?3 = 0 OR EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
+         AND j.status = 'completed')) \
+     ORDER BY e.created_ms, e.id LIMIT ?6";
+
+/// A live automatic entry nominated by a page query (not yet authorized).
 pub(crate) struct ArchiveCandidate {
+    pub created_ms: i64,
     pub entry: ArchiveEntry,
-    /// The artifact has an unfinished job that may still need its files.
-    pub active: bool,
-    /// The artifact has at least one confirmed upload.
-    pub uploaded: bool,
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), AppError> {
@@ -755,5 +804,114 @@ impl RawJob {
             paused: self.paused,
             attempt: u32::try_from(self.attempt).map_err(|_| corrupt())?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Raw rows: artifact + archive entry (+ optional job) in the test database.
+    struct Rows {
+        conn: Connection,
+        n: u32,
+    }
+
+    impl Rows {
+        fn entry(&mut self, root: &str, origin: &str, created_ms: i64) -> String {
+            self.n += 1;
+            let artifact = Uuid::new_v4().to_string();
+            let id = Uuid::new_v4().to_string();
+            self.conn
+                .execute(
+                    "INSERT INTO artifacts (id, path, display_name, kind, size, sha256, created_ms) \
+                     VALUES (?1, ?2, 'x.png', 'screenshot', 1, zeroblob(32), 0)",
+                    params![artifact, format!(r"C:\spool\{}", self.n)],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "INSERT INTO archive_entries (id, artifact_id, root, path, origin, size, sha256, created_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, zeroblob(32), ?6)",
+                    params![id, artifact, root, format!(r"{root}\2026-11\{}.png", self.n), origin, created_ms],
+                )
+                .unwrap();
+            id
+        }
+
+        fn job(&self, entry: &str, status: &str) {
+            self.conn
+                .execute(
+                    "INSERT INTO jobs (id, artifact_id, dest_id, dest_label, dest_origin, \
+                     dest_credential_generation, status, created_ms, updated_ms) \
+                     SELECT ?1, artifact_id, ?2, 'Phone', 'https://vectr.example', 1, ?3, 0, 0 \
+                     FROM archive_entries WHERE id = ?4",
+                    params![Uuid::new_v4().to_string(), Uuid::new_v4().to_string(), status, entry],
+                )
+                .unwrap();
+        }
+    }
+
+    fn all_pages(h: &History, rule: ReleaseRule, limit: usize) -> Vec<(i64, String)> {
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = h.archive_page(r"C:\R", rule, after, limit).unwrap();
+            assert!(page.len() <= limit, "page of {} exceeds limit {limit}", page.len());
+            let Some(last) = page.last() else { break };
+            after = Some((last.created_ms, last.entry.id));
+            seen.extend(page.iter().map(|c| (c.created_ms, c.entry.id.0.to_string())));
+        }
+        seen
+    }
+
+    #[test]
+    fn archive_pages_are_bounded_filtered_and_tie_stable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("history.sqlite3");
+        let history = History::open(&db).unwrap();
+        let mut rows = Rows { conn: Connection::open(&db).unwrap(), n: 0 };
+
+        let mut eligible: Vec<(i64, String)> = [10, 10, 10, 20, 20, 30, 40]
+            .into_iter()
+            .map(|ms| (ms, rows.entry(r"C:\R", "automatic", ms)))
+            .collect();
+        eligible.sort();
+        rows.entry(r"C:\R", "manual", 5);
+        rows.entry(r"C:\S", "automatic", 5);
+        rows.entry(r"C:\R", "automatic", 50); // newer than the cutoff
+        let removed = rows.entry(r"C:\R", "automatic", 5);
+        rows.conn
+            .execute("UPDATE archive_entries SET removed_ms = 1 WHERE id = ?1", params![removed])
+            .unwrap();
+        let active = rows.entry(r"C:\R", "automatic", 5);
+        rows.job(&active, "failed");
+
+        let age = ReleaseRule { created_at_or_before_ms: 45, require_uploaded: false };
+        for limit in [1, 2, 3, 64] {
+            assert_eq!(all_pages(&history, age, limit), eligible, "limit {limit}");
+        }
+
+        // Upload reconciliation additionally needs a confirmed upload.
+        rows.job(&eligible[1].1, "completed");
+        rows.job(&eligible[4].1, "completed");
+        let uploaded = ReleaseRule { created_at_or_before_ms: i64::MAX, require_uploaded: true };
+        assert_eq!(
+            all_pages(&history, uploaded, 1),
+            vec![eligible[1].clone(), eligible[4].clone()]
+        );
+
+        // The scan is served by the partial live/automatic index, not a table scan + sort.
+        let plan: Vec<String> = rows
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {ARCHIVE_PAGE_SQL}"))
+            .unwrap()
+            .query_map(params![r"C:\R", 45, false, i64::MIN, "", 2], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("archive_live_auto"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 }

@@ -192,12 +192,6 @@ pub(crate) fn open_no_follow(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
-pub(crate) fn mark_readonly(path: &Path) -> io::Result<()> {
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_readonly(true);
-    fs::set_permissions(path, perms)
-}
-
 /// Removes a file the app created, clearing the read-only attribute it may carry.
 pub(crate) fn remove_owned_file(path: &Path) -> io::Result<()> {
     let mut perms = fs::symlink_metadata(path)?.permissions();

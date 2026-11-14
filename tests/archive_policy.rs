@@ -358,7 +358,8 @@ fn cleanup_skips_active_manual_and_modified_files() {
         .cleanup(&policy, Local::now() + Duration::days(31))
         .unwrap();
     assert_eq!(report.removed, 2);
-    assert_eq!(report.kept_active, 1);
+    // Active and manual entries are filtered by the query, never examined.
+    assert_eq!(report.kept_active, 0);
     assert_eq!(report.kept_modified, 1);
     assert_eq!(report.kept_missing, 1);
     assert!(!e_idle.path.exists() && !e_local.path.exists());
@@ -417,5 +418,8 @@ fn changing_archive_root_never_moves_or_deletes_existing_files() {
     );
     assert!(!fresh.path.exists());
     assert_eq!(report.removed, 1);
-    assert_eq!(report.kept_other_root, 1);
+    assert_eq!(
+        report.kept_other_root, 0,
+        "entries of other roots are never fetched"
+    );
 }
