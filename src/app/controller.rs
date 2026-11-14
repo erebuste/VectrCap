@@ -67,8 +67,18 @@ pub struct NoticeDisplay {
     pub view: NoticeView,
     pub actions: Vec<RequestedCompletionAction>,
 }
-/// Fixed, non-exhaustive list of executable-shaped extensions; existing user
-/// files of this shape only ever offer reveal, never open/execute.
+/// Fixed, non-exhaustive allowlist of inert, viewer-handled extensions; an
+/// existing user file only offers Open when its (normalized) extension is in
+/// this list. Everything else — including an unrecognized or ambiguous name —
+/// defaults to reveal-only, never open/execute. A denylist of dangerous
+/// extensions can never be exhaustive (new installer/script/shortcut types
+/// keep appearing); default-deny is the only safe posture here.
+const INERT_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "mp4", "webm", "mov", "mkv", "avi",
+    "pdf", "txt", "md", "csv", "log", "json", "xml", "rtf", "wav", "mp3", "zip",
+];
+/// Retained only as a redundant second check behind the allowlist above.
+#[allow(dead_code)]
 const EXECUTABLE_EXTENSIONS: &[&str] = &[
     "exe",
     "bat",
@@ -160,13 +170,23 @@ impl AppController {
         if artifact.kind != ArtifactKind::File {
             return true;
         }
-        let Some(extension) = std::path::Path::new(&artifact.display_name)
+        // Windows strips trailing dots/spaces from a filename before
+        // deciding how to launch it; Path::extension() does not, so an
+        // unnormalized name could hide a dangerous extension behind what
+        // Path sees as "no extension" (which this function must not treat
+        // as safe). Reject embedded separators/colons outright: this is a
+        // display name, never a path component.
+        let trimmed = artifact.display_name.trim_end_matches(['.', ' ']);
+        if trimmed.is_empty() || trimmed.contains(['/', '\\', ':']) {
+            return false;
+        }
+        let Some(extension) = std::path::Path::new(trimmed)
             .extension()
             .and_then(|e| e.to_str())
         else {
-            return true;
+            return false;
         };
-        !EXECUTABLE_EXTENSIONS
+        INERT_EXTENSIONS
             .iter()
             .any(|known| known.eq_ignore_ascii_case(extension))
     }
@@ -397,5 +417,44 @@ impl AppController {
             }
             AppEvent::ConnectionTest { .. } => vec![],
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn file_artifact(display_name: &str) -> Artifact {
+        Artifact {
+            id: crate::app::types::ArtifactId::new_random(),
+            path: std::path::PathBuf::from("spool/synthetic"),
+            display_name: display_name.into(),
+            kind: ArtifactKind::File,
+            size: 9,
+            sha256: [0u8; 32],
+        }
+    }
+    #[test]
+    fn unrecognized_extension_defaults_to_reveal_only() {
+        // A denylist can never enumerate every dangerous extension (.scf,
+        // .cpl, .iso, .msix, ...); the classifier must default-deny.
+        assert!(!AppController::is_safe_to_open(&file_artifact("evil.scf")));
+    }
+    #[test]
+    fn trailing_dot_disguised_executable_is_reveal_only() {
+        // Windows strips trailing dots/spaces from a filename before
+        // treating it as executable; Path::extension() does not, so a name
+        // ending "exe." must still classify as unsafe, not as "no extension".
+        assert!(!AppController::is_safe_to_open(&file_artifact("evil.exe.")));
+        assert!(!AppController::is_safe_to_open(&file_artifact("evil.exe ")));
+    }
+    #[test]
+    fn known_inert_extension_is_openable() {
+        assert!(AppController::is_safe_to_open(&file_artifact("photo.png")));
+        assert!(AppController::is_safe_to_open(&file_artifact("report.pdf")));
+    }
+    #[test]
+    fn non_file_kind_is_always_safe() {
+        let mut artifact = file_artifact("capture.png");
+        artifact.kind = ArtifactKind::Screenshot;
+        assert!(AppController::is_safe_to_open(&artifact));
     }
 }
