@@ -28,6 +28,19 @@ pub enum AppError {
     Encoder(&'static str),
     #[error("HTTP error: {0}")]
     Http(&'static str),
+    #[error("network transport failed")]
+    Network,
+    #[error("TLS verification or negotiation failed")]
+    Tls,
+    #[error("invalid server protocol: {0}")]
+    Protocol(&'static str),
+    #[error("server returned HTTP {code}")]
+    HttpStatus {
+        code: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+    #[error("upload paused")]
+    Paused,
     /// The remote outcome is unknown; it must be resolved, never blindly retried.
     #[error("result uncertain: {0}")]
     Uncertain(&'static str),

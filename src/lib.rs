@@ -10,3 +10,4 @@ compile_error!("VectrCap targets Windows only");
 pub mod app;
 pub mod capture;
 pub mod persistence;
+pub mod vectr;

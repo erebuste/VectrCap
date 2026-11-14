@@ -7,8 +7,7 @@ description = "Windows tray capture and Vectr upload utility"
 license = "UNLICENSED"
 publish = false
 
-# Task 1 dependencies only. GUI, tray, capture, media, and network crates are
-# added by the tasks that use them (see docs/verification/foundation-report.md).
+# Foundation and Task 2 only; GUI, tray, capture and media belong to later tasks.
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dirs = "7.0.0"
@@ -20,6 +19,20 @@ tempfile = "3.27.0"
 thiserror = "2.0.21"
 url = "2.5.8"
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
+bytes = "1.11"
+httpdate = "1.0.3"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+rand = "0.10"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "multipart", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tokio = { version = "1.54.1", features = ["net", "io-util", "test-util", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 # Already in the tree via dirs/tempfile. Handle-based file operations: directory-relative
 # NtCreateFile opens, rename/delete/identity by handle, final-path checks, free space.

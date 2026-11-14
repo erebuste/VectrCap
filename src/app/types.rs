@@ -104,7 +104,8 @@ impl fmt::Debug for UploadReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UploadReceipt")
             .field("url", &"<redacted>")
-            .field("name", &self.name)
+            // A malicious server can echo credentials/links in its name field.
+            .field("name", &"<redacted>")
             .finish()
     }
 }

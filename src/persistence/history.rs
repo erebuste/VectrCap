@@ -15,7 +15,17 @@ use crate::persistence::settings::{LinkOrigin, ServerOrigin};
 use crate::persistence::winfs::FileIdentity;
 use crate::persistence::{PARTIAL_PREFIX, local_from_ms, now_ms};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+const SCHEMA_V2: &str = r"
+CREATE TABLE upload_retry (
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    operation TEXT NOT NULL,
+    failures INTEGER NOT NULL CHECK (failures BETWEEN 0 AND 5),
+    not_before_ms INTEGER NOT NULL CHECK (not_before_ms >= 0),
+    PRIMARY KEY (job_id,operation)
+) STRICT;
+";
 
 /// Schema v1. Pause intents and favorites start false; runtime state lives here,
 /// never in exported settings.
@@ -177,6 +187,106 @@ pub struct History {
 }
 
 impl History {
+    /// A safe operation's retry budget and deadline survive pause and restart.
+    pub fn upload_retry(&self, id: JobId, operation: &str) -> Result<Option<(u32, i64)>, AppError> {
+        Ok(self
+            .lock()?
+            .query_row(
+                "SELECT failures, not_before_ms FROM upload_retry WHERE job_id=?1 AND operation=?2",
+                params![id.0.to_string(), operation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+    pub fn set_upload_retry(
+        &self,
+        id: JobId,
+        operation: &str,
+        failures: u32,
+        not_before_ms: i64,
+    ) -> Result<(), AppError> {
+        validate_failure_code(operation)?;
+        if !(1..=5).contains(&failures) || not_before_ms < 0 {
+            return Err(AppError::InvalidInput("invalid upload retry state"));
+        }
+        if operation != "create"
+            && operation != "empty"
+            && operation != "status"
+            && operation != "complete"
+            && !operation
+                .strip_prefix("piece.")
+                .is_some_and(|s| s.parse::<u32>().is_ok_and(|n| n < 100_000))
+        {
+            return Err(AppError::InvalidInput("invalid retry operation"));
+        }
+        self.lock()?.execute("INSERT INTO upload_retry(job_id,operation,failures,not_before_ms) VALUES (?1,?2,?3,?4) ON CONFLICT(job_id,operation) DO UPDATE SET failures=excluded.failures, not_before_ms=excluded.not_before_ms",params![id.0.to_string(),operation,failures,not_before_ms])?;
+        Ok(())
+    }
+    pub fn clear_operation_retry(&self, id: JobId, operation: &str) -> Result<(), AppError> {
+        self.lock()?.execute(
+            "DELETE FROM upload_retry WHERE job_id=?1 AND operation=?2",
+            params![id.0.to_string(), operation],
+        )?;
+        Ok(())
+    }
+    /// Explicit Retry resets the attempt budget while retaining server cooldowns.
+    pub fn reset_upload_retry(&self, id: JobId) -> Result<(), AppError> {
+        self.lock()?.execute(
+            "UPDATE upload_retry SET failures=0 WHERE job_id=?1",
+            params![id.0.to_string()],
+        )?;
+        Ok(())
+    }
+    pub fn upload_retry_deadline(&self, id: JobId) -> Result<Option<i64>, AppError> {
+        Ok(self.lock()?.query_row(
+            "SELECT max(not_before_ms) FROM upload_retry WHERE job_id=?1",
+            params![id.0.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn clear_upload_retry(&self, id: JobId) -> Result<(), AppError> {
+        self.lock()?.execute(
+            "DELETE FROM upload_retry WHERE job_id=?1",
+            params![id.0.to_string()],
+        )?;
+        Ok(())
+    }
+    /// Explicit restart creates a fresh sessionless job with the same source
+    /// and destination. Replacement publication and retirement are atomic.
+    pub fn restart_upload(&self, id: JobId) -> Result<UploadJob, AppError> {
+        let new_id = JobId::new_random();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let old = tx
+            .query_row(
+                &format!("{JOB_SELECT} WHERE j.id=?1"),
+                params![id.0.to_string()],
+                RawJob::read,
+            )
+            .optional()?
+            .ok_or(AppError::InvalidInput("unknown upload job"))?
+            .into_job()?;
+        if !matches!(
+            old.status,
+            JobStatus::Failed { .. }
+                | JobStatus::Uncertain
+                | JobStatus::Interrupted
+                | JobStatus::Cancelled
+        ) {
+            return Err(AppError::InvalidInput(
+                "upload cannot be restarted in this state",
+            ));
+        }
+        tx.execute("INSERT INTO jobs(id,artifact_id,dest_id,dest_label,dest_origin,dest_credential_generation,dest_link_domain,status,paused,created_ms,updated_ms) SELECT ?2,artifact_id,dest_id,dest_label,dest_origin,dest_credential_generation,dest_link_domain,'pending',paused,?3,?3 FROM jobs WHERE id=?1",params![id.0.to_string(),new_id.0.to_string(),now_ms()])?;
+        tx.execute(
+            "UPDATE jobs SET status='cancelled',updated_ms=?2 WHERE id=?1",
+            params![id.0.to_string(), now_ms()],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.job(new_id)?
+            .ok_or(AppError::Persistence("replacement upload disappeared"))
+    }
     pub fn open(path: &Path) -> Result<History, AppError> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             fs::create_dir_all(dir).map_err(|e| AppError::io("creating the history folder", &e))?;
@@ -844,6 +954,13 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
     match version {
         0 => {
             tx.execute_batch(SCHEMA_V1)?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            Ok(())
+        }
+        1 => {
+            tx.execute_batch(SCHEMA_V2)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())

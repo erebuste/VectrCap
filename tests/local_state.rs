@@ -638,7 +638,7 @@ fn pause_and_favorite_intents_default_false_and_persist() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     let favorite: i64 = conn
         .query_row("SELECT favorite FROM history_items", [], |r| r.get(0))
         .unwrap();
