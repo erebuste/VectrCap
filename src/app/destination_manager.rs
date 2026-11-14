@@ -325,7 +325,10 @@ impl DestinationManager {
             journal.register(&key);
             staged.push((key, token));
         }
-        candidate.validate()?;
+        // Preflight the same bounded bytes used by Settings::save before any
+        // durable generation reservation or secret write. Runtime I/O failures
+        // still use the existing rollback path.
+        candidate.encode_persistence()?;
         journal.validate()?;
         self.repository.save_journal(&journal)?;
         self.journal = journal;

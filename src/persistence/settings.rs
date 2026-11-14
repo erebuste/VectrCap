@@ -304,18 +304,33 @@ impl Settings {
 
     /// Validates, then atomically replaces the file; a failed save keeps the old one.
     pub fn save(&self, path: &Path) -> Result<(), AppError> {
+        let bytes = self.encode_persistence()?;
+        save_encoded_json(&bytes, path)
+    }
+
+    /// The exact bounded representation used by save, without filesystem effects.
+    pub(crate) fn encode_persistence(&self) -> Result<Vec<u8>, AppError> {
         self.validate()?;
-        save_json(self, path)
+        encode_json(self)
     }
 }
 
 pub(crate) fn save_json(value: &impl Serialize, path: &Path) -> Result<(), AppError> {
-    const STAGE: &str = "saving local settings";
+    let bytes = encode_json(value)?;
+    save_encoded_json(&bytes, path)
+}
+
+fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, AppError> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|_| AppError::Persistence("local settings could not be encoded"))?;
     if bytes.len() as u64 > MAX_SETTINGS_BYTES {
         return Err(AppError::Persistence("local settings exceed capacity"));
     }
+    Ok(bytes)
+}
+
+fn save_encoded_json(bytes: &[u8], path: &Path) -> Result<(), AppError> {
+    const STAGE: &str = "saving local settings";
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -325,7 +340,7 @@ pub(crate) fn save_json(value: &impl Serialize, path: &Path) -> Result<(), AppEr
         .prefix(PARTIAL_PREFIX)
         .tempfile_in(dir)
         .map_err(|e| AppError::io(STAGE, &e))?;
-    tmp.write_all(&bytes).map_err(|e| AppError::io(STAGE, &e))?;
+    tmp.write_all(bytes).map_err(|e| AppError::io(STAGE, &e))?;
     tmp.flush().map_err(|e| AppError::io(STAGE, &e))?;
     tmp.as_file()
         .sync_all()

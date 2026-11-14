@@ -22,6 +22,7 @@ struct Memory {
     fail_write: Mutex<bool>,
     fail_delete: Mutex<bool>,
     reads: AtomicUsize,
+    writes: AtomicUsize,
     fail_read: AtomicBool,
 }
 struct Backend(Arc<Memory>);
@@ -53,6 +54,7 @@ impl CredentialBackend for Backend {
             }))
     }
     fn write(&self, r: &CredentialRecord) -> Result<(), AppError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         if *self.fail_write.lock().unwrap() {
             return Err(AppError::Credential("store unavailable"));
         }
@@ -795,6 +797,78 @@ fn every_native_metadata_field_is_checked_before_read_or_delete() {
         assert_eq!(backend.entries.lock().unwrap().len(), 1);
     }
 }
+#[test]
+fn oversized_candidate_settings_never_stage_credentials_or_reserve_generations() {
+    let f = Management::new();
+    let mut m = f.manager();
+    let existing = f.add(&mut m, "existing");
+    let mut near_limit = m.settings().clone();
+    drop(m);
+    near_limit.archive.archive_root = Some(std::path::PathBuf::from("C:\\"));
+    let base_size = serde_json::to_vec_pretty(&near_limit).unwrap().len();
+    let padding = 1024 * 1024 - 32 - base_size;
+    near_limit.archive.archive_root = Some(std::path::PathBuf::from(format!(
+        "C:\\{}",
+        "a".repeat(padding)
+    )));
+    let path = f.dir.path().join("settings.json");
+    near_limit.save(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 1024 * 1024 - 32);
+    let before_bytes = std::fs::read(&path).unwrap();
+    let journal_path = f.dir.path().join("settings.json.credential-journal.json");
+    let before_journal = std::fs::read(&journal_path).unwrap();
+    let before_writes = f.backend.writes.load(Ordering::SeqCst);
+    let mut m = f.manager();
+    let before = m.settings().clone();
+    let existing_key = before
+        .destinations
+        .get(existing)
+        .unwrap()
+        .credential_ref
+        .clone()
+        .unwrap();
+    let mut destinations = before.destinations.clone();
+    let id = destinations
+        .add(
+            "new destination",
+            ServerOrigin::parse("https://vectr.example").unwrap(),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        m.apply(
+            DestinationEdit {
+                destinations,
+                tokens: vec![(id, token("synthetic-never-staged"))],
+            },
+            before.revision
+        ),
+        Err(AppError::Persistence(_))
+    ));
+    assert_eq!(
+        f.backend.writes.load(Ordering::SeqCst),
+        before_writes,
+        "oversized settings must fail before any secret write"
+    );
+    assert_eq!(m.settings(), &before);
+    assert_eq!(std::fs::read(path).unwrap(), before_bytes);
+    assert_eq!(std::fs::read(journal_path).unwrap(), before_journal);
+    assert_eq!(f.backend.entries.lock().unwrap().len(), 1);
+    assert!(f.store.read(&existing_key).is_ok());
+    assert_eq!(
+        f.backend
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .blob
+            .as_slice(),
+        b"synthetic-initial"
+    );
+}
+
 #[test]
 fn staging_capacity_and_journal_failure_happen_before_any_secret_write() {
     let f = Management::new();
