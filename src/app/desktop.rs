@@ -179,7 +179,16 @@ type ConnectionTask = tokio::task::JoinHandle<(
     uuid::Uuid,
     Result<crate::vectr::uploader_info::UploaderInfoSupport, AppError>,
 )>;
-type StagingTask = (uuid::Uuid, String, Result<Artifact, AppError>);
+/// `index` is the file's position in its original picker selection.
+type StagingTask = (uuid::Uuid, usize, String, Result<Artifact, AppError>);
+/// How many `stage_file_cancellable` calls (and therefore open source-file
+/// handles) may be in flight at once, regardless of how many files were
+/// accepted across however many concurrent batches.
+const MAX_CONCURRENT_STAGING: usize = 4;
+/// How many staging requests may sit admitted-but-not-yet-running at once.
+/// Beyond this, a newly accepted file is bounced with an explicit busy
+/// outcome instead of growing the backlog without limit.
+const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
     queue: Option<mpsc::Sender<QueueCommand>>,
     metadata: Option<ConnectionTask>,
@@ -188,6 +197,11 @@ struct Effects {
     local_cancel: CancellationToken,
     artifacts: Arc<ArtifactStore>,
     staging: tokio::task::JoinSet<StagingTask>,
+    staging_limit: Arc<tokio::sync::Semaphore>,
+    /// Batch/index/display-name for each outstanding `staging` task, so a
+    /// panicked or aborted task can still resolve its exact batch slot
+    /// instead of leaving that batch permanently pending.
+    staging_meta: HashMap<tokio::task::Id, (uuid::Uuid, usize, String)>,
 }
 impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
@@ -269,21 +283,61 @@ impl Effects {
                 AppEffect::Error(error) => self.state.error = Some(error),
                 AppEffect::StageFiles { batch, paths } => {
                     self.state.failed_uploads.clear();
-                    for path in paths {
-                        let artifacts = self.artifacts.clone();
-                        let cancel = self.local_cancel.clone();
+                    for (index, path) in paths.into_iter().enumerate() {
                         let display_name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| "selected file".to_owned());
-                        self.staging.spawn_blocking(move || {
-                            let outcome = if cancel.is_cancelled() {
-                                Err(AppError::Cancelled)
-                            } else {
-                                artifacts.stage_file(&path, ArtifactKind::File)
+                        // Bounded pending backlog: a request beyond the cap
+                        // is bounced with an explicit busy outcome rather
+                        // than growing the queue (and the open-handle count
+                        // behind it) without limit.
+                        if self.staging.len() >= MAX_PENDING_STAGING {
+                            let display_name = display_name.clone();
+                            self.staging.spawn(async move {
+                                (
+                                    batch,
+                                    index,
+                                    display_name,
+                                    Err(AppError::InUse(
+                                        "the staging queue is busy; try again shortly",
+                                    )),
+                                )
+                            });
+                            continue;
+                        }
+                        let artifacts = self.artifacts.clone();
+                        let cancel = self.local_cancel.clone();
+                        let limit = self.staging_limit.clone();
+                        let task_display_name = display_name.clone();
+                        let handle = self.staging.spawn(async move {
+                            if cancel.is_cancelled() {
+                                return (batch, index, task_display_name, Err(AppError::Cancelled));
+                            }
+                            // Bounds concurrent `stage_file_cancellable` calls
+                            // (and therefore concurrently open source-file
+                            // handles) to a small fixed number, independent
+                            // of how many files/batches were accepted.
+                            let Ok(_permit) = limit.acquire_owned().await else {
+                                return (
+                                    batch,
+                                    index,
+                                    task_display_name,
+                                    Err(AppError::Persistence("staging worker pool closed")),
+                                );
                             };
-                            (batch, display_name, outcome)
+                            if cancel.is_cancelled() {
+                                return (batch, index, task_display_name, Err(AppError::Cancelled));
+                            }
+                            let outcome = tokio::task::spawn_blocking(move || {
+                                artifacts.stage_file_cancellable(&path, ArtifactKind::File, &cancel)
+                            })
+                            .await
+                            .unwrap_or(Err(AppError::Persistence("file staging worker failed")));
+                            (batch, index, task_display_name, outcome)
                         });
+                        self.staging_meta
+                            .insert(handle.id(), (batch, index, display_name));
                     }
                 }
                 AppEffect::FileRejected {
@@ -362,6 +416,8 @@ async fn serve(
         local_cancel: CancellationToken::new(),
         artifacts: artifacts.clone(),
         staging: tokio::task::JoinSet::new(),
+        staging_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STAGING)),
+        staging_meta: HashMap::new(),
         queue: Some(queue_tx),
         metadata: None,
         state: DesktopView {
@@ -384,10 +440,24 @@ async fn serve(
             }
             // No lifecycle guard: a file already accepted into a batch must
             // still become a durable job even if Quit arrives mid-staging.
-            result = effects.staging.join_next(), if !effects.staging.is_empty() => {
+            result = effects.staging.join_next_with_id(), if !effects.staging.is_empty() => {
                 match result {
-                    Some(Ok((batch, display_name, outcome))) => controller.on_event(AppEvent::FileStaged { batch, display_name, outcome }),
-                    _ => vec![AppEffect::Error(AppError::Persistence("file staging worker failed"))],
+                    Some(Ok((id, (batch, index, display_name, outcome)))) => {
+                        effects.staging_meta.remove(&id);
+                        controller.on_event(AppEvent::FileStaged { batch, index, display_name, outcome })
+                    }
+                    // A panicked/aborted staging task still resolves its
+                    // exact batch slot via the metadata recorded at spawn
+                    // time, instead of leaving that batch permanently
+                    // pending with no `FileStaged` ever arriving for it.
+                    Some(Err(join_error)) => match effects.staging_meta.remove(&join_error.id()) {
+                        Some((batch, index, display_name)) => controller.on_event(AppEvent::FileStaged {
+                            batch, index, display_name,
+                            outcome: Err(AppError::Persistence("file staging worker failed")),
+                        }),
+                        None => vec![AppEffect::Error(AppError::Persistence("file staging worker failed"))],
+                    },
+                    None => vec![],
                 }
             }
             _ = stop.cancelled(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::Quit),
@@ -446,16 +516,38 @@ async fn serve(
     // A file already accepted into a batch durably becomes a job the moment
     // `on_event` runs, even though nothing reads the published view anymore;
     // draining here (instead of dropping the JoinSet) is what prevents an
-    // in-flight staged file from being orphaned without a job record.
-    while let Some(result) = effects.staging.join_next().await {
-        if let Ok((batch, display_name, outcome)) = result {
-            controller.on_event(AppEvent::FileStaged {
-                batch,
-                display_name,
-                outcome,
-            });
+    // in-flight staged file from being orphaned without a job record. Every
+    // resulting effect is applied (not just the success path, and not just
+    // discarded) so an `AppEffect::Error` from a failed drain-time commit
+    // still lands in `state.error` instead of being silently swallowed.
+    while let Some(result) = effects.staging.join_next_with_id().await {
+        let event_effects = match result {
+            Ok((id, (batch, index, display_name, outcome))) => {
+                effects.staging_meta.remove(&id);
+                controller.on_event(AppEvent::FileStaged {
+                    batch,
+                    index,
+                    display_name,
+                    outcome,
+                })
+            }
+            Err(join_error) => match effects.staging_meta.remove(&join_error.id()) {
+                Some((batch, index, display_name)) => controller.on_event(AppEvent::FileStaged {
+                    batch,
+                    index,
+                    display_name,
+                    outcome: Err(AppError::Persistence("file staging worker failed")),
+                }),
+                None => vec![AppEffect::Error(AppError::Persistence(
+                    "file staging worker failed",
+                ))],
+            },
+        };
+        if let Err(error) = effects.apply(event_effects, &history).await {
+            effects.state.error = Some(error);
         }
     }
+    effects.publish(&view, wake.as_ref());
     effects.queue.take();
     if let Some(task) = effects.metadata.take() {
         task.abort();

@@ -3,8 +3,19 @@
 //! egui/UI thread or the controller's Tokio runtime. A cancelled dialog is a
 //! pure no-op: nothing is staged, no command is submitted.
 #![allow(unsafe_code)]
-use crate::app::{desktop::DesktopClient, error::AppError, events::AppCommand, notifications};
-use std::path::PathBuf;
+use crate::app::{
+    desktop::DesktopClient,
+    error::AppError,
+    events::{AppCommand, Lifecycle},
+    notifications,
+};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use windows::Win32::{
     System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -64,6 +75,12 @@ fn pick_existing_files() -> Result<Option<Vec<PathBuf>>, AppError> {
         }
         let results = dialog.GetResults().map_err(|_| error())?;
         let count = results.GetCount().map_err(|_| error())?;
+        // Bounded BEFORE any allocation or per-item shell call: a pathological
+        // (or corrupted) count must never size a `Vec` or walk `GetItemAt` for
+        // more items than the app will ever accept.
+        if count as usize > notifications::MAX_BATCH_ITEMS {
+            return Err(AppError::InvalidInput("select at most 100 files to upload"));
+        }
         let mut paths = Vec::with_capacity(count as usize);
         for index in 0..count {
             let item: IShellItem = results.GetItemAt(index).map_err(|_| error())?;
@@ -81,25 +98,80 @@ fn pick_existing_files() -> Result<Option<Vec<PathBuf>>, AppError> {
     }
 }
 
+/// Single-flight gate: at most one native picker dialog may be open at a
+/// time. Acquiring it returns a guard that releases on drop, including on a
+/// panic inside the picker thread or a failed thread launch — so a failure
+/// can never leave the gate stuck busy forever.
+#[derive(Clone, Default)]
+pub struct PickerGate(Arc<AtomicBool>);
+struct PickerGuard(Arc<AtomicBool>);
+impl Drop for PickerGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+impl PickerGate {
+    fn try_acquire(&self) -> Option<PickerGuard> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| PickerGuard(self.0.clone()))
+    }
+}
+
 /// Opens the native picker on a dedicated thread and, on a non-empty
 /// selection, hands the paths to the controller as one accepted batch.
-/// Never blocks the calling (egui/UI or tray) thread. Bounding the batch
-/// here, before anything is touched, keeps an oversized selection from
-/// reaching the controller at all.
-pub fn spawn_pick_and_upload(client: DesktopClient) {
-    std::thread::spawn(move || match pick_existing_files() {
-        Ok(None) => {}
-        Ok(Some(paths)) => {
-            if paths.len() > notifications::MAX_BATCH_ITEMS {
-                client.report_error(AppError::InvalidInput("select at most 100 files to upload"));
+/// Never blocks the calling (egui/UI or tray) thread.
+pub fn spawn_pick_and_upload(client: DesktopClient, gate: PickerGate) {
+    spawn_pick_with(client, gate, pick_existing_files);
+}
+
+/// `spawn_pick_and_upload`'s real logic, parameterized over the picker call
+/// itself so lifecycle/gating/bounding can be exercised deterministically in
+/// tests without a real native dialog.
+pub fn spawn_pick_with<P>(client: DesktopClient, gate: PickerGate, picker: P)
+where
+    P: FnOnce() -> Result<Option<Vec<PathBuf>>, AppError> + Send + 'static,
+{
+    // Shutting down: never open a dialog, never touch a file.
+    if client.snapshot().lifecycle != Lifecycle::Running {
+        return;
+    }
+    let Some(guard) = gate.try_acquire() else {
+        client.report_error(AppError::InUse(
+            "a file picker is already open; finish or cancel it first",
+        ));
+        return;
+    };
+    let report_client = client.clone();
+    let spawned = std::thread::Builder::new()
+        .name("vectrcap-file-picker".into())
+        .spawn(move || {
+            let _guard = guard;
+            let result = picker();
+            // The dialog may have resolved after shutdown began; a late
+            // selection must never be accepted, and nothing it names has
+            // been touched (the picker only resolves display paths).
+            if client.snapshot().lifecycle != Lifecycle::Running {
                 return;
             }
-            if let Err(submit_error) = client.submit(AppCommand::AcceptFileSelection(paths)) {
-                client.report_error(submit_error);
+            match result {
+                Ok(None) => {}
+                Ok(Some(paths)) => {
+                    if let Err(submit_error) = client.submit(AppCommand::AcceptFileSelection(paths))
+                    {
+                        client.report_error(submit_error);
+                    }
+                }
+                Err(error) => client.report_error(error),
             }
-        }
-        Err(error) => client.report_error(error),
-    });
+        });
+    // A failed launch releases the gate itself (the never-run closure, and
+    // the guard it captured, are dropped here), but the user still needs to
+    // hear about it.
+    if spawned.is_err() {
+        report_client.report_error(error());
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use crate::{
         error::AppError,
         events::{AppCommand, Lifecycle, Window},
     },
-    platform::windows::{appearance, tray::Tray},
+    platform::windows::{appearance, file_dialog::PickerGate, tray::Tray},
 };
 use eframe::egui;
 use std::sync::{
@@ -26,6 +26,9 @@ pub struct Shell {
     focus_revision: u64,
     current_window: Option<Window>,
     focus_requested: Arc<AtomicBool>,
+    /// Shared with the tray's "Upload file" menu item: the two entry points
+    /// are single-flight together, not just independently.
+    picker_gate: PickerGate,
 }
 impl Shell {
     pub fn new(
@@ -33,7 +36,8 @@ impl Shell {
         focus_requested: Arc<AtomicBool>,
         context: egui::Context,
     ) -> Result<Self, AppError> {
-        let tray = Tray::new(client.clone(), context)?;
+        let picker_gate = PickerGate::default();
+        let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
             view: client.snapshot(),
             client,
@@ -44,6 +48,7 @@ impl Shell {
             focus_revision: 0,
             current_window: None,
             focus_requested,
+            picker_gate,
         })
     }
     fn submit(&mut self, command: AppCommand) {
@@ -229,7 +234,12 @@ impl eframe::App for Shell {
                                 super::batch_summary::draw(ui, &self.view);
                             }
                             (Some(Window::Uploads), Some(_)) => {
-                                commands.extend(super::uploads::draw(ui, &self.view, &self.client))
+                                commands.extend(super::uploads::draw(
+                                    ui,
+                                    &self.view,
+                                    &self.client,
+                                    &self.picker_gate,
+                                ))
                             }
                             (_, None) => {
                                 ui.label("Opening local settings…");

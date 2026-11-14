@@ -4,13 +4,22 @@ use crate::{
         events::{AppCommand, QueueAction},
     },
     persistence::history::JobStatus,
+    platform::windows::file_dialog::PickerGate,
 };
 use eframe::egui::Ui;
-pub fn draw(ui: &mut Ui, view: &DesktopView, client: &DesktopClient) -> Vec<AppCommand> {
+pub fn draw(
+    ui: &mut Ui,
+    view: &DesktopView,
+    client: &DesktopClient,
+    picker_gate: &PickerGate,
+) -> Vec<AppCommand> {
     let mut commands = vec![];
     ui.heading("Uploads");
     if ui.button("Upload file…").clicked() {
-        crate::platform::windows::file_dialog::spawn_pick_and_upload(client.clone());
+        crate::platform::windows::file_dialog::spawn_pick_and_upload(
+            client.clone(),
+            picker_gate.clone(),
+        );
     }
     if !view.failed_uploads.is_empty() {
         ui.add_space(6.0);

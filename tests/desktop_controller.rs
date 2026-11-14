@@ -517,12 +517,14 @@ fn stage_and_feed(
     app: &mut AppController,
     artifacts: &ArtifactStore,
     batch: uuid::Uuid,
+    index: usize,
     path: &std::path::Path,
 ) -> Vec<AppEffect> {
     let display_name = path.file_name().unwrap().to_string_lossy().into_owned();
     let outcome = artifacts.stage_file(path, ArtifactKind::File);
     app.on_event(AppEvent::FileStaged {
         batch,
+        index,
         display_name,
         outcome,
     })
@@ -563,7 +565,7 @@ fn file_selection_batch_keeps_one_destination_across_a_default_change_during_sta
 
     // Stage the first file, then change the default destination before the
     // second file is staged. Both files must still use the ORIGINAL snapshot.
-    let effects_a = stage_and_feed(&mut app, &artifacts, batch, &source_a);
+    let effects_a = stage_and_feed(&mut app, &artifacts, batch, 0, &source_a);
     assert!(
         effects_a
             .iter()
@@ -584,7 +586,7 @@ fn file_selection_batch_keeps_one_destination_across_a_default_change_during_sta
     });
     assert_eq!(app.settings().destinations.default_id(), Some(second));
 
-    let effects_b = stage_and_feed(&mut app, &artifacts, batch, &source_b);
+    let effects_b = stage_and_feed(&mut app, &artifacts, batch, 1, &source_b);
     assert!(
         effects_b
             .iter()
@@ -636,7 +638,7 @@ fn bad_file_alongside_valid_file_in_a_batch_still_uploads_the_valid_one() {
         })
         .unwrap();
 
-    let good_effects = stage_and_feed(&mut app, &artifacts, batch, &good);
+    let good_effects = stage_and_feed(&mut app, &artifacts, batch, 0, &good);
     let job_id = good_effects
         .iter()
         .find_map(|e| match e {
@@ -645,7 +647,7 @@ fn bad_file_alongside_valid_file_in_a_batch_still_uploads_the_valid_one() {
         })
         .expect("the valid sibling file is still accepted");
 
-    let bad_effects = stage_and_feed(&mut app, &artifacts, batch, &missing);
+    let bad_effects = stage_and_feed(&mut app, &artifacts, batch, 1, &missing);
     assert!(matches!(
         bad_effects.as_slice(),
         [AppEffect::FileRejected { display_name, .. }] if display_name == "does-not-exist.txt"
@@ -801,4 +803,111 @@ async fn quitting_during_staging_never_orphans_an_accepted_file() {
         .unwrap_or(0);
     assert!(jobs.len() <= 1 && spool_files <= 1);
     assert_eq!(jobs.len(), spool_files);
+}
+
+#[test]
+fn staged_success_delivered_after_quit_keeps_its_reserved_destination_and_durable_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store);
+    let destination = seed(
+        &mut app,
+        "Original",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-token",
+    );
+    let artifacts = ArtifactStore::new(dir.path().join("spool")).unwrap();
+    let source = dir.path().join("accepted-before-quit.txt");
+    std::fs::write(&source, b"synthetic").unwrap();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(vec![source.clone()]));
+    let batch = effects
+        .into_iter()
+        .find_map(|e| {
+            if let AppEffect::StageFiles { batch, .. } = e {
+                Some(batch)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let artifact = artifacts.stage_file(&source, ArtifactKind::File).unwrap();
+    app.dispatch(AppCommand::Quit);
+    let effects = app.on_event(AppEvent::FileStaged {
+        batch,
+        index: 0,
+        display_name: "accepted-before-quit.txt".into(),
+        outcome: Ok(artifact),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::JobAccepted(_))),
+        "successful staging accepted before Quit must retain its destination reservation and durably commit"
+    );
+    let jobs = History::open(&dir.path().join("history.db"))
+        .unwrap()
+        .shell_jobs()
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].destination.id, destination);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_staging_backlog_gets_explicit_busy_feedback_without_losing_any_file() {
+    // Exceeds the staging pool's bounded pending backlog (64) within one
+    // accepted batch: beyond that cap, a file must be bounced with an
+    // explicit busy outcome instead of growing an unbounded queue of open
+    // source handles — never silently dropped and never stuck forever.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store.clone());
+    seed(
+        &mut app,
+        "Personal",
+        ServerOrigin::parse("https://example.invalid").unwrap(),
+        "synthetic-a",
+    );
+    drop(app);
+    const TOTAL: usize = 80;
+    let paths: Vec<_> = (0..TOTAL)
+        .map(|i| {
+            let p = dir.path().join(format!("f{i}.txt"));
+            std::fs::write(&p, b"x").unwrap();
+            p
+        })
+        .collect();
+    let (tx, rx) = mpsc::channel();
+    let runtime = DesktopRuntime::spawn(
+        dir.path().into(),
+        store.clone(),
+        Arc::new(CredentialClientFactory::new(store)),
+        Arc::new(move || {
+            let _ = tx.send(());
+        }),
+    )
+    .unwrap();
+    wait(&runtime.client, &rx, |s| s.settings.is_some());
+    runtime
+        .client
+        .submit(AppCommand::AcceptFileSelection(paths))
+        .unwrap();
+    // Staging a handful of tiny local files never touches the network, so
+    // this resolves independently of any upload outcome.
+    let state = wait(&runtime.client, &rx, |s| {
+        s.jobs.len() + s.failed_uploads.len() >= TOTAL
+    });
+    assert_eq!(
+        state.jobs.len() + state.failed_uploads.len(),
+        TOTAL,
+        "every selected file must resolve: a durable job or an explicit rejection, never lost"
+    );
+    assert!(
+        state
+            .failed_uploads
+            .iter()
+            .any(|(_, e)| matches!(e, AppError::InUse(_))),
+        "the backlog beyond the bounded pending cap must surface an explicit busy rejection"
+    );
+    runtime.client.submit(AppCommand::Quit).unwrap();
+    wait(&runtime.client, &rx, |s| s.lifecycle == Lifecycle::Exited);
 }

@@ -4,12 +4,15 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::app::error::AppError;
 use crate::app::types::{Artifact, ArtifactId, ArtifactKind};
 use crate::persistence::winfs::{self, ERROR_SHARING_VIOLATION};
-use crate::persistence::{PARTIAL_PREFIX, copy_hashing, ensure_free_space, hook};
+use crate::persistence::{
+    PARTIAL_PREFIX, copy_hashing, copy_hashing_checked, ensure_free_space, hook,
+};
 
 const IN_USE: AppError =
     AppError::InUse("the file is open for writing in another program; close it and try again");
@@ -134,6 +137,107 @@ impl ArtifactStore {
             size,
             sha256,
         })
+    }
+
+    /// Same contract as [`Self::stage_file`], but polls `cancel` before
+    /// opening the source, before waiting on the staging lock, and once per
+    /// chunk during the copy itself — so a task already queued behind
+    /// another large file, or partway through its own large copy, still
+    /// stops promptly instead of finishing the entire file. On cancellation
+    /// no artifact is produced, the source is untouched, and the temp file
+    /// is removed exactly as it is for any other early return. The returned
+    /// artifact is already [`Self::verify`]-checked, so callers that hand it
+    /// across a thread/channel boundary need not re-hash it themselves.
+    pub fn stage_file_cancellable(
+        &self,
+        source: &Path,
+        kind: ArtifactKind,
+        cancel: &CancellationToken,
+    ) -> Result<Artifact, AppError> {
+        const NOT_REGULAR: AppError =
+            AppError::InvalidInput("only regular local files can be uploaded");
+        const READING: &str = "reading the source file";
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let display_name = display_name_of(source)?;
+        check_source_path(source)?;
+        let mut src = winfs::open_read_exclusive(source).map_err(|e| {
+            let not_file = fs::symlink_metadata(source).is_ok_and(|m| !m.is_file());
+            if e.kind() == io::ErrorKind::InvalidInput || not_file {
+                NOT_REGULAR
+            } else {
+                open_error("opening the source file", &e)
+            }
+        })?;
+        hook("stage.source_open");
+        let resolved = winfs::final_path(&src).map_err(|e| AppError::io(READING, &e))?;
+        if !is_local_final_path(&resolved) {
+            return Err(AppError::InvalidInput(
+                "network and device paths are not supported",
+            ));
+        }
+        let before = src.metadata().map_err(|e| AppError::io(READING, &e))?;
+        let size = before.len();
+        let modified = before.modified().map_err(|e| AppError::io(READING, &e))?;
+
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let _guard = self
+            .staging
+            .lock()
+            .map_err(|_| AppError::Persistence("staging lock poisoned"))?;
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        ensure_free_space(&self.root, size)?;
+        const STAGE: &str = "staging the file";
+        let mut tmp = tempfile::Builder::new()
+            .prefix(PARTIAL_PREFIX)
+            .tempfile_in(&self.root)
+            .map_err(|e| AppError::io(STAGE, &e))?;
+        let Some((copied, sha256)) =
+            copy_hashing_checked(&mut src, tmp.as_file_mut(), size, &|| cancel.is_cancelled())
+                .map_err(|e| AppError::io(STAGE, &e))?
+        else {
+            // `tmp` is dropped here and deletes itself; nothing is orphaned.
+            return Err(AppError::Cancelled);
+        };
+        let after = src.metadata().map_err(|e| AppError::io(STAGE, &e))?;
+        let modified_after = after.modified().map_err(|e| AppError::io(STAGE, &e))?;
+        if copied != size || after.len() != size || modified_after != modified {
+            return Err(AppError::InvalidInput(
+                "the file changed while it was being staged; try again",
+            ));
+        }
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| AppError::io(STAGE, &e))?;
+
+        let id = ArtifactId::new_random();
+        let path = self.spool_path(id);
+        let file = tmp
+            .persist_noclobber(&path)
+            .map_err(|e| AppError::io(STAGE, &e.error))?;
+        let mut perms = file
+            .metadata()
+            .map_err(|e| AppError::io(STAGE, &e))?
+            .permissions();
+        perms.set_readonly(true);
+        file.set_permissions(perms)
+            .map_err(|e| AppError::io(STAGE, &e))?;
+        drop(file);
+        let artifact = Artifact {
+            id,
+            path,
+            display_name,
+            kind,
+            size,
+            sha256,
+        };
+        self.verify(&artifact)?;
+        Ok(artifact)
     }
 
     fn spool_path(&self, id: ArtifactId) -> PathBuf {
@@ -341,6 +445,91 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = ArtifactStore::new(dir.path().join("spool")).unwrap();
         (dir, store)
+    }
+
+    fn spool_is_empty(store: &ArtifactStore) -> bool {
+        fs::read_dir(store.root())
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+    }
+
+    #[test]
+    fn cancellation_before_any_work_touches_nothing() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("a.bin");
+        fs::write(&src, b"synthetic").unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            store.stage_file_cancellable(&src, ArtifactKind::File, &cancel),
+            Err(AppError::Cancelled)
+        ));
+        assert_eq!(fs::read(&src).unwrap(), b"synthetic");
+        assert!(spool_is_empty(&store));
+    }
+
+    #[test]
+    fn cancellation_queued_behind_the_staging_lock_still_stops_before_copying() {
+        // Simulates a task that was already admitted (source opened) when
+        // Quit/cancel arrives, but has not yet reached the actual copy —
+        // exactly the gap the parent review flagged: a check only before the
+        // mutex wait is not enough on its own, but this one fires AFTER the
+        // open and BEFORE the lock, independent of the per-chunk check below.
+        let (dir, store) = fixture();
+        let src = dir.path().join("a.bin");
+        fs::write(&src, b"synthetic").unwrap();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        set_hook(move |point| {
+            if point == "stage.source_open" {
+                c.cancel();
+            }
+        });
+        let result = store.stage_file_cancellable(&src, ArtifactKind::File, &cancel);
+        clear_hook();
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert_eq!(fs::read(&src).unwrap(), b"synthetic");
+        assert!(
+            spool_is_empty(&store),
+            "no temp/spool file must be left behind"
+        );
+    }
+
+    #[test]
+    fn cancellation_mid_copy_leaves_no_partial_spool_file() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("big.bin");
+        fs::write(&src, vec![9u8; 3 * 64 * 1024 + 5]).unwrap();
+        // `stage.source_open` fires once, before the copy loop starts; by
+        // cancelling there we exercise the per-chunk check inside the copy
+        // itself rather than the earlier open/mutex checks above.
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        set_hook(move |point| {
+            if point == "stage.source_open" {
+                c.cancel();
+            }
+        });
+        let result = store.stage_file_cancellable(&src, ArtifactKind::File, &cancel);
+        clear_hook();
+        assert!(matches!(result, Err(AppError::Cancelled)));
+        assert!(
+            spool_is_empty(&store),
+            "the partial temp file must not survive"
+        );
+    }
+
+    #[test]
+    fn an_uncancelled_token_stages_exactly_like_stage_file() {
+        let (dir, store) = fixture();
+        let src = dir.path().join("a.bin");
+        fs::write(&src, b"synthetic payload").unwrap();
+        let artifact = store
+            .stage_file_cancellable(&src, ArtifactKind::File, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(fs::read(&artifact.path).unwrap(), b"synthetic payload");
+        // Already verified internally; a fresh verify must still agree.
+        store.verify(&artifact).unwrap();
     }
 
     #[test]

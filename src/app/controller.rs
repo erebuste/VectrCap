@@ -115,7 +115,6 @@ pub struct BatchSummaryRow {
 /// Tracks one accepted native-file-picker batch from acceptance through its
 /// last upload settlement, so every file's completion can be grouped into a
 /// single notice instead of one toast per file.
-#[derive(Default)]
 struct FileBatch {
     /// Paths not yet staged (succeeded or failed). The destination snapshot
     /// in `workflows` is released once this reaches zero, independent of
@@ -123,7 +122,13 @@ struct FileBatch {
     staging_remaining: usize,
     /// Created jobs not yet in a terminal state for notification purposes.
     jobs_remaining: usize,
-    completions: Vec<JobCompletion>,
+    /// One slot per originally selected path, in picker order; filled in as
+    /// each job resolves (truthfully, never fabricated) regardless of the
+    /// order staging/settlement actually complete in. A rejected file (no
+    /// job was ever created) keeps its slot `None` forever; it is still
+    /// surfaced to the user via `failed_uploads`, just not folded into this
+    /// per-job grouped notice.
+    completions: Vec<Option<JobCompletion>>,
 }
 pub struct AppController {
     batch_jobs: Vec<super::types::JobId>,
@@ -135,7 +140,8 @@ pub struct AppController {
     references: Arc<References>,
     workflows: HashMap<Uuid, DestinationSnapshot>,
     batches: HashMap<Uuid, FileBatch>,
-    job_batch: HashMap<super::types::JobId, Uuid>,
+    /// Each batch member's batch id and its original picker-order index.
+    job_batch: HashMap<super::types::JobId, (Uuid, usize)>,
     notifications: NotificationCenter,
     shell: Arc<dyn ShellActions>,
     clipboard: Arc<dyn ClipboardWriter>,
@@ -418,7 +424,8 @@ impl AppController {
             batch,
             FileBatch {
                 staging_remaining: paths.len(),
-                ..Default::default()
+                jobs_remaining: 0,
+                completions: vec![None; paths.len()],
             },
         );
         self.update_active()?;
@@ -428,10 +435,15 @@ impl AppController {
         ])
     }
     /// Creates the durable job for one successfully staged batch file,
-    /// reusing the batch's single pre-resolved destination snapshot.
+    /// reusing the batch's single pre-resolved destination snapshot. The
+    /// artifact arrives already verified by the staging task that produced
+    /// it (off this thread); re-hashing it again here would re-block the
+    /// controller on exactly the large-file cost the staging handoff exists
+    /// to avoid, so this only does cheap, in-memory checks.
     fn accept_batch_artifact(
         &mut self,
         batch: Uuid,
+        index: usize,
         artifact: &Artifact,
     ) -> Result<Vec<AppEffect>, AppError> {
         let snapshot = self
@@ -439,9 +451,8 @@ impl AppController {
             .get(&batch)
             .ok_or(AppError::InvalidInput("unknown accepted workflow"))?;
         self.manager.ensure_not_corrupted()?;
-        self.artifacts.verify(artifact)?;
         let job = self.history.create_job(artifact, snapshot)?;
-        self.job_batch.insert(job.id, batch);
+        self.job_batch.insert(job.id, (batch, index));
         if let Some(state) = self.batches.get_mut(&batch) {
             state.jobs_remaining += 1;
         }
@@ -454,12 +465,13 @@ impl AppController {
     fn file_staged(
         &mut self,
         batch: Uuid,
+        index: usize,
         display_name: String,
         outcome: Result<Artifact, AppError>,
     ) -> Vec<AppEffect> {
         let mut effects = Vec::new();
         match outcome {
-            Ok(artifact) => match self.accept_batch_artifact(batch, &artifact) {
+            Ok(artifact) => match self.accept_batch_artifact(batch, index, &artifact) {
                 Ok(job_effects) => effects.extend(job_effects),
                 Err(error) => effects.push(AppEffect::Error(error)),
             },
@@ -491,17 +503,62 @@ impl AppController {
         completion: Option<JobCompletion>,
         effects: &mut Vec<AppEffect>,
     ) -> bool {
-        let Some(batch) = self.job_batch.remove(&job) else {
+        let Some((batch, index)) = self.job_batch.remove(&job) else {
             return false;
         };
         if let Some(state) = self.batches.get_mut(&batch) {
             state.jobs_remaining = state.jobs_remaining.saturating_sub(1);
-            if let Some(completion) = completion {
-                state.completions.push(completion);
+            if let Some(completion) = completion
+                && let Some(slot) = state.completions.get_mut(index)
+            {
+                *slot = Some(completion);
             }
         }
         self.maybe_flush_batch(batch, effects);
         true
+    }
+    /// Truthfully closes one batch member's slot when it reaches a state
+    /// that will never produce a receipt on its own (cancelled, uncertain,
+    /// or superseded by an explicit restart) — never a fabricated success,
+    /// and never an automatic restart. Without this, one stuck slot would
+    /// hold every successful sibling's notice forever (`jobs_remaining`
+    /// never reaches zero). A standalone (non-batch) job in these states
+    /// still shows nothing: this only ever touches batch bookkeeping.
+    fn resolve_batch_slot(
+        &mut self,
+        job: super::types::JobId,
+        status: CompletionStatus,
+        effects: &mut Vec<AppEffect>,
+    ) {
+        if !self.job_batch.contains_key(&job) {
+            return;
+        }
+        let completion = match self.history.job(job) {
+            Ok(Some(record)) => {
+                let local_available = record.artifact.path.exists();
+                let safe_to_open = local_available && Self::is_safe_to_open(&record.artifact);
+                match JobCompletion::try_new(
+                    job,
+                    &record.artifact.display_name,
+                    local_available,
+                    safe_to_open,
+                    None,
+                    status,
+                ) {
+                    Ok(completion) => Some(completion),
+                    Err(error) => {
+                        effects.push(AppEffect::Error(error));
+                        None
+                    }
+                }
+            }
+            Ok(None) => None,
+            Err(error) => {
+                effects.push(AppEffect::Error(error));
+                None
+            }
+        };
+        self.resolve_batch_job(job, completion, effects);
     }
     fn maybe_flush_batch(&mut self, batch: Uuid, effects: &mut Vec<AppEffect>) {
         let done = self
@@ -514,13 +571,18 @@ impl AppController {
         let Some(state) = self.batches.remove(&batch) else {
             return;
         };
-        if state.completions.is_empty() {
-            return;
-        }
-        match self
-            .notifications
-            .record(CompletionNotice::Batch(state.completions))
-        {
+        // The slot count is the ORIGINAL picker-selection size; a selection
+        // of exactly one file gets an ordinary single-job notice instead of
+        // a one-item "batch", regardless of how many siblings were rejected
+        // during staging (there are none when the slot count is 1).
+        let single_selection = state.completions.len() == 1;
+        let completions: Vec<JobCompletion> = state.completions.into_iter().flatten().collect();
+        let notice = match (single_selection, completions.len()) {
+            (_, 0) => return,
+            (true, 1) => CompletionNotice::Job(completions.into_iter().next().unwrap()),
+            _ => CompletionNotice::Batch(completions),
+        };
+        match self.notifications.record(notice) {
             Ok(_) => {}
             // An already-visible duplicate is benign; see the single-job path below.
             Err(AppError::InvalidInput(_)) => {}
@@ -785,8 +847,14 @@ impl AppController {
             AppCommand::AcceptFileSelection(paths) => self.accept_file_selection(paths)?,
             AppCommand::Quit => {
                 self.lifecycle = Lifecycle::Draining;
-                self.workflows.clear();
-                self.update_active()?;
+                // Workflows are deliberately NOT cleared here: a batch file
+                // already accepted (its destination reserved in `workflows`)
+                // may still be mid-staging when Quit arrives, and a later
+                // successful `FileStaged` for it must still find that
+                // reservation and durably commit — see `file_staged`. No
+                // command but `Quit` itself reaches `apply` once Draining
+                // starts (checked in `dispatch`), so nothing new can be
+                // accepted into `workflows` from here on regardless.
                 vec![AppEffect::DrainWorker]
             }
         })
@@ -825,11 +893,25 @@ impl AppController {
                         }
                         Ok(Some(CompletionNotice::Batch(_))) => {}
                         Ok(None) => {
-                            // A cancelled batch member never completes; it
-                            // must still free its slot so sibling files are
-                            // not stuck waiting on it forever.
-                            if job.status == JobStatus::Cancelled {
-                                self.resolve_batch_job(id, None, &mut effects);
+                            // Cancelled and Uncertain never produce a receipt
+                            // on their own; a batch member stuck in either
+                            // must still free its slot (truthfully, not
+                            // silently) or sibling successes could be
+                            // withheld forever. A standalone job in these
+                            // states still shows nothing (`resolve_batch_slot`
+                            // is a no-op outside a batch).
+                            match job.status {
+                                JobStatus::Cancelled => self.resolve_batch_slot(
+                                    id,
+                                    CompletionStatus::Cancelled,
+                                    &mut effects,
+                                ),
+                                JobStatus::Uncertain => self.resolve_batch_slot(
+                                    id,
+                                    CompletionStatus::Uncertain,
+                                    &mut effects,
+                                ),
+                                _ => {}
                             }
                         }
                         Err(error) => effects.push(AppEffect::Error(error)),
@@ -838,11 +920,24 @@ impl AppController {
                 effects.push(AppEffect::RefreshQueue);
                 effects
             }
+            AppEvent::Queue(crate::vectr::queue::QueueEffect::Restarted { previous, .. }) => {
+                // An explicit restart (never automatic) retires the OLD job
+                // as cancelled and admits a brand-new replacement job that
+                // is not part of any batch; if `previous` was a batch
+                // member, close its slot truthfully instead of leaving it
+                // stuck (`job_batch` has no entry for the replacement, so a
+                // later `Changed` for it is just an ordinary standalone job).
+                let mut effects = vec![];
+                self.resolve_batch_slot(previous, CompletionStatus::Cancelled, &mut effects);
+                effects.push(AppEffect::RefreshQueue);
+                effects
+            }
             AppEvent::FileStaged {
                 batch,
+                index,
                 display_name,
                 outcome,
-            } => self.file_staged(batch, display_name, outcome),
+            } => self.file_staged(batch, index, display_name, outcome),
             AppEvent::Queue(_) => vec![AppEffect::RefreshQueue],
             AppEvent::ConnectionTest { request, result }
                 if self.lifecycle == Lifecycle::Running =>

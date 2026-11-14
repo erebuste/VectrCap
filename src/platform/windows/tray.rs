@@ -26,12 +26,16 @@ fn error() -> AppError {
 }
 impl Tray {
     #[allow(unsafe_code)]
-    pub fn new(client: DesktopClient, context: eframe::egui::Context) -> Result<Self, AppError> {
+    pub fn new(
+        client: DesktopClient,
+        context: eframe::egui::Context,
+        picker_gate: super::file_dialog::PickerGate,
+    ) -> Result<Self, AppError> {
         let choices: Choices = Arc::new(Mutex::new(HashMap::new()));
         let map = choices.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id.as_ref() == "upload-file" {
-                super::file_dialog::spawn_pick_and_upload(client.clone());
+                super::file_dialog::spawn_pick_and_upload(client.clone(), picker_gate.clone());
                 return;
             }
             let command = match event.id.as_ref() {

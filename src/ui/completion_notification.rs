@@ -65,6 +65,8 @@ pub fn draw(
                     CompletionStatus::Uploaded => "Uploaded",
                     CompletionStatus::Failed(_) => "Upload failed",
                     CompletionStatus::LocalOnly => "Local only",
+                    CompletionStatus::Uncertain => "Outcome uncertain",
+                    CompletionStatus::Cancelled => "Cancelled",
                 });
             }
             ui.horizontal_wrapped(|ui| {

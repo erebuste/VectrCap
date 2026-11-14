@@ -89,12 +89,17 @@ impl CompletionErrorCode {
     }
 }
 
-/// Closed upload outcome for one completion snapshot.
+/// Closed upload outcome for one completion snapshot. `Uncertain` and
+/// `Cancelled` close a batch member's slot truthfully (never a fabricated
+/// success) when its own attempt ends without a confirmed receipt; a
+/// standalone (non-batch) job never gains a notice for these two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionStatus {
     Uploaded,
     Failed(CompletionErrorCode),
     LocalOnly,
+    Uncertain,
+    Cancelled,
 }
 
 impl CompletionStatus {
@@ -151,6 +156,8 @@ impl JobCompletion {
             (CompletionStatus::Uploaded, true)
                 | (CompletionStatus::Failed(_), false)
                 | (CompletionStatus::LocalOnly, false)
+                | (CompletionStatus::Uncertain, false)
+                | (CompletionStatus::Cancelled, false)
         );
         if !receipt_matches {
             return Err(AppError::InvalidInput(

@@ -1096,12 +1096,13 @@ fn accept_batch_and_settle(
         })
         .expect("batch accepted");
     let mut job_ids = Vec::new();
-    for source in &sources {
+    for (index, source) in sources.iter().enumerate() {
         let display_name = source.file_name().unwrap().to_string_lossy().into_owned();
         let outcome = artifacts.stage_file(source, ArtifactKind::File);
         std::fs::remove_file(source).ok();
         let effects = app.on_event(AppEvent::FileStaged {
             batch,
+            index,
             display_name,
             outcome,
         });
@@ -1215,4 +1216,333 @@ fn batch_summary_opens_from_its_grouped_notice() {
     let summary = app.batch_summary().unwrap();
     assert_eq!(summary.len(), 2);
     assert_eq!(summary.iter().map(|r| r.id).collect::<Vec<_>>(), jobs);
+}
+
+#[test]
+fn single_file_selection_gets_an_ordinary_job_notice_not_a_one_item_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, _clipboard) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/solo", "solo.txt").unwrap();
+    let jobs = accept_batch_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        vec![("solo.txt", Ok(receipt))],
+    );
+    let notices = app.visible_notices();
+    assert_eq!(notices.len(), 1);
+    assert!(
+        !notices[0].view.is_batch(),
+        "a single-file picker selection must get an ordinary job notice, not a one-item batch"
+    );
+    assert_eq!(notices[0].view.items()[0].job_id(), jobs[0]);
+}
+
+#[test]
+fn out_of_order_staging_and_settlement_still_yields_a_picker_ordered_batch_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, _clipboard) = open(dir.path());
+    seed(&mut app);
+    let names = ["a.txt", "b.txt", "c.txt"];
+    let sources: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let path = std::env::temp_dir().join(format!("{}-{name}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, b"synthetic").unwrap();
+            path
+        })
+        .collect();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(sources.clone()));
+    let batch = effects
+        .into_iter()
+        .find_map(|e| match e {
+            AppEffect::StageFiles { batch, .. } => Some(batch),
+            _ => None,
+        })
+        .unwrap();
+    // Stage and feed FileStaged in REVERSE picker order (c, b, a).
+    let mut job_ids: Vec<Option<vectrcap::app::types::JobId>> = vec![None, None, None];
+    for &index in &[2usize, 1, 0] {
+        let source = &sources[index];
+        let display_name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let outcome = artifacts.stage_file(source, ArtifactKind::File);
+        std::fs::remove_file(source).ok();
+        let effects = app.on_event(AppEvent::FileStaged {
+            batch,
+            index,
+            display_name,
+            outcome,
+        });
+        job_ids[index] = effects.into_iter().find_map(|e| match e {
+            AppEffect::JobAccepted(id) => Some(id),
+            _ => None,
+        });
+    }
+    let job_ids: Vec<_> = job_ids.into_iter().map(Option::unwrap).collect();
+    let mut queue = QueueController::new(history.clone()).unwrap();
+    // Settle in REVERSE order too (c, b, a) — the opposite of picker order.
+    for &index in &[2usize, 1, 0] {
+        let job_id = job_ids[index];
+        queue.handle(QueueCommand::Admit(job_id));
+        history.set_session(job_id, uuid::Uuid::new_v4()).unwrap();
+        let attempt = history.job(job_id).unwrap().unwrap().attempt;
+        let receipt = vectrcap::app::types::UploadReceipt::new(
+            &format!("https://links.example/{index}"),
+            names[index],
+        )
+        .unwrap();
+        for effect in queue.handle(QueueCommand::Settled {
+            job: job_id,
+            attempt,
+            result: Ok(receipt),
+        }) {
+            if let QueueEffect::Changed(id) = effect {
+                app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+            }
+        }
+    }
+    let notices = app.visible_notices();
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert!(notice.view.is_batch());
+    let ids: Vec<_> = notice.view.items().iter().map(|i| i.job_id()).collect();
+    assert_eq!(
+        ids, job_ids,
+        "notice items must stay in original picker order, never completion order"
+    );
+}
+
+#[test]
+fn uncertain_and_cancelled_batch_members_resolve_truthfully_without_stranding_their_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, _clipboard) = open(dir.path());
+    seed(&mut app);
+    let names = ["ok.txt", "uncertain.txt", "cancelled.txt"];
+    let sources: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let path = std::env::temp_dir().join(format!("{}-{name}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, b"synthetic").unwrap();
+            path
+        })
+        .collect();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(sources.clone()));
+    let batch = effects
+        .into_iter()
+        .find_map(|e| match e {
+            AppEffect::StageFiles { batch, .. } => Some(batch),
+            _ => None,
+        })
+        .unwrap();
+    let mut job_ids = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        let display_name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let outcome = artifacts.stage_file(source, ArtifactKind::File);
+        std::fs::remove_file(source).ok();
+        let effects = app.on_event(AppEvent::FileStaged {
+            batch,
+            index,
+            display_name,
+            outcome,
+        });
+        job_ids.push(
+            effects
+                .into_iter()
+                .find_map(|e| match e {
+                    AppEffect::JobAccepted(id) => Some(id),
+                    _ => None,
+                })
+                .unwrap(),
+        );
+    }
+    let mut queue = QueueController::new(history.clone()).unwrap();
+    // ok.txt succeeds normally.
+    queue.handle(QueueCommand::Admit(job_ids[0]));
+    history
+        .set_session(job_ids[0], uuid::Uuid::new_v4())
+        .unwrap();
+    let attempt0 = history.job(job_ids[0]).unwrap().unwrap().attempt;
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/ok", "ok.txt").unwrap();
+    for effect in queue.handle(QueueCommand::Settled {
+        job: job_ids[0],
+        attempt: attempt0,
+        result: Ok(receipt),
+    }) {
+        if let QueueEffect::Changed(id) = effect {
+            app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+        }
+    }
+    // Pausing keeps the scheduler from auto-activating cancelled.txt the
+    // moment uncertain.txt settles below, so Cancel below hits it while
+    // still genuinely pending, never run.
+    history.set_queue_paused(true).unwrap();
+    // uncertain.txt's own attempt ends ambiguous — never automatically retried.
+    queue.handle(QueueCommand::Admit(job_ids[1]));
+    let attempt1 = history.job(job_ids[1]).unwrap().unwrap().attempt;
+    for effect in queue.handle(QueueCommand::Settled {
+        job: job_ids[1],
+        attempt: attempt1,
+        result: Err(AppError::Uncertain("creation")),
+    }) {
+        if let QueueEffect::Changed(id) = effect {
+            app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+        }
+    }
+    // cancelled.txt is explicitly cancelled before it ever runs.
+    for effect in queue.handle(QueueCommand::Cancel(job_ids[2])) {
+        if let QueueEffect::Changed(id) = effect {
+            app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+        }
+    }
+    let notices = app.visible_notices();
+    assert_eq!(
+        notices.len(),
+        1,
+        "the batch must flush exactly once, never be withheld forever"
+    );
+    let notice = &notices[0];
+    assert!(notice.view.is_batch());
+    let statuses: Vec<_> = notice
+        .view
+        .items()
+        .iter()
+        .map(|i| (i.job_id(), i.status().clone()))
+        .collect();
+    assert_eq!(statuses[0], (job_ids[0], CompletionStatus::uploaded()));
+    assert_eq!(statuses[1], (job_ids[1], CompletionStatus::Uncertain));
+    assert_eq!(statuses[2], (job_ids[2], CompletionStatus::Cancelled));
+}
+
+#[test]
+fn restarting_an_interrupted_batch_member_resolves_its_slot_without_stranding_its_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, _clipboard) = open(dir.path());
+    seed(&mut app);
+    let names = ["ok.txt", "interrupted.txt"];
+    let sources: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let path = std::env::temp_dir().join(format!("{}-{name}", uuid::Uuid::new_v4()));
+            std::fs::write(&path, b"synthetic").unwrap();
+            path
+        })
+        .collect();
+    let effects = app.dispatch(AppCommand::AcceptFileSelection(sources.clone()));
+    let batch = effects
+        .into_iter()
+        .find_map(|e| match e {
+            AppEffect::StageFiles { batch, .. } => Some(batch),
+            _ => None,
+        })
+        .unwrap();
+    let mut job_ids = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        let display_name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let outcome = artifacts.stage_file(source, ArtifactKind::File);
+        std::fs::remove_file(source).ok();
+        let effects = app.on_event(AppEvent::FileStaged {
+            batch,
+            index,
+            display_name,
+            outcome,
+        });
+        job_ids.push(
+            effects
+                .into_iter()
+                .find_map(|e| match e {
+                    AppEffect::JobAccepted(id) => Some(id),
+                    _ => None,
+                })
+                .unwrap(),
+        );
+    }
+    let mut queue = QueueController::new(history.clone()).unwrap();
+    // ok.txt succeeds.
+    queue.handle(QueueCommand::Admit(job_ids[0]));
+    history
+        .set_session(job_ids[0], uuid::Uuid::new_v4())
+        .unwrap();
+    let attempt0 = history.job(job_ids[0]).unwrap().unwrap().attempt;
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/ok", "ok.txt").unwrap();
+    for effect in queue.handle(QueueCommand::Settled {
+        job: job_ids[0],
+        attempt: attempt0,
+        result: Ok(receipt),
+    }) {
+        if let QueueEffect::Changed(id) = effect {
+            app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+        }
+    }
+    // interrupted.txt was mid-flight with a known session when its request
+    // was paused — `Interrupted`, not a closed outcome, so `Changed` alone
+    // must NOT resolve its batch slot: it is expected to resume on its own.
+    // Pausing before the settle keeps the queue from immediately
+    // auto-resuming an interrupted job once it transitions below: `Restart`
+    // is meant to be an explicit choice, not something racing a live
+    // scheduler, and this is also exactly how a real shutdown/pause leaves a
+    // mid-flight request interrupted instead of instantly retried.
+    history.set_queue_paused(true).unwrap();
+    history
+        .set_session(job_ids[1], uuid::Uuid::new_v4())
+        .unwrap();
+    let attempt1 = history.job(job_ids[1]).unwrap().unwrap().attempt;
+    for effect in queue.handle(QueueCommand::Settled {
+        job: job_ids[1],
+        attempt: attempt1,
+        result: Err(AppError::Paused),
+    }) {
+        if let QueueEffect::Changed(id) = effect {
+            app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+        }
+    }
+    assert_eq!(
+        history.job(job_ids[1]).unwrap().unwrap().status,
+        vectrcap::persistence::history::JobStatus::Interrupted
+    );
+    assert!(
+        app.visible_notices().is_empty(),
+        "an interrupted (not closed) sibling must still withhold the batch notice"
+    );
+    // The user explicitly restarts it — never automatic — which retires the
+    // old job as cancelled and admits an unrelated replacement.
+    for effect in queue.handle(QueueCommand::Restart(job_ids[1])) {
+        if let QueueEffect::Restarted {
+            previous,
+            replacement,
+        } = effect
+        {
+            app.on_event(AppEvent::Queue(QueueEffect::Restarted {
+                previous,
+                replacement,
+            }));
+        }
+    }
+    let notices = app.visible_notices();
+    assert_eq!(
+        notices.len(),
+        1,
+        "an explicit restart must still release the batch, not strand the successful sibling"
+    );
+    let notice = &notices[0];
+    assert!(notice.view.is_batch());
+    let statuses: Vec<_> = notice
+        .view
+        .items()
+        .iter()
+        .map(|i| (i.job_id(), i.status().clone()))
+        .collect();
+    // The restarted slot is truthfully closed as Cancelled — never a
+    // fabricated success — in its ORIGINAL picker position; the unrelated
+    // replacement job is not part of this (already-closed) batch at all.
+    assert_eq!(
+        statuses,
+        vec![
+            (job_ids[0], CompletionStatus::uploaded()),
+            (job_ids[1], CompletionStatus::Cancelled),
+        ]
+    );
 }

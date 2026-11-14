@@ -58,11 +58,28 @@ pub(crate) fn copy_hashing(
     dst: &mut impl Write,
     expected: u64,
 ) -> io::Result<(u64, [u8; 32])> {
+    Ok(copy_hashing_checked(src, dst, expected, &|| false)?
+        .expect("a cancel check that never returns true never yields None"))
+}
+
+/// Same as [`copy_hashing`], but polls `cancelled` once per chunk and stops
+/// early with `Ok(None)` instead of completing the copy. `dst` is left with a
+/// partial write; callers that must not keep a partial result (e.g. a staging
+/// temp file) rely on their own cleanup, not on this function.
+pub(crate) fn copy_hashing_checked(
+    src: &mut impl Read,
+    dst: &mut impl Write,
+    expected: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<Option<(u64, [u8; 32])>> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_BUFFER_BYTES];
     let mut limited = src.take(expected.saturating_add(1));
     let mut total = 0u64;
     loop {
+        if cancelled() {
+            return Ok(None);
+        }
         let n = match limited.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -73,7 +90,7 @@ pub(crate) fn copy_hashing(
         dst.write_all(&buf[..n])?;
         total += n as u64;
     }
-    Ok((total, hasher.finalize().into()))
+    Ok(Some((total, hasher.finalize().into())))
 }
 
 pub(crate) fn ensure_free_space(dir: &Path, needed: u64) -> Result<(), AppError> {
@@ -116,6 +133,49 @@ fn available_space(dir: &Path) -> io::Result<u64> {
         Err(io::Error::last_os_error())
     } else {
         Ok(free)
+    }
+}
+
+#[cfg(test)]
+mod copy_hashing_tests {
+    use super::{COPY_BUFFER_BYTES, copy_hashing_checked};
+    use std::cell::Cell;
+
+    #[test]
+    fn stops_early_on_cancellation_with_a_partial_write() {
+        let data = vec![7u8; 10 * COPY_BUFFER_BYTES];
+        let mut src = &data[..];
+        let mut dst = Vec::new();
+        let calls = Cell::new(0u32);
+        let result = copy_hashing_checked(&mut src, &mut dst, data.len() as u64, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() > 2
+        })
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "a cancelled copy must report None, not a hash"
+        );
+        assert!(
+            dst.len() < data.len(),
+            "the copy must stop partway, not finish"
+        );
+    }
+
+    #[test]
+    fn a_cancel_check_that_never_fires_behaves_exactly_like_copy_hashing() {
+        let data = b"synthetic payload".to_vec();
+        let mut src = &data[..];
+        let mut dst = Vec::new();
+        let (total, hash) = copy_hashing_checked(&mut src, &mut dst, data.len() as u64, &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, data.len() as u64);
+        assert_eq!(dst, data);
+        let mut src2 = &data[..];
+        let mut dst2 = Vec::new();
+        let (total2, hash2) = super::copy_hashing(&mut src2, &mut dst2, data.len() as u64).unwrap();
+        assert_eq!((total, hash), (total2, hash2));
     }
 }
 

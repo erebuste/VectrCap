@@ -131,8 +131,11 @@ pub enum AppEvent {
         result: Result<UploaderInfoSupport, AppError>,
     },
     /// One file from an accepted batch finished staging (or failed to).
+    /// `index` is the file's position in the original picker selection,
+    /// independent of the (possibly different) order staging settles in.
     FileStaged {
         batch: Uuid,
+        index: usize,
         display_name: String,
         outcome: Result<Artifact, AppError>,
     },
