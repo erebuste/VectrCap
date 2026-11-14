@@ -65,23 +65,18 @@ struct Active {
 /// notifications after persistence. A Start effect is one reserved durable attempt.
 pub struct QueueController {
     history: Arc<History>,
-    jobs: VecDeque<JobId>,
     active: Option<Active>,
     stats: HashMap<JobId, TransferStats>,
+    speed_epoch: u64,
 }
 impl QueueController {
     pub fn new(history: Arc<History>) -> Result<Self, AppError> {
-        let recovered = history.recover_jobs()?;
-        if recovered.len() > CAPACITY {
-            return Err(AppError::InUse(
-                "queue capacity exceeded; resolve existing jobs",
-            ));
-        }
+        history.recover_uploads()?;
         Ok(Self {
             history,
-            jobs: recovered.into_iter().map(|j| j.id).collect(),
             active: None,
             stats: HashMap::new(),
+            speed_epoch: 0,
         })
     }
     pub fn handle(&mut self, command: QueueCommand) -> Vec<QueueEffect> {
@@ -106,17 +101,18 @@ impl QueueController {
     ) -> Result<(), AppError> {
         match command {
             QueueCommand::Admit(id) => {
-                let job = self.job(id)?;
-                if !job.status.is_terminal() && !self.jobs.contains(&id) {
-                    if self.jobs.len() >= CAPACITY {
-                        return Err(AppError::InUse("upload queue is full"));
-                    }
-                    self.jobs.push_back(id);
-                }
+                // Acceptance already committed atomically in History::create_job.
+                // Admit is a wake hint; durable work never depends on its delivery.
+                self.job(id)?;
             }
             QueueCommand::PauseJob(id) => {
                 self.history.set_job_paused(id, true)?;
-                self.stats.entry(id).or_default().pause();
+                if self.active.as_ref().is_some_and(|a| a.job == id) {
+                    self.speed_epoch = self.speed_epoch.wrapping_add(1);
+                }
+                if let Some(stats) = self.stats.get_mut(&id) {
+                    stats.pause();
+                }
                 effects.push(if self.active.as_ref().is_some_and(|a| a.job == id) {
                     QueueEffect::Pausing(id)
                 } else {
@@ -125,11 +121,17 @@ impl QueueController {
             }
             QueueCommand::ResumeJob(id) => {
                 self.history.set_job_paused(id, false)?;
-                self.stats.entry(id).or_default().pause();
+                if self.active.as_ref().is_some_and(|a| a.job == id) {
+                    self.speed_epoch = self.speed_epoch.wrapping_add(1);
+                }
+                if let Some(stats) = self.stats.get_mut(&id) {
+                    stats.pause();
+                }
                 effects.push(QueueEffect::Changed(id));
             }
             QueueCommand::PauseAll => {
                 self.history.set_queue_paused(true)?;
+                self.speed_epoch = self.speed_epoch.wrapping_add(1);
                 for stats in self.stats.values_mut() {
                     stats.pause();
                 }
@@ -139,21 +141,17 @@ impl QueueController {
             }
             QueueCommand::ResumeAll => {
                 self.history.set_queue_paused(false)?;
+                self.speed_epoch = self.speed_epoch.wrapping_add(1);
                 for stats in self.stats.values_mut() {
                     stats.pause();
                 }
             }
             QueueCommand::RetryEligible => {
-                for &id in &self.jobs {
-                    if matches!(self.job(id)?.status,JobStatus::Failed{code} if code=="transient"||code=="rate_limited")
-                    {
-                        self.history.reset_upload_retry(id)?;
-                        self.history.transition(id, JobStatus::Pending)?;
-                    }
-                }
+                self.history.retry_eligible_uploads()?;
             }
             QueueCommand::Cancel(id) => {
                 if let Some(a) = self.active.as_mut().filter(|a| a.job == id) {
+                    self.history.request_upload_cancel(id)?;
                     a.cancelled = true;
                     effects.push(QueueEffect::CancelActive(id));
                 } else {
@@ -161,7 +159,6 @@ impl QueueController {
                     if !job.status.is_terminal() {
                         self.history.transition(id, JobStatus::Cancelled)?;
                     }
-                    self.jobs.retain(|j| *j != id);
                     self.stats.remove(&id);
                     effects.push(QueueEffect::Changed(id));
                 }
@@ -180,12 +177,7 @@ impl QueueController {
                 ) {
                     return Err(AppError::InvalidInput("job does not need restart"));
                 }
-                if self.jobs.len() >= CAPACITY && !self.jobs.contains(&id) {
-                    return Err(AppError::InUse("upload queue is full"));
-                }
                 let replacement = self.history.restart_upload(id)?;
-                self.jobs.retain(|j| *j != id);
-                self.jobs.push_back(replacement.id);
                 self.stats.remove(&id);
                 effects.push(QueueEffect::Restarted {
                     previous: id,
@@ -236,12 +228,7 @@ impl QueueController {
                         self.history.transition(id, to)?;
                     }
                 }
-                if self.job(id)?.status.is_terminal() {
-                    self.jobs.retain(|j| *j != id);
-                    self.stats.remove(&id);
-                } else {
-                    self.stats.entry(id).or_default().pause();
-                }
+                self.stats.remove(&id);
                 effects.push(QueueEffect::Changed(id));
                 if self.job(id)?.paused || self.history.queue_paused()? {
                     effects.push(QueueEffect::Paused(id));
@@ -254,11 +241,8 @@ impl QueueController {
         if self.active.is_some() || self.history.queue_paused()? {
             return Ok(());
         }
-        for &id in &self.jobs {
-            let job = self.job(id)?;
-            if job.paused || !matches!(job.status, JobStatus::Pending | JobStatus::Interrupted) {
-                continue;
-            }
+        if let Some(job) = self.history.next_upload()? {
+            let id = job.id;
             self.history.transition(id, JobStatus::Running)?;
             let job = self.job(id)?;
             self.stats.entry(id).or_default();
@@ -268,7 +252,6 @@ impl QueueController {
                 cancelled: false,
             });
             effects.push(QueueEffect::Start(Box::new(job)));
-            break;
         }
         Ok(())
     }
@@ -298,24 +281,51 @@ impl QueueController {
                 bytes,
                 elapsed,
                 started,
+                at,
+                epoch,
                 ..
             } => {
-                if stats.reset_at.is_some_and(|reset| started < reset) {
+                if epoch != self.speed_epoch || stats.reset_at.is_some_and(|reset| started < reset)
+                {
                     Ok(())
                 } else {
-                    stats.payload(now, bytes, elapsed)
+                    stats.payload(now.saturating_sub(at.elapsed()), bytes, elapsed)
                 }
             }
             UploadEvent::Completed { .. } => Ok(()),
         };
         match result {
-            Ok(()) => vec![QueueEffect::Progress {
-                job: id,
-                acknowledged: stats.acknowledged(),
-                speed: stats.speed(now),
-            }],
+            Ok(()) => {
+                let speed = stats.speed(now);
+                stats.published = Some(speed);
+                vec![QueueEffect::Progress {
+                    job: id,
+                    acknowledged: stats.acknowledged(),
+                    speed,
+                }]
+            }
             Err(e) => vec![QueueEffect::Error(e)],
         }
+    }
+    /// Retire a displayed rate even when the body and response are silent.
+    /// Only changes produce hints; callers can also refresh before reading.
+    pub fn refresh_progress(&mut self, now: Duration) -> Vec<QueueEffect> {
+        let Some(active) = &self.active else {
+            return Vec::new();
+        };
+        let Some(stats) = self.stats.get_mut(&active.job) else {
+            return Vec::new();
+        };
+        let speed = stats.speed(now);
+        if stats.published == Some(speed) || stats.published.is_none() {
+            return Vec::new();
+        }
+        stats.published = Some(speed);
+        vec![QueueEffect::Progress {
+            job: active.job,
+            acknowledged: stats.acknowledged(),
+            speed,
+        }]
     }
     /// Single-worker driver. Commands and payload events have bounded channels;
     /// a paused request settles through Uploader before its lease can be reused.
@@ -336,10 +346,22 @@ impl QueueController {
         let (mut running, mut cancel): (Option<Running>, Option<CancellationToken>) = (None, None);
         let (event_tx, mut event_rx) = mpsc::channel(CAPACITY);
         let origin = tokio::time::Instant::now();
+        let mut refresh = tokio::time::interval(Duration::from_millis(250));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pending_progress = None;
         let mut closed = false;
         let mut effects = Vec::new();
         self.schedule(&mut effects)?;
         loop {
+            // Keep just the latest progress hint under UI backpressure. Retry
+            // delivery on the next bounded tick, including the final Waiting.
+            if let Some((effect, epoch)) = pending_progress.take()
+                && epoch == self.speed_epoch
+                && matches!(&effect, QueueEffect::Progress { job, .. } if self.active.as_ref().is_some_and(|a| a.job == *job))
+                && let Err(mpsc::error::TrySendError::Full(effect)) = notifications.try_send(effect)
+            {
+                pending_progress = Some((effect, epoch));
+            }
             for effect in effects.drain(..) {
                 match &effect {
                     QueueEffect::Start(job) => {
@@ -365,13 +387,27 @@ impl QueueController {
                     }
                     _ => {}
                 }
-                let _ = notifications.try_send(effect);
+                if matches!(effect, QueueEffect::Progress { .. }) {
+                    pending_progress = None;
+                    if let Err(mpsc::error::TrySendError::Full(effect)) =
+                        notifications.try_send(effect)
+                    {
+                        pending_progress = Some((effect, self.speed_epoch));
+                    }
+                } else {
+                    let _ = notifications.try_send(effect);
+                }
             }
-            uploader.notify_controls();
+            uploader
+                .speed_epoch
+                .store(self.speed_epoch, std::sync::atomic::Ordering::Relaxed);
             if closed && running.is_none() {
                 return Ok(());
             }
             tokio::select! {
+                _ = refresh.tick(), if self.active.is_some() || pending_progress.is_some() => {
+                    effects = self.refresh_progress(origin.elapsed());
+                }
                 command = commands.recv(), if !closed => {
                     effects = if let Some(command) = command {
                         self.handle(command)
@@ -379,6 +415,7 @@ impl QueueController {
                         closed = true;
                         self.handle(QueueCommand::PauseAll)
                     };
+                    uploader.notify_controls();
                 }
                 event = event_rx.recv() => {
                     if let Some(event) = event {
@@ -412,6 +449,7 @@ pub struct TransferStats {
     samples: VecDeque<(Duration, u64, Duration)>,
     last: Option<Duration>,
     reset_at: Option<tokio::time::Instant>,
+    published: Option<Option<f64>>,
 }
 impl TransferStats {
     pub fn acknowledge(&mut self, index: u32, bytes: u64) -> Result<(), AppError> {
@@ -443,10 +481,12 @@ impl TransferStats {
         if bytes > MAX_CHUNK {
             return Err(AppError::Protocol("payload sample exceeds bound"));
         }
-        if elapsed.is_zero() || bytes == 0 {
+        self.prune(at);
+        // A suspended/overloaded sampler cannot reconstruct recent deltas.
+        // Keep bytes in transport telemetry, but never invent a current rate.
+        if elapsed.is_zero() || elapsed > Duration::from_secs(5) {
             return Ok(());
         }
-        self.prune(at);
         if self.samples.len() == 64 {
             self.samples.pop_front();
         }
@@ -462,7 +502,7 @@ impl TransferStats {
         while self
             .samples
             .front()
-            .is_some_and(|(at, _, _)| now.saturating_sub(*at) > Duration::from_secs(5))
+            .is_some_and(|(at, _, _)| now.saturating_sub(*at) >= Duration::from_secs(5))
         {
             self.samples.pop_front();
         }
@@ -473,10 +513,17 @@ impl TransferStats {
             return None;
         }
         self.prune(now);
-        let bytes: u64 = self.samples.iter().map(|(_, b, _)| *b).sum();
-        let seconds: f64 = self.samples.iter().map(|(_, _, d)| d.as_secs_f64()).sum();
-        if seconds > 0.0 {
-            Some(bytes as f64 / seconds)
+        let cutoff = now.saturating_sub(Duration::from_secs(5));
+        let (bytes, seconds) =
+            self.samples
+                .iter()
+                .fold((0.0, 0.0), |(bytes, seconds), (at, count, elapsed)| {
+                    let included = (*at - cutoff.min(*at)).min(*elapsed).as_secs_f64();
+                    let fraction = included / elapsed.as_secs_f64();
+                    (bytes + *count as f64 * fraction, seconds + included)
+                });
+        if seconds > 0.0 && bytes > 0.0 {
+            Some(bytes / seconds)
         } else {
             None
         }

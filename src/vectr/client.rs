@@ -15,17 +15,52 @@ use serde::de::DeserializeOwned;
 use std::{
     error::Error as _,
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BodySnapshot {
+    pub bytes: u64,
+    pub first: Option<tokio::time::Instant>,
+    pub finished: Option<tokio::time::Instant>,
+}
+
+/// Cumulative outgoing-body meter. Timestamps are taken at body-frame polling,
+/// so DNS/connect time and waiting for the response are never transfer time.
+pub(crate) struct BodyMeter {
+    expected: u64,
+    state: Mutex<BodySnapshot>,
+}
+impl BodyMeter {
+    pub fn new(expected: u64) -> Self {
+        Self {
+            expected,
+            state: Mutex::new(BodySnapshot::default()),
+        }
+    }
+    pub fn record(&self, bytes: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = tokio::time::Instant::now();
+        state.first.get_or_insert(now);
+        state.bytes += bytes;
+        if state.bytes == self.expected {
+            state.finished = Some(now);
+        }
+    }
+    pub fn snapshot(&self) -> BodySnapshot {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Never serialized. The source buffer is wiped on drop; HTTP libraries own
 /// additional header copies which are marked sensitive.
+/// The 8192-byte ceiling validates transport only. Destination setup/import must
+/// separately enforce the secure-store adapter's encoded-byte capacity before
+/// installation (Windows CredentialBlobSize: 2560 bytes). Encoding is the
+/// adapter's contract; this type alone does not prove a token can be persisted.
 pub struct UploadToken(Zeroizing<String>);
 impl fmt::Debug for UploadToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -169,8 +204,8 @@ impl VectrClient {
         }
     }
     pub async fn put_piece(&self, id: Uuid, index: u32, bytes: Bytes) -> Result<(), AppError> {
-        self.put_piece_observed(id, index, bytes, Arc::new(AtomicU64::new(0)))
-            .await
+        let meter = Arc::new(BodyMeter::new(bytes.len() as u64));
+        self.put_piece_observed(id, index, bytes, meter).await
     }
     /// Counts bounded body frames handed to the HTTP transport, including retries
     /// and failures. This is outgoing payload, never server-accepted progress.
@@ -179,7 +214,7 @@ impl VectrClient {
         id: Uuid,
         index: u32,
         bytes: Bytes,
-        meter: Arc<AtomicU64>,
+        meter: Arc<BodyMeter>,
     ) -> Result<(), AppError> {
         validate_id(id)?;
         if index >= MAX_PIECES || bytes.is_empty() || bytes.len() as u64 > MAX_CHUNK {
@@ -193,7 +228,7 @@ impl VectrClient {
                 }
                 let end = bytes.len().min(offset + 65536);
                 let frame = bytes.slice(offset..end);
-                meter.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                meter.record(frame.len() as u64);
                 Some((Ok::<_, std::io::Error>(frame), (bytes, end, meter)))
             });
         self.send(

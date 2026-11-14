@@ -17,6 +17,20 @@ use vectrcap::{
 
 pub const ID: &str = "59c8493c-801b-408a-a332-efeb703520ff";
 pub const RECEIPT: &str = r#"{"url":"https://links.example/private-canary","name":"remote.webp"}"#;
+
+/// Build the previously approved on-disk schema, without modifying archive
+/// tables/ownership. Used only on disposable test databases.
+pub fn remove_schema_v3(c: &rusqlite::Connection) {
+    c.execute_batch(
+        "DROP TABLE upload_replacements;
+        DROP INDEX jobs_schedulable_order;
+        DROP INDEX jobs_acceptance_ordinal;
+        ALTER TABLE jobs DROP COLUMN acceptance_ordinal;
+        ALTER TABLE jobs DROP COLUMN cancel_requested;
+        DELETE FROM meta WHERE key='upload_ordinal';",
+    )
+    .unwrap();
+}
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,

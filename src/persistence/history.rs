@@ -15,7 +15,24 @@ use crate::persistence::settings::{LinkOrigin, ServerOrigin};
 use crate::persistence::winfs::FileIdentity;
 use crate::persistence::{PARTIAL_PREFIX, local_from_ms, now_ms};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+const SCHEMA_V3: &str = r"
+ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0, 1));
+ALTER TABLE jobs ADD COLUMN acceptance_ordinal INTEGER NOT NULL DEFAULT 0 CHECK (acceptance_ordinal >= 0);
+-- Legacy schemas have no acceptance sequence. Preserve their insertion order
+-- once during migration, then allocate independently of wall time and UUIDs.
+WITH ordered AS (SELECT id, row_number() OVER (ORDER BY rowid) AS ordinal FROM jobs)
+UPDATE jobs SET acceptance_ordinal=(SELECT ordinal FROM ordered WHERE ordered.id=jobs.id);
+CREATE UNIQUE INDEX jobs_acceptance_ordinal ON jobs(acceptance_ordinal);
+CREATE INDEX jobs_schedulable_order ON jobs(acceptance_ordinal)
+    WHERE status IN ('pending','interrupted') AND paused=0 AND cancel_requested=0;
+INSERT INTO meta(key,value) SELECT 'upload_ordinal',coalesce(max(acceptance_ordinal),0) FROM jobs;
+CREATE TABLE upload_replacements (
+    original_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(id),
+    replacement_id TEXT NOT NULL UNIQUE REFERENCES jobs(id)
+) STRICT;
+";
 
 const SCHEMA_V2: &str = r"
 CREATE TABLE upload_retry (
@@ -244,6 +261,13 @@ impl History {
             |r| r.get(0),
         )?)
     }
+    pub fn upload_retry_exhausted(&self, id: JobId) -> Result<bool, AppError> {
+        Ok(self.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM upload_retry WHERE job_id=?1 AND failures=5)",
+            params![id.0.to_string()],
+            |r| r.get(0),
+        )?)
+    }
     pub fn clear_upload_retry(&self, id: JobId) -> Result<(), AppError> {
         self.lock()?.execute(
             "DELETE FROM upload_retry WHERE job_id=?1",
@@ -257,6 +281,24 @@ impl History {
         let new_id = JobId::new_random();
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT replacement_id FROM upload_replacements WHERE original_id=?1",
+                params![id.0.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let replacement = tx
+                .query_row(
+                    &format!("{JOB_SELECT} WHERE j.id=?1"),
+                    params![existing],
+                    RawJob::read,
+                )?
+                .into_job()?;
+            tx.commit()?;
+            return Ok(replacement);
+        }
         let old = tx
             .query_row(
                 &format!("{JOB_SELECT} WHERE j.id=?1"),
@@ -277,7 +319,12 @@ impl History {
                 "upload cannot be restarted in this state",
             ));
         }
-        tx.execute("INSERT INTO jobs(id,artifact_id,dest_id,dest_label,dest_origin,dest_credential_generation,dest_link_domain,status,paused,created_ms,updated_ms) SELECT ?2,artifact_id,dest_id,dest_label,dest_origin,dest_credential_generation,dest_link_domain,'pending',paused,?3,?3 FROM jobs WHERE id=?1",params![id.0.to_string(),new_id.0.to_string(),now_ms()])?;
+        let ordinal = next_upload_ordinal(&tx)?;
+        tx.execute("INSERT INTO jobs(id,artifact_id,dest_id,dest_label,dest_origin,dest_credential_generation,dest_link_domain,status,paused,created_ms,updated_ms,acceptance_ordinal) SELECT ?2,artifact_id,dest_id,dest_label,dest_origin,dest_credential_generation,dest_link_domain,'pending',paused,?3,?3,?4 FROM jobs WHERE id=?1",params![id.0.to_string(),new_id.0.to_string(),now_ms(),ordinal])?;
+        tx.execute(
+            "INSERT INTO upload_replacements(original_id,replacement_id) VALUES (?1,?2)",
+            params![id.0.to_string(), new_id.0.to_string()],
+        )?;
         tx.execute(
             "UPDATE jobs SET status='cancelled',updated_ms=?2 WHERE id=?1",
             params![id.0.to_string(), now_ms()],
@@ -328,10 +375,11 @@ impl History {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_artifact(&tx, artifact, now)?;
+        let ordinal = next_upload_ordinal(&tx)?;
         tx.execute(
             "INSERT INTO jobs (id, artifact_id, dest_id, dest_label, dest_origin, dest_credential_generation, \
-             dest_link_domain, status, paused, created_ms, updated_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, ?8)",
+             dest_link_domain, status, paused, created_ms, updated_ms, acceptance_ordinal) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0, ?8, ?8, ?9)",
             params![
                 job.id.0.to_string(),
                 artifact.id.0.to_string(),
@@ -341,6 +389,7 @@ impl History {
                 destination.credential.generation(),
                 destination.link_domain.as_ref().map(LinkOrigin::as_str),
                 now,
+                ordinal,
             ],
         )?;
         tx.commit()?;
@@ -524,6 +573,28 @@ impl History {
         Ok(())
     }
 
+    /// Persist intent while leaving an in-flight attempt able to record success.
+    pub fn request_upload_cancel(&self, id: JobId) -> Result<(), AppError> {
+        let changed = self.lock()?.execute(
+            &format!(
+                "UPDATE jobs SET cancel_requested=1, updated_ms=?2 WHERE id=?1 AND {UNFINISHED}"
+            ),
+            params![id.0.to_string(), now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(AppError::InvalidInput("unknown or finished upload job"));
+        }
+        Ok(())
+    }
+
+    pub fn upload_cancel_requested(&self, id: JobId) -> Result<bool, AppError> {
+        Ok(self.lock()?.query_row(
+            "SELECT cancel_requested FROM jobs WHERE id=?1",
+            params![id.0.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn set_queue_paused(&self, paused: bool) -> Result<(), AppError> {
         self.lock()?.execute(
             "UPDATE meta SET value = ?1 WHERE key = 'queue_paused'",
@@ -545,9 +616,26 @@ impl History {
     /// (resume by status query); without one, creation may have reached the
     /// server, so they become Uncertain. Returns every unfinished job.
     pub fn recover_jobs(&self) -> Result<Vec<UploadJob>, AppError> {
+        self.recover_uploads()?;
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "{JOB_SELECT} WHERE j.{UNFINISHED} ORDER BY j.acceptance_ordinal"
+        ))?;
+        let raws = stmt
+            .query_map([], RawJob::read)?
+            .collect::<Result<Vec<_>, _>>()?;
+        raws.into_iter().map(RawJob::into_job).collect()
+    }
+
+    /// Recover durable state without loading the historic queue into memory.
+    pub fn recover_uploads(&self) -> Result<(), AppError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
+        tx.execute(
+            &format!("UPDATE jobs SET status='cancelled', updated_ms=?1 WHERE cancel_requested=1 AND {UNFINISHED}"),
+            params![now],
+        )?;
         tx.execute(
             "UPDATE jobs SET status = 'interrupted', updated_ms = ?1 WHERE status = 'running' AND session_id IS NOT NULL",
             params![now],
@@ -556,15 +644,26 @@ impl History {
             "UPDATE jobs SET status = 'uncertain', updated_ms = ?1 WHERE status = 'running' AND session_id IS NULL",
             params![now],
         )?;
-        let raws = {
-            let mut stmt = tx.prepare(&format!(
-                "{JOB_SELECT} WHERE j.{UNFINISHED} ORDER BY j.created_ms, j.id"
-            ))?;
-            stmt.query_map([], RawJob::read)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
         tx.commit()?;
-        raws.into_iter().map(RawJob::into_job).collect()
+        Ok(())
+    }
+
+    /// One bounded scheduling page; ineligible and paused rows stay controllable
+    /// in SQLite without consuming message-channel or actor memory capacity.
+    pub fn next_upload(&self) -> Result<Option<UploadJob>, AppError> {
+        self.lock()?.query_row(
+            &format!("{JOB_SELECT} WHERE j.status IN ('pending','interrupted') AND j.paused=0 AND j.cancel_requested=0 ORDER BY j.acceptance_ordinal LIMIT 1"),
+            [], RawJob::read,
+        ).optional()?.map(RawJob::into_job).transpose()
+    }
+
+    pub fn retry_eligible_uploads(&self) -> Result<(), AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE upload_retry SET failures=0 WHERE job_id IN (SELECT id FROM jobs WHERE status='failed' AND failure_code IN ('transient','rate_limited','retry_exhausted') AND cancel_requested=0)", [])?;
+        tx.execute("UPDATE jobs SET status='pending',failure_code=NULL,updated_ms=?1 WHERE status='failed' AND failure_code IN ('transient','rate_limited','retry_exhausted') AND cancel_requested=0", params![now_ms()])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Destinations referenced by unfinished jobs; their identity is frozen.
@@ -955,12 +1054,20 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
         0 => {
             tx.execute_batch(SCHEMA_V1)?;
             tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch(SCHEMA_V3)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())
         }
         1 => {
             tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch(SCHEMA_V3)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            Ok(())
+        }
+        2 => {
+            tx.execute_batch(SCHEMA_V3)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())
@@ -970,6 +1077,22 @@ fn migrate(conn: &mut Connection) -> Result<(), AppError> {
             "history was created by a newer VectrCap version",
         )),
     }
+}
+
+fn next_upload_ordinal(tx: &Transaction<'_>) -> Result<i64, AppError> {
+    let last: i64 = tx.query_row(
+        "SELECT value FROM meta WHERE key='upload_ordinal'",
+        [],
+        |r| r.get(0),
+    )?;
+    let next = last.checked_add(1).ok_or(AppError::Persistence(
+        "upload acceptance sequence exhausted",
+    ))?;
+    tx.execute(
+        "UPDATE meta SET value=?1 WHERE key='upload_ordinal'",
+        params![next],
+    )?;
+    Ok(next)
 }
 
 /// Inserts the artifact and its single history item if they are new; an
@@ -1195,8 +1318,9 @@ mod tests {
             self.conn
                 .execute(
                     "INSERT INTO jobs (id, artifact_id, dest_id, dest_label, dest_origin, \
-                     dest_credential_generation, status, created_ms, updated_ms) \
-                     SELECT ?1, artifact_id, ?2, 'Phone', 'https://vectr.example', 1, ?3, 0, 0 \
+                     dest_credential_generation, status, created_ms, updated_ms, acceptance_ordinal) \
+                     SELECT ?1, artifact_id, ?2, 'Phone', 'https://vectr.example', 1, ?3, 0, 0, \
+                     (SELECT coalesce(max(acceptance_ordinal),0)+1 FROM jobs) \
                      FROM archive_entries WHERE id = ?4",
                     params![
                         Uuid::new_v4().to_string(),

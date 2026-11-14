@@ -1,5 +1,5 @@
 use super::{
-    client::VectrClient,
+    client::{BodyMeter, VectrClient},
     protocol::{self, UploadStatus},
     retry,
 };
@@ -60,6 +60,8 @@ pub enum UploadEvent {
         bytes: u64,
         elapsed: Duration,
         started: Instant,
+        at: Instant,
+        epoch: u64,
     },
     Completed {
         job: JobId,
@@ -73,6 +75,7 @@ pub struct Uploader {
     factory: Arc<dyn ClientFactory>,
     worker: Mutex<()>,
     pub(crate) controls: Notify,
+    pub(crate) speed_epoch: AtomicU64,
 }
 impl Uploader {
     pub fn new(
@@ -86,6 +89,7 @@ impl Uploader {
             factory,
             worker: Mutex::new(()),
             controls: Notify::new(),
+            speed_epoch: AtomicU64::new(0),
         }
     }
     pub fn notify_controls(&self) {
@@ -170,7 +174,10 @@ impl Uploader {
             .history
             .job(id)?
             .ok_or(AppError::InvalidInput("unknown upload job"))?;
-        if cancel.is_cancelled() || job.status == JobStatus::Cancelled {
+        if cancel.is_cancelled()
+            || job.status == JobStatus::Cancelled
+            || self.history.upload_cancel_requested(id)?
+        {
             return Err(AppError::Cancelled);
         }
         if job.paused || self.history.queue_paused()? {
@@ -184,6 +191,12 @@ impl Uploader {
         cancel: &CancellationToken,
         events: &Sender<UploadEvent>,
     ) -> Result<UploadReceipt, AppError> {
+        // Recovery must offer explicit Retry immediately, even if the last
+        // exhausted failure also persisted a long server cooldown. Keep that
+        // deadline for the explicit retry; do not send a recovery request now.
+        if self.history.upload_retry_exhausted(job.id)? {
+            return Err(AppError::RetryExhausted);
+        }
         // This same guard stays alive through all reads, requests and retries.
         // Never verify then reopen the path; never touch or convert user originals.
         let store = self.store.clone();
@@ -288,17 +301,10 @@ impl Uploader {
                 self.before_retry(job, &operation, cancel).await?;
                 self.checkpoint(job.id, cancel)?;
                 let start = Instant::now();
-                let meter = Arc::new(AtomicU64::new(0));
-                let result = client
-                    .put_piece_observed(id, index, payload.clone(), meter.clone())
-                    .await;
-                let _ = events.try_send(UploadEvent::Payload {
-                    job: job.id,
-                    attempt: job.attempt,
-                    bytes: meter.load(Ordering::Relaxed),
-                    elapsed: start.elapsed(),
-                    started: start,
-                });
+                let meter = Arc::new(BodyMeter::new(payload.len() as u64));
+                let request = client.put_piece_observed(id, index, payload.clone(), meter.clone());
+                let epoch = self.speed_epoch.load(Ordering::Relaxed);
+                let result = observe_payload(request, meter, job, start, epoch, events).await;
                 match result {
                     Ok(()) => {
                         self.history.clear_operation_retry(job.id, &operation)?;
@@ -486,7 +492,7 @@ impl Uploader {
             self.checkpoint(job.id, cancel)?;
             if let Some((n, deadline)) = self.history.upload_retry(job.id, operation)? {
                 if n > retry::RETRIES {
-                    return Err(AppError::Http("retry budget exhausted"));
+                    return Err(AppError::RetryExhausted);
                 }
                 let delay =
                     Duration::from_millis(deadline.saturating_sub(unix_ms()?).max(0) as u64);
@@ -498,6 +504,73 @@ impl Uploader {
                 }
             }
             return self.checkpoint(job.id, cancel);
+        }
+    }
+}
+
+const PAYLOAD_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct PayloadCursor {
+    bytes: u64,
+    at: Option<Instant>,
+}
+impl PayloadCursor {
+    fn sample(
+        &mut self,
+        meter: &BodyMeter,
+        job: &UploadJob,
+        started: Instant,
+        epoch: u64,
+    ) -> Option<UploadEvent> {
+        let state = meter.snapshot();
+        let first = state.first?;
+        let at = state.finished.unwrap_or_else(Instant::now);
+        if self.at == Some(at) && self.bytes == state.bytes {
+            return None;
+        }
+        let bytes = state.bytes - self.bytes;
+        let elapsed = at.saturating_duration_since(self.at.unwrap_or(first));
+        self.at = Some(at);
+        self.bytes = state.bytes;
+        Some(UploadEvent::Payload {
+            job: job.id,
+            attempt: job.attempt,
+            bytes,
+            elapsed,
+            started,
+            at,
+            epoch,
+        })
+    }
+}
+
+/// Sample while the bounded HTTP request settles, without cancelling it or
+/// waiting for telemetry consumers. Each event is a delta, timestamped at its
+/// body interval rather than at response completion. A full channel drops hints.
+async fn observe_payload(
+    request: impl std::future::Future<Output = Result<(), AppError>>,
+    meter: Arc<BodyMeter>,
+    job: &UploadJob,
+    started: Instant,
+    epoch: u64,
+    events: &Sender<UploadEvent>,
+) -> Result<(), AppError> {
+    tokio::pin!(request);
+    let mut interval = tokio::time::interval_at(started + PAYLOAD_INTERVAL, PAYLOAD_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = PayloadCursor::default();
+    loop {
+        let result = tokio::select! {
+            biased;
+            result = &mut request => Some(result),
+            _ = interval.tick() => None,
+        };
+        if let Some(event) = cursor.sample(&meter, job, started, epoch) {
+            let _ = events.try_send(event);
+        }
+        if let Some(result) = result {
+            return result;
         }
     }
 }
@@ -537,4 +610,170 @@ fn read_piece(source: &mut VerifiedSource, chunk: u64, index: u32) -> Result<Byt
         .read_exact(&mut bytes)
         .map_err(|e| AppError::io("reading verified upload source", &e))?;
     Ok(Bytes::from(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::{
+            destinations::{DestinationSelection, Destinations, resolve_destination},
+            types::{Artifact, ArtifactId, ArtifactKind},
+        },
+        persistence::settings::ServerOrigin,
+        vectr::queue::TransferStats,
+    };
+
+    fn telemetry_job() -> UploadJob {
+        let mut destinations = Destinations::default();
+        let id = destinations
+            .add(
+                "Fixture",
+                ServerOrigin::parse("https://fixture.example").unwrap(),
+                None,
+            )
+            .unwrap();
+        destinations
+            .bind_credential(id, &Default::default())
+            .unwrap();
+        UploadJob {
+            id: JobId::new_random(),
+            artifact: Artifact {
+                id: ArtifactId::new_random(),
+                path: "unused-telemetry-fixture".into(),
+                display_name: "fixture.zip".into(),
+                kind: ArtifactKind::File,
+                size: 4800,
+                sha256: [0; 32],
+            },
+            destination: resolve_destination(
+                DestinationSelection::Inherit,
+                DestinationSelection::Inherit,
+                &destinations,
+            )
+            .unwrap(),
+            session: Some(uuid::Uuid::new_v4()),
+            status: JobStatus::Running,
+            paused: false,
+            attempt: 1,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn controlled_long_body_tracks_changing_and_stalled_rates_without_response_time() {
+        let job = telemetry_job();
+        let meter = Arc::new(BodyMeter::new(4800));
+        let outgoing = meter.clone();
+        let (release, response) = tokio::sync::oneshot::channel();
+        // Controlled transport-body polls exercise the same cumulative meter
+        // and observer as the HTTP body stream. No real-time/network sleeps.
+        let request = async move {
+            for step in 1..=40 {
+                tokio::time::sleep(PAYLOAD_INTERVAL).await;
+                let bytes = match step {
+                    1..=8 | 33..=40 => 100,
+                    9..=24 => 200,
+                    _ => 0,
+                };
+                if bytes != 0 {
+                    outgoing.record(bytes);
+                }
+            }
+            response.await.unwrap();
+            Ok(())
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let origin = Instant::now();
+        let task =
+            tokio::spawn(
+                async move { observe_payload(request, meter, &job, origin, 7, &tx).await },
+            );
+        tokio::task::yield_now().await;
+        let mut stats = TransferStats::default();
+        let mut total = 0;
+        let mut samples = 0;
+        for step in 1..=40 {
+            tokio::time::advance(PAYLOAD_INTERVAL).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            while let Ok(event) = rx.try_recv() {
+                if let UploadEvent::Payload {
+                    bytes,
+                    elapsed,
+                    at,
+                    epoch,
+                    ..
+                } = event
+                {
+                    assert_eq!(epoch, 7);
+                    assert!(elapsed <= PAYLOAD_INTERVAL);
+                    total += bytes;
+                    samples += 1;
+                    stats
+                        .payload(at.duration_since(origin), bytes, elapsed)
+                        .unwrap();
+                }
+            }
+            let want = match step {
+                8 => Some(400.0),
+                24 => Some(720.0),
+                32 => Some(480.0),
+                40 => Some(320.0),
+                _ => None,
+            };
+            if let Some(want) = want {
+                assert_eq!(stats.speed(origin.elapsed()), Some(want), "step {step}");
+            }
+        }
+        assert_eq!(total, 4800, "monotonic deltas count each body byte once");
+        assert!(samples <= 40, "sampling is bounded to four events/second");
+        assert!(!task.is_finished(), "server response is still blocked");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "completed body cannot republish old bytes during response wait"
+        );
+        assert_eq!(stats.speed(origin.elapsed()), None);
+        release.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "response completion is not another payload sample"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn payload_sampling_never_blocks_on_a_full_event_channel() {
+        let job = telemetry_job();
+        let meter = Arc::new(BodyMeter::new(100));
+        let outgoing = meter.clone();
+        let request = async move {
+            for _ in 0..100 {
+                outgoing.record(1);
+                tokio::time::sleep(PAYLOAD_INTERVAL).await;
+            }
+            Err(AppError::Network)
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            observe_payload(request, meter, &job, Instant::now(), 0, &tx).await
+        });
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            tokio::time::advance(PAYLOAD_INTERVAL).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            task.is_finished(),
+            "a silent consumer must not hold request settlement"
+        );
+        assert_eq!(rx.len(), 1);
+        assert_eq!(task.await.unwrap(), Err(AppError::Network));
+    }
 }

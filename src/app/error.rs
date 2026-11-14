@@ -30,6 +30,9 @@ pub enum AppError {
     Http(&'static str),
     #[error("network transport failed")]
     Network,
+    /// A durable safe-operation budget needs an explicit user retry.
+    #[error("upload retry budget exhausted")]
+    RetryExhausted,
     #[error("TLS verification or negotiation failed")]
     Tls,
     #[error("invalid server protocol: {0}")]

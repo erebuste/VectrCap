@@ -75,6 +75,179 @@ fn known(h: &History, j: &UploadJob) {
     h.transition(j.id, JobStatus::Interrupted).unwrap();
 }
 #[tokio::test]
+async fn crash_seeded_exhausted_budgets_remain_explicit_retry_eligible() {
+    use vectrcap::vectr::queue::{QueueCommand as C, QueueController, QueueEffect as E};
+    for operation in ["piece.0", "complete", "status"] {
+        let f = Fixture::new(vec![]).await;
+        let (t, h, s, j, _u) = setup(&f, b"abc");
+        h.transition(j.id, JobStatus::Running).unwrap();
+        h.set_session(j.id, ID.parse().unwrap()).unwrap();
+        h.set_upload_retry(j.id, operation, 5, 0).unwrap();
+        let reopened = Arc::new(History::open(&t.path().join("history.db")).unwrap());
+        let mut q = QueueController::new(reopened.clone()).unwrap();
+        let job = q
+            .handle(C::Admit(j.id))
+            .into_iter()
+            .find_map(|e| match e {
+                E::Start(j) => Some(*j),
+                _ => None,
+            })
+            .unwrap();
+        let root = f.root.clone();
+        let u = Uploader::new(
+            reopened.clone(),
+            s,
+            Arc::new(move |d: &DestinationSnapshot| {
+                VectrClient::with_root_certificate(
+                    d.origin.clone(),
+                    vectrcap::vectr::client::UploadToken::new("synthetic".into()).unwrap(),
+                    root.clone(),
+                )
+            }),
+        );
+        let error = run(&u, job.clone()).await.unwrap_err();
+        assert_eq!(
+            reopened.job(j.id).unwrap().unwrap().status,
+            JobStatus::Failed {
+                code: "retry_exhausted".into()
+            },
+            "{operation}: {error:?}"
+        );
+        assert!(
+            f.log().is_empty(),
+            "no recovery request before explicit Retry"
+        );
+        q.handle(C::Settled {
+            job: job.id,
+            attempt: job.attempt,
+            result: Err(error),
+        });
+        q.handle(C::PauseAll);
+        let deadline = i64::MAX / 2;
+        reopened
+            .set_upload_retry(j.id, operation, 5, deadline)
+            .unwrap();
+        q.handle(C::RetryEligible);
+        assert_eq!(
+            reopened.job(j.id).unwrap().unwrap().status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            reopened.upload_retry(j.id, operation).unwrap(),
+            Some((0, deadline))
+        );
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn recovered_exhaustion_offers_explicit_retry_before_cooldown_expires() {
+    use vectrcap::vectr::queue::{QueueCommand as C, QueueController, QueueEffect as E};
+    for operation in ["piece.0", "complete", "status"] {
+        let f = Fixture::new(vec![]).await;
+        let (t, h, s, j, _u) = setup(&f, b"abc");
+        h.transition(j.id, JobStatus::Running).unwrap();
+        h.set_session(j.id, ID.parse().unwrap()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let deadline = now + 120_000;
+        h.set_upload_retry(j.id, operation, 5, deadline).unwrap();
+        let reopened = Arc::new(History::open(&t.path().join("history.db")).unwrap());
+        let mut q = QueueController::new(reopened.clone()).unwrap();
+        let job = q
+            .handle(C::Admit(j.id))
+            .into_iter()
+            .find_map(|e| match e {
+                E::Start(j) => Some(*j),
+                _ => None,
+            })
+            .unwrap();
+        let root = f.root.clone();
+        let u = Uploader::new(
+            reopened.clone(),
+            s,
+            Arc::new(move |d: &DestinationSnapshot| {
+                VectrClient::with_root_certificate(
+                    d.origin.clone(),
+                    vectrcap::vectr::client::UploadToken::new("synthetic".into()).unwrap(),
+                    root.clone(),
+                )
+            }),
+        );
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), run(&u, job.clone())).await;
+        assert!(
+            result.is_ok(),
+            "{operation}: exhaustion must offer Retry without waiting out the persisted cooldown"
+        );
+        let error = result.unwrap().unwrap_err();
+        assert_eq!(
+            reopened.job(j.id).unwrap().unwrap().status,
+            JobStatus::Failed {
+                code: "retry_exhausted".into()
+            }
+        );
+        assert!(f.log().is_empty());
+        q.handle(C::Settled {
+            job: job.id,
+            attempt: job.attempt,
+            result: Err(error),
+        });
+        q.handle(C::PauseAll);
+        q.handle(C::RetryEligible);
+        assert_eq!(
+            reopened.job(j.id).unwrap().unwrap().status,
+            JobStatus::Pending
+        );
+        assert_eq!(
+            reopened.upload_retry(j.id, operation).unwrap(),
+            Some((0, deadline))
+        );
+    }
+}
+#[tokio::test]
+async fn payload_is_sampled_before_delayed_response_without_response_wait_time() {
+    let (reply, arrived, release) = Reply::json(204, "").blocked();
+    let f = Fixture::new(vec![
+        Reply::json(200, r#"{"chunkBytes":3,"received":[]}"#),
+        reply,
+        Reply::json(200, RECEIPT),
+    ])
+    .await;
+    let (_t, h, _s, j, u) = setup(&f, b"abc");
+    known(&h, &j);
+    let (tx, mut rx) = mpsc::channel(32);
+    let task = tokio::spawn(async move { u.run(j, CancellationToken::new(), tx).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(10)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let mut samples = vec![];
+    while let Ok(event) = rx.try_recv() {
+        if let vectrcap::vectr::uploader::UploadEvent::Payload { bytes, elapsed, .. } = event {
+            samples.push((bytes, elapsed));
+        }
+    }
+    assert_eq!(
+        samples.iter().map(|(bytes, _)| *bytes).sum::<u64>(),
+        3,
+        "outgoing body must be observed while response is blocked"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|(_, elapsed)| *elapsed < std::time::Duration::from_secs(1)),
+        "response waiting is not body transfer time"
+    );
+    tokio::time::resume();
+    release.add_permits(1);
+    task.await.unwrap().unwrap();
+}
+#[tokio::test]
 async fn resumes_only_missing_pieces() {
     let f = Fixture::new(vec![
         Reply::json(200, r#"{"chunkBytes":3,"received":[0,2]}"#),
@@ -368,6 +541,7 @@ async fn approved_schema_v1_upgrades_additively_without_retargeting_jobs() {
     h.set_job_paused(j.id, true).unwrap();
     let before = h.job(j.id).unwrap().unwrap();
     let c = rusqlite::Connection::open(t.path().join("history.db")).unwrap();
+    remove_schema_v3(&c);
     c.execute_batch("DROP TABLE upload_retry; PRAGMA user_version=1;")
         .unwrap();
     drop(c);
@@ -378,6 +552,48 @@ async fn approved_schema_v1_upgrades_additively_without_retargeting_jobs() {
         reopened.upload_retry(j.id, "piece.0").unwrap(),
         Some((1, 123))
     );
+}
+#[tokio::test]
+async fn approved_schema_v2_upgrades_queue_order_and_retries_without_archive_changes() {
+    let f = Fixture::new(vec![]).await;
+    let (t, h, _s, j, _u) = setup(&f, b"abc");
+    known(&h, &j);
+    h.set_job_paused(j.id, true).unwrap();
+    h.set_queue_paused(true).unwrap();
+    h.set_upload_retry(j.id, "piece.0", 5, 123456).unwrap();
+    let second = h.create_job(&j.artifact, &j.destination).unwrap();
+    let before = h.job(j.id).unwrap().unwrap();
+    let c = rusqlite::Connection::open(t.path().join("history.db")).unwrap();
+    let archive_schema = |c: &rusqlite::Connection| {
+        c.prepare("SELECT sql FROM sqlite_master WHERE name LIKE 'archive%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let archive_before = archive_schema(&c);
+    remove_schema_v3(&c);
+    c.execute_batch("PRAGMA user_version=2; UPDATE jobs SET created_ms=1;")
+        .unwrap();
+    let reopened = History::open(&t.path().join("history.db")).unwrap();
+    assert_eq!(reopened.job(j.id).unwrap().unwrap(), before);
+    assert!(reopened.queue_paused().unwrap());
+    assert_eq!(
+        reopened.upload_retry(j.id, "piece.0").unwrap(),
+        Some((5, 123456))
+    );
+    assert_eq!(archive_schema(&c), archive_before);
+    assert!(!reopened.upload_cancel_requested(j.id).unwrap());
+    reopened.set_job_paused(j.id, false).unwrap();
+    assert_eq!(reopened.next_upload().unwrap().unwrap().id, j.id);
+    reopened.transition(j.id, JobStatus::Cancelled).unwrap();
+    let third = reopened.create_job(&j.artifact, &j.destination).unwrap();
+    assert_eq!(reopened.next_upload().unwrap().unwrap().id, second.id);
+    reopened
+        .transition(second.id, JobStatus::Cancelled)
+        .unwrap();
+    assert_eq!(reopened.next_upload().unwrap().unwrap().id, third.id);
 }
 #[tokio::test]
 async fn ambiguous_completion_status_query_uses_bounded_rate_limit_recovery() {

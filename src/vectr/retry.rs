@@ -14,6 +14,7 @@ pub fn eligible(error: &AppError) -> bool {
 }
 pub fn failure_code(error: &AppError) -> &'static str {
     match error {
+        AppError::RetryExhausted => "retry_exhausted",
         AppError::HttpStatus { code: 404, .. } => "expired",
         AppError::HttpStatus {
             code: 401 | 403, ..
