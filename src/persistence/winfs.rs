@@ -21,7 +21,8 @@ use std::ptr;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -31,10 +32,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
     FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
-    FileDispositionInfo, FileDispositionInfoEx, FileIdInfo, FileRenameInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
+    FileDispositionInfoEx, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -264,42 +264,55 @@ fn nt_open(
             0,
         )
     };
+    nt_result(status)?;
+    // SAFETY: NtCreateFile succeeded, so `handle` is a new handle we now own.
+    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
+}
+
+fn nt_result(status: i32) -> io::Result<()> {
     if status < 0 {
         // SAFETY: pure status-code translation.
         let code = unsafe { RtlNtStatusToDosError(status) };
         return Err(io::Error::from_raw_os_error(code as i32));
     }
-    // SAFETY: NtCreateFile succeeded, so `handle` is a new handle we now own.
-    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
+    Ok(())
 }
 
-/// Renames the open `file` to `name` inside `dir` without replacing an
-/// existing entry (`AlreadyExists`). The object renamed is the one the handle
-/// refers to; no pathname is reopened.
-pub(crate) fn rename_in(file: &File, dir: &File, name: &str) -> io::Result<()> {
+/// Renames the open `file` to `name` in the directory it is already in,
+/// never replacing an existing entry (`AlreadyExists`). The object renamed is
+/// the one the handle refers to; no pathname is resolved. Per the
+/// FILE_RENAME_INFORMATION contract, a NULL `RootDirectory` with a bare name
+/// renames within the current directory. (Win32 `SetFileInformationByHandle`
+/// would instead resolve a relative name against the process's current
+/// directory, so the native call is used.) Callers keep that directory open
+/// without delete sharing, so it cannot be moved meanwhile.
+pub(crate) fn rename_in_place(file: &File, name: &str) -> io::Result<()> {
     check_component(name)?;
     let wide: Vec<u16> = name.encode_utf16().collect();
-    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-    let size = offset + (wide.len() + 1) * 2;
+    let size = size_of::<FILE_RENAME_INFORMATION>() + (wide.len() + 1) * 2;
     let mut buf = vec![0u64; size.div_ceil(8)];
-    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut status_block = IO_STATUS_BLOCK::default();
     // SAFETY: `buf` is zeroed, 8-byte aligned, and large enough for the header
-    // plus `wide` and a NUL; both handles are open for the call's duration.
-    let ok = unsafe {
+    // plus `wide` and a NUL; the file handle is open for the call's duration.
+    let status = unsafe {
         (*info).Anonymous.ReplaceIfExists = false;
-        (*info).RootDirectory = dir.as_raw_handle();
+        (*info).RootDirectory = ptr::null_mut();
         (*info).FileNameLength = (wide.len() * 2) as u32;
         ptr::copy_nonoverlapping(
             wide.as_ptr(),
             (&raw mut (*info).FileName).cast::<u16>(),
             wide.len(),
         );
-        SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfo, info.cast(), size as u32)
+        NtSetInformationFile(
+            file.as_raw_handle(),
+            &mut status_block,
+            info.cast(),
+            size as u32,
+            FileRenameInformation,
+        )
     };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    nt_result(status)
 }
 
 fn set_info<T>(file: &File, class: FILE_INFO_BY_HANDLE_CLASS, value: &T) -> io::Result<()> {
@@ -340,7 +353,11 @@ pub(crate) fn delete_by_handle(file: &File) -> io::Result<()> {
         perms.set_readonly(false);
         file.set_permissions(perms)?;
     }
-    let result = set_info(file, FileDispositionInfo, &FILE_DISPOSITION_INFO { DeleteFile: true });
+    let result = set_info(
+        file,
+        FileDispositionInfo,
+        &FILE_DISPOSITION_INFO { DeleteFile: true },
+    );
     if result.is_err() && readonly {
         let mut perms = file.metadata()?.permissions();
         perms.set_readonly(true);
@@ -372,5 +389,58 @@ pub(crate) fn final_path(file: &File) -> io::Result<String> {
             n if n <= 32 * 1024 => buf.resize(n + 1, 0),
             _ => return Err(invalid("path too long")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use super::*;
+
+    #[test]
+    fn relative_create_write_rename_and_delete_by_handle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = open_root(dir.path()).unwrap();
+        let month = open_child_dir(&root, "2026-11", true).unwrap();
+        let mut file = create_child_file(&month, "partial").unwrap();
+        file.write_all(b"bytes").unwrap();
+        file.sync_all().unwrap();
+        let id = identity(&file).unwrap();
+        assert_eq!(FileIdentity::from_bytes(&id.to_bytes()), Some(id));
+
+        fs_write(&dir.path().join("2026-11").join("taken"));
+        let taken = rename_in_place(&file, "taken").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists, "{taken:?}");
+        rename_in_place(&file, "final.png").unwrap();
+        let published = dir.path().join("2026-11").join("final.png");
+        assert!(published.exists() && !dir.path().join("2026-11").join("partial").exists());
+
+        // While the writer handle lives, a second owner (DELETE access) is refused.
+        let busy = open_child_file(&month, "final.png").unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(ERROR_SHARING_VIOLATION));
+        drop(file);
+        let mut reopened = open_child_file(&month, "final.png").unwrap();
+        assert_eq!(
+            identity(&reopened).unwrap(),
+            id,
+            "rename keeps the file identity"
+        );
+        let mut bytes = Vec::new();
+        reopened.seek(SeekFrom::Start(0)).unwrap();
+        reopened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"bytes");
+        delete_by_handle(&reopened).unwrap();
+        drop(reopened);
+        assert!(!published.exists());
+        assert!(dir.path().join("2026-11").join("taken").exists());
+
+        for bad in ["", ".", "..", r"a\b", "a/b", "x:y", "a*"] {
+            assert!(open_child_dir(&root, bad, true).is_err(), "{bad:?}");
+        }
+    }
+
+    fn fs_write(path: &Path) {
+        std::fs::write(path, b"other").unwrap();
     }
 }

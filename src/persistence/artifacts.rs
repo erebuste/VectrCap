@@ -334,8 +334,7 @@ mod tests {
 
     use super::*;
     use crate::persistence::test_support::{
-        assert_sharing_violations, clear_hook, junction, make_writable, mutation_attempts,
-        set_hook,
+        assert_sharing_violations, clear_hook, junction, make_writable, mutation_attempts, set_hook,
     };
 
     fn fixture() -> (TempDir, ArtifactStore) {
@@ -458,7 +457,9 @@ mod tests {
         assert!(is_local_final_path(r"\\?\C:\Users\me\a.png"));
         assert!(is_local_final_path(r"\\?\d:\x"));
         assert!(!is_local_final_path(r"\\?\UNC\server\share\a.png"));
-        assert!(!is_local_final_path(r"\\?\Volume{0f1e2d3c-0000-0000-0000-000000000000}\a"));
+        assert!(!is_local_final_path(
+            r"\\?\Volume{0f1e2d3c-0000-0000-0000-000000000000}\a"
+        ));
         assert!(!is_local_final_path(r"\\?\GLOBALROOT\Device\X\a"));
         assert!(!is_local_final_path(r"C:\not-normalized"));
 

@@ -12,7 +12,8 @@ use crate::app::error::AppError;
 use crate::app::types::{Artifact, ArtifactId, ArtifactKind, JobId, UploadReceipt};
 use crate::persistence::archive::{ArchiveEntry, ArchiveEntryId, ArchiveOrigin};
 use crate::persistence::settings::{LinkOrigin, ServerOrigin};
-use crate::persistence::{local_from_ms, now_ms};
+use crate::persistence::winfs::FileIdentity;
+use crate::persistence::{PARTIAL_PREFIX, local_from_ms, now_ms};
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -69,8 +70,26 @@ CREATE TABLE archive_entries (
     origin TEXT NOT NULL CHECK (origin IN ('automatic', 'manual')),
     size INTEGER NOT NULL CHECK (size >= 0),
     sha256 BLOB NOT NULL CHECK (length(sha256) = 32),
+    -- Volume serial + file ID of the bound root directory and of the published file.
+    root_identity BLOB NOT NULL CHECK (length(root_identity) = 24),
+    file_identity BLOB NOT NULL CHECK (length(file_identity) = 24),
     created_ms INTEGER NOT NULL,
     removed_ms INTEGER
+) STRICT;
+
+-- Durable write intent for an archive copy in progress: recorded before the
+-- partial file `.vectrcap-partial-<id>` is created, removed atomically with the
+-- ownership record. Startup recovery acts only on files these rows prove ours.
+CREATE TABLE archive_intents (
+    id TEXT PRIMARY KEY NOT NULL,
+    root TEXT NOT NULL,
+    root_identity BLOB NOT NULL CHECK (length(root_identity) = 24),
+    month TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    sha256 BLOB NOT NULL CHECK (length(sha256) = 32),
+    file_identity BLOB CHECK (file_identity IS NULL OR length(file_identity) = 24),
+    final_name TEXT,
+    created_ms INTEGER NOT NULL
 ) STRICT;
 CREATE UNIQUE INDEX archive_live_path ON archive_entries(path) WHERE removed_ms IS NULL;
 -- Release passes page live automatic entries per root in (created_ms, id) order.
@@ -284,7 +303,8 @@ impl History {
     ) -> Result<(), AppError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(String, i64, Option<String>, Option<String>, Option<String>)> = tx
+        type ReceiptRow = (String, i64, Option<String>, Option<String>, Option<String>);
+        let row: Option<ReceiptRow> = tx
             .query_row(
                 "SELECT status, attempt, session_id, receipt_url, receipt_name FROM jobs WHERE id = ?1",
                 params![id.0.to_string()],
@@ -429,11 +449,16 @@ impl History {
         .map(|ids| ids.into_iter().map(ArtifactId).collect())
     }
 
+    /// Records ownership of a published archive file (with the identities of
+    /// its bound root and of the file itself) and retires its write intent,
+    /// in one transaction.
     pub(crate) fn record_archive(
         &self,
         artifact: &Artifact,
         entry: &ArchiveEntry,
         created_ms: i64,
+        intent: &ArchiveIntent,
+        file_identity: FileIdentity,
     ) -> Result<(), AppError> {
         let utf8 = |p: &Path| {
             p.to_str()
@@ -451,8 +476,9 @@ impl History {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_artifact(&tx, artifact, created_ms)?;
         tx.execute(
-            "INSERT INTO archive_entries (id, artifact_id, root, path, origin, size, sha256, created_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO archive_entries (id, artifact_id, root, path, origin, size, sha256, \
+             root_identity, file_identity, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 entry.id.0.to_string(),
                 entry.artifact_id.0.to_string(),
@@ -461,11 +487,107 @@ impl History {
                 origin,
                 size,
                 entry.sha256.as_slice(),
+                intent.root_identity.to_bytes().as_slice(),
+                file_identity.to_bytes().as_slice(),
                 created_ms,
             ],
         )?;
+        tx.execute(
+            "DELETE FROM archive_intents WHERE id = ?1",
+            params![intent.id.to_string()],
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Inserts or updates a write intent (durable before the next file step).
+    pub(crate) fn save_archive_intent(&self, intent: &ArchiveIntent) -> Result<(), AppError> {
+        let size = i64::try_from(intent.size)
+            .map_err(|_| AppError::InvalidInput("archive file is too large"))?;
+        self.lock()?.execute(
+            "INSERT OR REPLACE INTO archive_intents (id, root, root_identity, month, size, sha256, \
+             file_identity, final_name, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                intent.id.to_string(),
+                intent.root,
+                intent.root_identity.to_bytes().as_slice(),
+                intent.month,
+                size,
+                intent.sha256.as_slice(),
+                intent.file_identity.map(|i| i.to_bytes().to_vec()),
+                intent.final_name,
+                now_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn drop_archive_intent(&self, id: Uuid) -> Result<(), AppError> {
+        self.lock()?.execute(
+            "DELETE FROM archive_intents WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// A bounded page of outstanding write intents after `after` (by ID).
+    pub(crate) fn archive_intents_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<ArchiveIntent>, AppError> {
+        type Row = (
+            String,
+            String,
+            Vec<u8>,
+            String,
+            i64,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = {
+            let conn = self.lock()?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, root, root_identity, month, size, sha256, file_identity, final_name \
+                 FROM archive_intents WHERE id > ?1 ORDER BY id LIMIT ?2",
+            )?;
+            stmt.query_map(
+                params![
+                    after.map(|a| a.to_string()).unwrap_or_default(),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )?
+            .collect::<Result<_, _>>()?
+        };
+        rows.into_iter()
+            .map(
+                |(id, root, root_id, month, size, sha, file_id, final_name)| {
+                    Ok(ArchiveIntent {
+                        id: parse_uuid(&id)?,
+                        root,
+                        root_identity: identity_col(root_id)?,
+                        month,
+                        size: u64::try_from(size).map_err(|_| corrupt())?,
+                        sha256: sha.try_into().map_err(|_| corrupt())?,
+                        file_identity: file_id.map(identity_col).transpose()?,
+                        final_name,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// One bounded page of live automatic entries under `root` that `rule`
@@ -494,34 +616,42 @@ impl History {
                 ],
                 |r| {
                     Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
+                        (
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ),
                         r.get::<_, i64>(4)?,
                         r.get::<_, Vec<u8>>(5)?,
                         r.get::<_, i64>(6)?,
+                        r.get::<_, Vec<u8>>(7)?,
+                        r.get::<_, Vec<u8>>(8)?,
                     ))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?
         };
         rows.into_iter()
-            .map(|(id, artifact, root, path, size, sha, created)| {
-                Ok(ArchiveCandidate {
-                    created_ms: created,
-                    entry: ArchiveEntry {
-                        id: ArchiveEntryId(parse_uuid(&id)?),
-                        artifact_id: ArtifactId(parse_uuid(&artifact)?),
-                        root: PathBuf::from(root),
-                        path: PathBuf::from(path),
-                        origin: ArchiveOrigin::Automatic,
-                        created_at: local_from_ms(created)?,
-                        size: u64::try_from(size).map_err(|_| corrupt())?,
-                        sha256: sha.try_into().map_err(|_| corrupt())?,
-                    },
-                })
-            })
+            .map(
+                |((id, artifact, root, path), size, sha, created, root_id, file_id)| {
+                    Ok(ArchiveCandidate {
+                        created_ms: created,
+                        root_identity: identity_col(root_id)?,
+                        file_identity: identity_col(file_id)?,
+                        entry: ArchiveEntry {
+                            id: ArchiveEntryId(parse_uuid(&id)?),
+                            artifact_id: ArtifactId(parse_uuid(&artifact)?),
+                            root: PathBuf::from(root),
+                            path: PathBuf::from(path),
+                            origin: ArchiveOrigin::Automatic,
+                            created_at: local_from_ms(created)?,
+                            size: u64::try_from(size).map_err(|_| corrupt())?,
+                            sha256: sha.try_into().map_err(|_| corrupt())?,
+                        },
+                    })
+                },
+            )
             .collect()
     }
 
@@ -588,7 +718,8 @@ pub(crate) struct ReleaseRule {
 /// Params: ?1 root, ?2 created_ms cutoff, ?3 require uploaded, ?4/?5 keyset
 /// after `(created_ms, id)`, ?6 limit. Served by `archive_live_auto` in
 /// `(root, created_ms, id)` order, so no sort or full scan is needed.
-pub(crate) const ARCHIVE_PAGE_SQL: &str = "SELECT e.id, e.artifact_id, e.root, e.path, e.size, e.sha256, e.created_ms \
+pub(crate) const ARCHIVE_PAGE_SQL: &str = "SELECT e.id, e.artifact_id, e.root, e.path, e.size, e.sha256, e.created_ms, \
+     e.root_identity, e.file_identity \
      FROM archive_entries e \
      WHERE e.removed_ms IS NULL AND e.origin = 'automatic' AND e.root = ?1 AND e.created_ms <= ?2 \
      AND (e.created_ms, e.id) > (?4, ?5) \
@@ -602,6 +733,33 @@ pub(crate) const ARCHIVE_PAGE_SQL: &str = "SELECT e.id, e.artifact_id, e.root, e
 pub(crate) struct ArchiveCandidate {
     pub created_ms: i64,
     pub entry: ArchiveEntry,
+    pub root_identity: FileIdentity,
+    pub file_identity: FileIdentity,
+}
+
+/// One archive copy in progress (see the `archive_intents` table).
+#[derive(Debug, Clone)]
+pub(crate) struct ArchiveIntent {
+    pub id: Uuid,
+    pub root: String,
+    pub root_identity: FileIdentity,
+    pub month: String,
+    pub size: u64,
+    pub sha256: [u8; 32],
+    /// Identity of the partial file once it exists.
+    pub file_identity: Option<FileIdentity>,
+    /// Name being published; set before each no-clobber rename attempt.
+    pub final_name: Option<String>,
+}
+
+impl ArchiveIntent {
+    pub(crate) fn partial_name(&self) -> String {
+        format!("{PARTIAL_PREFIX}{}", self.id.simple())
+    }
+}
+
+fn identity_col(bytes: Vec<u8>) -> Result<FileIdentity, AppError> {
+    FileIdentity::from_bytes(&bytes).ok_or_else(corrupt)
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), AppError> {
@@ -831,8 +989,9 @@ mod tests {
                 .unwrap();
             self.conn
                 .execute(
-                    "INSERT INTO archive_entries (id, artifact_id, root, path, origin, size, sha256, created_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1, zeroblob(32), ?6)",
+                    "INSERT INTO archive_entries (id, artifact_id, root, path, origin, size, sha256, \
+                     root_identity, file_identity, created_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, zeroblob(32), zeroblob(24), zeroblob(24), ?6)",
                     params![id, artifact, root, format!(r"{root}\2026-11\{}.png", self.n), origin, created_ms],
                 )
                 .unwrap();
@@ -846,7 +1005,12 @@ mod tests {
                      dest_credential_generation, status, created_ms, updated_ms) \
                      SELECT ?1, artifact_id, ?2, 'Phone', 'https://vectr.example', 1, ?3, 0, 0 \
                      FROM archive_entries WHERE id = ?4",
-                    params![Uuid::new_v4().to_string(), Uuid::new_v4().to_string(), status, entry],
+                    params![
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        status,
+                        entry
+                    ],
                 )
                 .unwrap();
         }
@@ -857,10 +1021,17 @@ mod tests {
         let mut after = None;
         loop {
             let page = h.archive_page(r"C:\R", rule, after, limit).unwrap();
-            assert!(page.len() <= limit, "page of {} exceeds limit {limit}", page.len());
+            assert!(
+                page.len() <= limit,
+                "page of {} exceeds limit {limit}",
+                page.len()
+            );
             let Some(last) = page.last() else { break };
             after = Some((last.created_ms, last.entry.id));
-            seen.extend(page.iter().map(|c| (c.created_ms, c.entry.id.0.to_string())));
+            seen.extend(
+                page.iter()
+                    .map(|c| (c.created_ms, c.entry.id.0.to_string())),
+            );
         }
         seen
     }
@@ -870,7 +1041,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("history.sqlite3");
         let history = History::open(&db).unwrap();
-        let mut rows = Rows { conn: Connection::open(&db).unwrap(), n: 0 };
+        let mut rows = Rows {
+            conn: Connection::open(&db).unwrap(),
+            n: 0,
+        };
 
         let mut eligible: Vec<(i64, String)> = [10, 10, 10, 20, 20, 30, 40]
             .into_iter()
@@ -882,12 +1056,18 @@ mod tests {
         rows.entry(r"C:\R", "automatic", 50); // newer than the cutoff
         let removed = rows.entry(r"C:\R", "automatic", 5);
         rows.conn
-            .execute("UPDATE archive_entries SET removed_ms = 1 WHERE id = ?1", params![removed])
+            .execute(
+                "UPDATE archive_entries SET removed_ms = 1 WHERE id = ?1",
+                params![removed],
+            )
             .unwrap();
         let active = rows.entry(r"C:\R", "automatic", 5);
         rows.job(&active, "failed");
 
-        let age = ReleaseRule { created_at_or_before_ms: 45, require_uploaded: false };
+        let age = ReleaseRule {
+            created_at_or_before_ms: 45,
+            require_uploaded: false,
+        };
         for limit in [1, 2, 3, 64] {
             assert_eq!(all_pages(&history, age, limit), eligible, "limit {limit}");
         }
@@ -895,7 +1075,10 @@ mod tests {
         // Upload reconciliation additionally needs a confirmed upload.
         rows.job(&eligible[1].1, "completed");
         rows.job(&eligible[4].1, "completed");
-        let uploaded = ReleaseRule { created_at_or_before_ms: i64::MAX, require_uploaded: true };
+        let uploaded = ReleaseRule {
+            created_at_or_before_ms: i64::MAX,
+            require_uploaded: true,
+        };
         assert_eq!(
             all_pages(&history, uploaded, 1),
             vec![eligible[1].clone(), eligible[4].clone()]
@@ -906,7 +1089,9 @@ mod tests {
             .conn
             .prepare(&format!("EXPLAIN QUERY PLAN {ARCHIVE_PAGE_SQL}"))
             .unwrap()
-            .query_map(params![r"C:\R", 45, false, i64::MIN, "", 2], |r| r.get::<_, String>(3))
+            .query_map(params![r"C:\R", 45, false, i64::MIN, "", 2], |r| {
+                r.get::<_, String>(3)
+            })
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();

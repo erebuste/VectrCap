@@ -1,7 +1,7 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::iter;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, TimeDelta};
@@ -9,13 +9,13 @@ use uuid::Uuid;
 
 use crate::app::error::AppError;
 use crate::app::types::{Artifact, ArtifactId, ArtifactKind};
-use crate::persistence::filename::{persist_new, random_suffix, validate_file_name};
-use crate::persistence::history::{History, ReleaseRule};
-use crate::persistence::settings::{ArchivePolicy, StorageMode};
-use crate::persistence::{
-    PARTIAL_PREFIX, copy_hashing, ensure_free_space, fingerprint, local_from_ms, now_ms,
-    open_no_follow, remove_owned_file,
+use crate::persistence::filename::{
+    FilenamePreset, MAX_NAME_ATTEMPTS, OutputFormat, random_suffix, validate_file_name,
 };
+use crate::persistence::history::{ArchiveCandidate, ArchiveIntent, History, ReleaseRule};
+use crate::persistence::settings::{ArchivePolicy, StorageMode};
+use crate::persistence::winfs::{self, ERROR_SHARING_VIOLATION, FileIdentity};
+use crate::persistence::{copy_hashing, ensure_free_space, hook, local_from_ms, now_ms};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArchiveEntryId(pub Uuid);
@@ -28,7 +28,8 @@ pub enum ArchiveOrigin {
     Manual,
 }
 
-/// Ownership record for one archive file the app created.
+/// Ownership record for one archive file the app created. The database also
+/// records the file's identity (volume + file ID) and that of the bound root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEntry {
     pub id: ArchiveEntryId,
@@ -49,25 +50,51 @@ pub struct CleanupReport {
     pub removed: usize,
     /// Became referenced by an unfinished job before the delete committed.
     pub kept_active: usize,
+    /// Different bytes, a different (replacement) file, or not a regular file.
     pub kept_modified: usize,
     pub kept_missing: usize,
+    /// The configured root path now names a different folder.
     pub kept_other_root: usize,
+    /// Open in another program without delete sharing; retried next pass.
+    pub kept_in_use: usize,
 }
 
-/// Rows fetched per release query; bounds memory and connection-lock time.
-const RELEASE_PAGE: usize = 64;
+/// Rows fetched per query; bounds memory and connection-lock time.
+const PAGE: usize = 64;
+const SAVING: &str = "writing the archive copy";
 
 /// User-visible dated archive (`<root>/YYYY-MM/<name>`). Independent of the
 /// upload spool: editing, moving, or deleting archive files never affects
 /// queued uploads, and cleanup only touches unchanged files it recorded.
+///
+/// Every operation binds the configured root once by path (a redirected
+/// Pictures folder is a legitimate root) and reaches the month folder and
+/// files only relative to that handle, refusing descendant reparse points.
+/// Files are published, verified, and deleted through one handle that
+/// denies other writers, renames, and deletes for as long as it is held.
 pub struct ArchiveStore {
     history: Arc<History>,
     root: PathBuf,
+    /// Regenerates a bounded name (fresh `{id}`) when the bound name collides.
+    preset: FilenamePreset,
+}
+
+/// What startup recovery concluded about one write intent.
+enum Recovery {
+    Removed,
+    /// Nothing (left) to do; the intent can be retired without touching files.
+    Settled,
+    /// Possibly still in use or temporarily unreachable; keep the intent.
+    Retry,
 }
 
 impl ArchiveStore {
-    pub fn new(history: Arc<History>, root: PathBuf) -> Self {
-        ArchiveStore { history, root }
+    pub fn new(history: Arc<History>, root: PathBuf, preset: FilenamePreset) -> Self {
+        ArchiveStore {
+            history,
+            root,
+            preset,
+        }
     }
 
     /// Automatic (policy) copy of a finalized screenshot/recording.
@@ -123,24 +150,29 @@ impl ArchiveStore {
         )
     }
 
-    /// Walks eligible entries in bounded `(created_ms, id)` keyset pages. A
-    /// page only nominates candidates; eligibility is rechecked at commit.
-    fn release(&self, root: &Path, rule: ReleaseRule) -> Result<CleanupReport, AppError> {
-        let mut report = CleanupReport::default();
-        let root_text = root.to_str().ok_or(AppError::InvalidInput(
-            "archive path must be valid Unicode",
-        ))?;
+    /// Startup recovery for interrupted archive writes (bounded pages of
+    /// durable write intents). Deletes only the intent's own partial, or its
+    /// published-but-unrecorded file when identity and bytes still match, via
+    /// the verified handle. Foreign, replaced, or still-open files are kept.
+    /// Returns the number of files removed.
+    pub fn recover_partials(&self) -> Result<usize, AppError> {
+        let mut removed = 0;
         let mut after = None;
         loop {
-            let page = self
-                .history
-                .archive_page(root_text, rule, after, RELEASE_PAGE)?;
+            let page = self.history.archive_intents_page(after, PAGE)?;
             let Some(last) = page.last() else {
-                return Ok(report);
+                return Ok(removed);
             };
-            after = Some((last.created_ms, last.entry.id));
-            for candidate in &page {
-                self.remove_if_unchanged(&candidate.entry, root, rule, &mut report)?;
+            after = Some(last.id);
+            for intent in &page {
+                match recover_intent(intent)? {
+                    Recovery::Removed => {
+                        removed += 1;
+                        self.history.drop_archive_intent(intent.id)?;
+                    }
+                    Recovery::Settled => self.history.drop_archive_intent(intent.id)?,
+                    Recovery::Retry => {}
+                }
             }
         }
     }
@@ -151,111 +183,325 @@ impl ArchiveStore {
         captured_at: DateTime<Local>,
         origin: ArchiveOrigin,
     ) -> Result<ArchiveEntry, AppError> {
-        const STAGE: &str = "writing the archive copy";
         if source.kind == ArtifactKind::File {
             return Err(AppError::InvalidInput(
                 "only finalized captures and recordings are archived",
             ));
         }
-        if !self.root.is_absolute() {
-            return Err(AppError::InvalidInput(
-                "archive folder must be an absolute path",
-            ));
-        }
+        let root_text = self
+            .root
+            .to_str()
+            .filter(|_| self.root.is_absolute())
+            .ok_or(AppError::InvalidInput(
+                "archive folder must be an absolute Unicode path",
+            ))?;
         validate_file_name(&source.display_name)?;
-        let month_dir = self.root.join(captured_at.format("%Y-%m").to_string());
-        fs::create_dir_all(&month_dir)
+        let format = output_format(&source.display_name)?;
+        let month = captured_at.format("%Y-%m").to_string();
+
+        fs::create_dir_all(&self.root)
             .map_err(|e| AppError::io("creating the archive folder", &e))?;
-        ensure_free_space(&month_dir, source.size)?;
-
-        let mut src = open_no_follow(&source.path)
+        let root = winfs::open_root(&self.root)
+            .map_err(|e| AppError::io("opening the archive folder", &e))?;
+        let month_dir = winfs::open_child_dir(&root, &month, true)
+            .map_err(|e| dir_error("opening the archive month folder", &e))?;
+        ensure_free_space(&self.root, source.size)?;
+        let mut src = winfs::open_read_exclusive(&source.path)
             .map_err(|e| AppError::io("opening the staged file", &e))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(PARTIAL_PREFIX)
-            .tempfile_in(&month_dir)
-            .map_err(|e| AppError::io(STAGE, &e))?;
-        let (size, sha256) = copy_hashing(&mut src, tmp.as_file_mut(), source.size)
-            .map_err(|e| AppError::io(STAGE, &e))?;
-        if size != source.size || sha256 != source.sha256 {
-            return Err(AppError::ArtifactChanged);
-        }
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| AppError::io(STAGE, &e))?;
 
-        let name = source.display_name.as_str();
-        let (stem, ext) = name
-            .rsplit_once('.')
-            .map_or((name, None), |(s, e)| (s, Some(e)));
-        let mut candidates = iter::once(Ok(name.to_owned())).chain(iter::repeat_with(|| {
-            Ok(match ext {
-                Some(ext) => format!("{stem}_{}.{ext}", random_suffix()),
-                None => format!("{stem}_{}", random_suffix()),
-            })
-        }));
-        let (_, path) = persist_new(tmp, &month_dir, &mut candidates)?;
-
-        let created_ms = now_ms();
-        let entry = ArchiveEntry {
-            id: ArchiveEntryId(Uuid::new_v4()),
-            artifact_id: source.id,
-            root: self.root.clone(),
-            path,
-            origin,
-            created_at: local_from_ms(created_ms)?,
-            size,
-            sha256,
+        let mut intent = ArchiveIntent {
+            id: Uuid::new_v4(),
+            root: root_text.to_owned(),
+            root_identity: winfs::identity(&root).map_err(|e| AppError::io(SAVING, &e))?,
+            month,
+            size: source.size,
+            sha256: source.sha256,
+            file_identity: None,
+            final_name: None,
         };
-        if let Err(e) = self.history.record_archive(source, &entry, created_ms) {
-            // Never leave a file whose ownership was not recorded.
-            let _ = remove_owned_file(&entry.path);
-            return Err(e);
+        self.history.save_archive_intent(&intent)?;
+        let file = match winfs::create_child_file(&month_dir, &intent.partial_name()) {
+            Ok(file) => file,
+            Err(e) => {
+                let _ = self.history.drop_archive_intent(intent.id);
+                return Err(AppError::io(SAVING, &e));
+            }
+        };
+
+        let result = (|| {
+            let file_identity = winfs::identity(&file).map_err(|e| AppError::io(SAVING, &e))?;
+            intent.file_identity = Some(file_identity);
+            self.history.save_archive_intent(&intent)?;
+            hook("archive.partial_created");
+
+            let (size, sha256) = copy_hashing(&mut src, &mut &file, source.size)
+                .map_err(|e| AppError::io(SAVING, &e))?;
+            if size != source.size || sha256 != source.sha256 {
+                return Err(AppError::ArtifactChanged);
+            }
+            file.sync_all().map_err(|e| AppError::io(SAVING, &e))?;
+
+            // The bound name first; on collision a fresh, equally bounded
+            // name from the preset (never a suffix appended past the cap).
+            let names =
+                iter::once(Ok(source.display_name.clone())).chain(iter::repeat_with(|| {
+                    self.preset.render(captured_at, &random_suffix(), format)
+                }));
+            let mut published = None;
+            for name in names.take(MAX_NAME_ATTEMPTS) {
+                let name = name?;
+                validate_file_name(&name)?;
+                intent.final_name = Some(name.clone());
+                self.history.save_archive_intent(&intent)?;
+                match winfs::rename_in_place(&file, &name) {
+                    Ok(()) => {
+                        published = Some(name);
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(AppError::io(SAVING, &e)),
+                }
+            }
+            let name = published.ok_or(AppError::Io {
+                stage: "choosing a unique file name",
+                kind: io::ErrorKind::AlreadyExists,
+            })?;
+            hook("archive.published");
+
+            let created_ms = now_ms();
+            let entry = ArchiveEntry {
+                id: ArchiveEntryId(Uuid::new_v4()),
+                artifact_id: source.id,
+                root: self.root.clone(),
+                path: self.root.join(&intent.month).join(name),
+                origin,
+                created_at: local_from_ms(created_ms)?,
+                size,
+                sha256,
+            };
+            self.history
+                .record_archive(source, &entry, created_ms, &intent, file_identity)?;
+            Ok(entry)
+        })();
+
+        if result.is_err() {
+            // Never leave an unrecorded file: delete exactly the object this
+            // handle created (a swapped-in file cannot be reached). If that
+            // fails, the intent stays for startup recovery.
+            let deleted = winfs::delete_by_handle(&file).is_ok();
+            drop(file);
+            if deleted {
+                let _ = self.history.drop_archive_intent(intent.id);
+            }
         }
-        Ok(entry)
+        result
     }
 
-    fn remove_if_unchanged(
+    /// Walks eligible entries in bounded `(created_ms, id)` keyset pages. A
+    /// page only nominates candidates; eligibility is rechecked at commit.
+    fn release(&self, root_path: &Path, rule: ReleaseRule) -> Result<CleanupReport, AppError> {
+        let mut report = CleanupReport::default();
+        let root_text = root_path
+            .to_str()
+            .ok_or(AppError::InvalidInput("archive path must be valid Unicode"))?;
+        let root = match winfs::open_root(root_path) {
+            Ok(root) => root,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(report),
+            Err(e) => return Err(AppError::io("opening the archive folder", &e)),
+        };
+        let root_identity =
+            winfs::identity(&root).map_err(|e| AppError::io("opening the archive folder", &e))?;
+        let mut after = None;
+        loop {
+            let page = self.history.archive_page(root_text, rule, after, PAGE)?;
+            let Some(last) = page.last() else {
+                return Ok(report);
+            };
+            after = Some((last.created_ms, last.entry.id));
+            for candidate in &page {
+                self.release_one(
+                    candidate,
+                    root_path,
+                    &root,
+                    root_identity,
+                    rule,
+                    &mut report,
+                )?;
+            }
+        }
+    }
+
+    fn release_one(
         &self,
-        entry: &ArchiveEntry,
-        root: &Path,
+        candidate: &ArchiveCandidate,
+        root_path: &Path,
+        root: &File,
+        root_identity: FileIdentity,
         rule: ReleaseRule,
         report: &mut CleanupReport,
     ) -> Result<(), AppError> {
-        let inside_root = entry.path.parent().and_then(Path::parent) == Some(root);
-        if entry.root != root || !inside_root {
+        const CHECKING: &str = "checking an archive file";
+        let entry = &candidate.entry;
+        let Some((month, name)) = month_and_name(&entry.path, root_path) else {
+            report.kept_other_root += 1;
+            return Ok(());
+        };
+        if candidate.root_identity != root_identity {
             report.kept_other_root += 1;
             return Ok(());
         }
-        // ponytail: check-then-delete window; a handle-based delete would close it.
-        match fingerprint(&entry.path) {
-            Ok((size, hash)) if size == entry.size && hash == entry.sha256 => {}
-            Ok(_) => {
-                report.kept_modified += 1;
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                report.kept_missing += 1;
-                return Ok(());
-            }
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-                report.kept_modified += 1;
-                return Ok(());
-            }
-            Err(e) => return Err(AppError::io("checking an archive file", &e)),
+        let month_dir = match winfs::open_child_dir(root, month, false) {
+            Ok(dir) => dir,
+            Err(e) => return keep(e, report, CHECKING),
+        };
+        let file = match winfs::open_child_file(&month_dir, name) {
+            Ok(file) => file,
+            Err(e) => return keep(e, report, CHECKING),
+        };
+        // Same object (not just same bytes) and still the recorded bytes.
+        let same_object = winfs::identity(&file).map_err(|e| AppError::io(CHECKING, &e))?
+            == candidate.file_identity;
+        let unchanged = same_object && {
+            let (read, hash) = copy_hashing(&mut &file, &mut io::sink(), entry.size)
+                .map_err(|e| AppError::io(CHECKING, &e))?;
+            read == entry.size && hash == entry.sha256
+        };
+        if !unchanged {
+            report.kept_modified += 1;
+            return Ok(());
         }
-        crate::persistence::hook("cleanup.verified");
-        let removed = self
-            .history
-            .commit_archive_removal(entry.id, rule.require_uploaded, || {
-                remove_owned_file(&entry.path)
-                    .map_err(|e| AppError::io("removing an archive file", &e))
-            })?;
+        hook("cleanup.verified");
+        let removed =
+            self.history
+                .commit_archive_removal(entry.id, rule.require_uploaded, || {
+                    winfs::delete_by_handle(&file)
+                        .map_err(|e| AppError::io("removing an archive file", &e))
+                })?;
+        drop(file);
         if removed {
             report.removed += 1;
         } else {
             report.kept_active += 1;
         }
         Ok(())
+    }
+}
+
+/// Classifies a failed open of an archive descendant as a reason to keep it.
+fn keep(e: io::Error, report: &mut CleanupReport, stage: &'static str) -> Result<(), AppError> {
+    match e.kind() {
+        io::ErrorKind::NotFound => report.kept_missing += 1,
+        // A reparse point or non-regular object where ours used to be.
+        io::ErrorKind::InvalidInput => report.kept_modified += 1,
+        _ if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => report.kept_in_use += 1,
+        _ => return Err(AppError::io(stage, &e)),
+    }
+    Ok(())
+}
+
+fn dir_error(stage: &'static str, e: &io::Error) -> AppError {
+    if e.kind() == io::ErrorKind::InvalidInput {
+        AppError::InvalidInput("the archive month folder is a link to another location")
+    } else {
+        AppError::io(stage, e)
+    }
+}
+
+/// `<root>/<YYYY-MM>/<name>` → (`YYYY-MM`, `name`); anything else is not ours.
+fn month_and_name<'a>(path: &'a Path, root: &Path) -> Option<(&'a str, &'a str)> {
+    let mut parts = path.strip_prefix(root).ok()?.components();
+    let (Some(Component::Normal(month)), Some(Component::Normal(name)), None) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    Some((month.to_str()?, name.to_str()?))
+}
+
+/// The encoder-owned format of a finalized capture, from its bound name.
+fn output_format(name: &str) -> Result<OutputFormat, AppError> {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    Ok(match ext.as_deref() {
+        Some("png") => OutputFormat::Png,
+        Some("jpg") => OutputFormat::Jpeg,
+        Some("webp") => OutputFormat::WebP,
+        Some("gif") => OutputFormat::Gif,
+        Some("mp4") => OutputFormat::Mp4,
+        _ => {
+            return Err(AppError::InvalidInput(
+                "archived captures need an encoder-owned extension",
+            ));
+        }
+    })
+}
+
+fn recover_intent(intent: &ArchiveIntent) -> Result<Recovery, AppError> {
+    const RECOVERING: &str = "recovering an interrupted archive copy";
+    let io_err = |e: io::Error| AppError::io(RECOVERING, &e);
+    let in_use = |e: &io::Error| e.raw_os_error() == Some(ERROR_SHARING_VIOLATION);
+    let gone = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::InvalidInput
+        )
+    };
+
+    let root = match winfs::open_root(Path::new(&intent.root)) {
+        Ok(root) => root,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Recovery::Settled),
+        Err(_) => return Ok(Recovery::Retry), // e.g. an offline drive
+    };
+    if winfs::identity(&root).map_err(io_err)? != intent.root_identity {
+        // The path now names a different folder; never act inside it.
+        return Ok(Recovery::Settled);
+    }
+    let month = match winfs::open_child_dir(&root, &intent.month, false) {
+        Ok(dir) => dir,
+        Err(e) if gone(&e) => return Ok(Recovery::Settled),
+        Err(e) => return Err(io_err(e)),
+    };
+
+    // 1. The partial itself (still under its unique intent-derived name).
+    match winfs::open_child_file(&month, &intent.partial_name()) {
+        Ok(file) => {
+            let ours = match intent.file_identity {
+                Some(id) => winfs::identity(&file).map_err(io_err)? == id,
+                // Crashed between create and recording identity: the name is
+                // unique to this intent, and it can hold at most the copy.
+                None => file.metadata().map_err(io_err)?.len() <= intent.size,
+            };
+            if !ours {
+                return Ok(Recovery::Settled);
+            }
+            winfs::delete_by_handle(&file).map_err(io_err)?;
+            return Ok(Recovery::Removed);
+        }
+        Err(e) if in_use(&e) => return Ok(Recovery::Retry), // an active writer
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if gone(&e) => return Ok(Recovery::Settled),
+        Err(e) => return Err(io_err(e)),
+    }
+
+    // 2. Renamed to its final name, but the ownership record never committed.
+    let (Some(id), Some(name)) = (intent.file_identity, intent.final_name.as_deref()) else {
+        return Ok(Recovery::Settled);
+    };
+    match winfs::open_child_file(&month, name) {
+        Ok(file) => {
+            if winfs::identity(&file).map_err(io_err)? != id {
+                return Ok(Recovery::Settled); // someone else's file at that name
+            }
+            let (read, hash) =
+                copy_hashing(&mut &file, &mut io::sink(), intent.size).map_err(io_err)?;
+            if read != intent.size || hash != intent.sha256 {
+                return Ok(Recovery::Settled); // changed since: treat as the user's
+            }
+            winfs::delete_by_handle(&file).map_err(io_err)?;
+            Ok(Recovery::Removed)
+        }
+        Err(e) if in_use(&e) => Ok(Recovery::Retry),
+        Err(e) if gone(&e) => Ok(Recovery::Settled),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -271,9 +517,12 @@ mod tests {
     use crate::app::destinations::{
         DestinationSelection, DestinationSnapshot, Destinations, resolve_destination,
     };
+    use crate::persistence::PARTIAL_PREFIX;
     use crate::persistence::artifacts::ArtifactStore;
     use crate::persistence::settings::ServerOrigin;
-    use crate::persistence::test_support::{clear_hook, set_hook};
+    use crate::persistence::test_support::{
+        assert_sharing_violations, clear_hook, mutation_attempts, set_hook,
+    };
 
     struct Fx {
         dir: TempDir,
@@ -289,11 +538,41 @@ mod tests {
             let store = ArtifactStore::new(dir.path().join("spool")).unwrap();
             let history = Arc::new(History::open(&dir.path().join("history.sqlite3")).unwrap());
             let root = dir.path().join("Pictures").join("VectrCap");
-            Fx { dir, store, history, root, n: Default::default() }
+            Fx {
+                dir,
+                store,
+                history,
+                root,
+                n: Default::default(),
+            }
         }
 
         fn archive(&self) -> ArchiveStore {
-            ArchiveStore::new(self.history.clone(), self.root.clone())
+            ArchiveStore::new(
+                self.history.clone(),
+                self.root.clone(),
+                FilenamePreset::default(),
+            )
+        }
+
+        fn month(&self) -> PathBuf {
+            self.root.join("2026-11")
+        }
+
+        fn names_in_month(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(self.month())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn intents(&self) -> i64 {
+            rusqlite::Connection::open(self.dir.path().join("history.sqlite3"))
+                .unwrap()
+                .query_row("SELECT count(*) FROM archive_intents", [], |r| r.get(0))
+                .unwrap()
         }
 
         fn screenshot(&self) -> Artifact {
@@ -301,7 +580,9 @@ mod tests {
             let name = format!("VectrCap_2026-11-14_08-03-09_0000000{}.png", self.n.get());
             let work = self.dir.path().join(&name);
             fs::write(&work, format!("png {}", self.n.get())).unwrap();
-            self.store.stage_file(&work, ArtifactKind::Screenshot).unwrap()
+            self.store
+                .stage_file(&work, ArtifactKind::Screenshot)
+                .unwrap()
         }
 
         fn policy(&self) -> ArchivePolicy {
@@ -314,7 +595,10 @@ mod tests {
     }
 
     fn captured() -> DateTime<Local> {
-        Local.with_ymd_and_hms(2026, 11, 14, 8, 3, 9).single().unwrap()
+        Local
+            .with_ymd_and_hms(2026, 11, 14, 8, 3, 9)
+            .single()
+            .unwrap()
     }
 
     fn later() -> DateTime<Local> {
@@ -324,11 +608,19 @@ mod tests {
     fn snapshot() -> DestinationSnapshot {
         let mut d = Destinations::default();
         let id = d
-            .add("Phone", ServerOrigin::parse("https://vectr.example").unwrap(), None)
+            .add(
+                "Phone",
+                ServerOrigin::parse("https://vectr.example").unwrap(),
+                None,
+            )
             .unwrap();
         d.bind_credential(id, &HashSet::new()).unwrap();
-        resolve_destination(DestinationSelection::Inherit, DestinationSelection::Inherit, &d)
-            .unwrap()
+        resolve_destination(
+            DestinationSelection::Inherit,
+            DestinationSelection::Inherit,
+            &d,
+        )
+        .unwrap()
     }
 
     fn exists(p: &Path) -> bool {
@@ -351,7 +643,160 @@ mod tests {
         let report = archive.cleanup(&fx.policy(), later());
         clear_hook();
         let report = report.unwrap();
-        assert!(exists(&entry.path), "a source needed by an unfinished job is kept");
+        assert!(
+            exists(&entry.path),
+            "a source needed by an unfinished job is kept"
+        );
         assert_eq!((report.removed, report.kept_active), (0, 1));
+    }
+
+    /// Runs `save_finalized` with a hook that "crashes" the process at `point`
+    /// (unwinding drops handles exactly like process exit; nothing else runs).
+    fn crash_at(fx: &Fx, archive: &ArchiveStore, art: &Artifact, point: &'static str) {
+        set_hook(move |p| {
+            if p == point {
+                panic!("simulated crash at {p}");
+            }
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            archive.save_finalized(art, captured())
+        }));
+        clear_hook();
+        assert!(outcome.is_err(), "expected the simulated crash");
+        assert_eq!(
+            fx.intents(),
+            1,
+            "the write intent was durable before the crash"
+        );
+    }
+
+    #[test]
+    fn verified_file_cannot_be_swapped_before_its_delete() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        let entry = archive
+            .save_finalized(&fx.screenshot(), captured())
+            .unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (s, p) = (seen.clone(), entry.path.clone());
+        set_hook(move |point| {
+            if point == "cleanup.verified" {
+                *s.borrow_mut() = mutation_attempts(&p);
+            }
+        });
+        let report = archive.cleanup(&fx.policy(), later());
+        clear_hook();
+        assert_sharing_violations(&seen.borrow());
+        assert_eq!(report.unwrap().removed, 1);
+        assert!(!exists(&entry.path));
+        assert!(!exists(&entry.path.with_extension("moved")));
+    }
+
+    #[test]
+    fn record_failure_rolls_back_only_the_published_object() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        let art = fx.screenshot();
+        let published = fx.month().join(&art.display_name);
+        let db = fx.dir.path().join("history.sqlite3");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (s, p, id) = (seen.clone(), published.clone(), art.id);
+        set_hook(move |point| {
+            if point == "archive.published" {
+                // Make the ownership record fail: a conflicting artifact row.
+                rusqlite::Connection::open(&db)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO artifacts (id, path, display_name, kind, size, sha256, created_ms) \
+                         VALUES (?1, 'conflict', 'x.png', 'screenshot', 1, zeroblob(32), 0)",
+                        rusqlite::params![id.0.to_string()],
+                    )
+                    .unwrap();
+                *s.borrow_mut() = mutation_attempts(&p);
+            }
+        });
+        let result = archive.save_finalized(&art, captured());
+        clear_hook();
+        assert!(
+            matches!(result, Err(AppError::Persistence(_))),
+            "{result:?}"
+        );
+        assert_sharing_violations(&seen.borrow());
+        assert!(fx.names_in_month().is_empty(), "{:?}", fx.names_in_month());
+        assert_eq!(fx.intents(), 0);
+    }
+
+    #[test]
+    fn interrupted_partial_is_recovered_at_startup() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        crash_at(&fx, &archive, &fx.screenshot(), "archive.partial_created");
+        let names = fx.names_in_month();
+        assert!(
+            names.len() == 1 && names[0].starts_with(PARTIAL_PREFIX),
+            "{names:?}"
+        );
+        fs::write(fx.month().join(".vectrcap-partial-foreign"), b"not ours").unwrap();
+        fs::write(fx.month().join("notes.png"), b"user file").unwrap();
+
+        assert_eq!(archive.recover_partials().unwrap(), 1);
+        assert_eq!(
+            fx.names_in_month(),
+            vec![
+                ".vectrcap-partial-foreign".to_string(),
+                "notes.png".to_string()
+            ],
+            "only the proven app-owned partial is removed"
+        );
+        assert_eq!(fx.intents(), 0);
+        assert_eq!(archive.recover_partials().unwrap(), 0);
+    }
+
+    #[test]
+    fn crash_after_publish_before_record_is_recovered() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        let art = fx.screenshot();
+        crash_at(&fx, &archive, &art, "archive.published");
+        assert_eq!(fx.names_in_month(), vec![art.display_name.clone()]);
+        fs::write(fx.month().join("keep.png"), b"user file").unwrap();
+
+        assert_eq!(archive.recover_partials().unwrap(), 1);
+        assert_eq!(fx.names_in_month(), vec!["keep.png".to_string()]);
+        assert_eq!(fx.intents(), 0);
+    }
+
+    #[test]
+    fn published_file_replaced_before_recovery_is_kept() {
+        let fx = Fx::new();
+        let archive = fx.archive();
+        let art = fx.screenshot();
+        crash_at(&fx, &archive, &art, "archive.published");
+        let published = fx.month().join(&art.display_name);
+        let bytes = fs::read(&published).unwrap();
+        fs::remove_file(&published).unwrap();
+        fs::write(&published, &bytes).unwrap(); // the user's own file now
+
+        assert_eq!(archive.recover_partials().unwrap(), 0);
+        assert_eq!(fs::read(&published).unwrap(), bytes);
+        assert_eq!(fx.intents(), 0);
+    }
+
+    #[test]
+    fn recovery_never_touches_an_active_write() {
+        let fx = Fx::new();
+        let archive = Arc::new(fx.archive());
+        let removed = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (r, a) = (removed.clone(), archive.clone());
+        set_hook(move |point| {
+            if point == "archive.partial_created" {
+                r.set(Some(a.recover_partials().unwrap()));
+            }
+        });
+        let entry = archive.save_finalized(&fx.screenshot(), captured());
+        clear_hook();
+        assert_eq!(removed.get(), Some(0), "an open partial is never swept");
+        assert!(exists(&entry.unwrap().path));
+        assert_eq!(fx.intents(), 0);
     }
 }

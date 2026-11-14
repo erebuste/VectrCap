@@ -10,8 +10,22 @@ use vectrcap::app::error::AppError;
 use vectrcap::app::types::{Artifact, ArtifactKind, JobId, UploadReceipt};
 use vectrcap::persistence::archive::{ArchiveOrigin, ArchiveStore};
 use vectrcap::persistence::artifacts::ArtifactStore;
+use vectrcap::persistence::filename::{FilenamePreset, OutputFormat};
 use vectrcap::persistence::history::{History, JobStatus};
 use vectrcap::persistence::settings::{ArchivePolicy, ServerOrigin, StorageMode};
+
+/// Directory junction (no elevation needed): the Windows fixture for
+/// redirected roots and descendant escapes.
+fn junction(link: &Path, target: &Path) {
+    let status = std::process::Command::new("cmd")
+        .args(["/D", "/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
+}
 
 struct Fixture {
     dir: TempDir,
@@ -37,7 +51,11 @@ impl Fixture {
     }
 
     fn archive(&self) -> ArchiveStore {
-        ArchiveStore::new(self.history.clone(), self.root.clone())
+        ArchiveStore::new(
+            self.history.clone(),
+            self.root.clone(),
+            FilenamePreset::default(),
+        )
     }
 
     fn policy(&self, mode: StorageMode, cleanup_age_days: Option<u16>) -> ArchivePolicy {
@@ -79,7 +97,9 @@ impl Fixture {
             match s {
                 JobStatus::Completed(r) => {
                     let attempt = self.history.job(job.id).unwrap().unwrap().attempt;
-                    self.history.record_receipt(job.id, attempt, None, r).unwrap();
+                    self.history
+                        .record_receipt(job.id, attempt, None, r)
+                        .unwrap();
                 }
                 s => self.history.transition(job.id, s.clone()).unwrap(),
             }
@@ -392,7 +412,11 @@ fn changing_archive_root_never_moves_or_deletes_existing_files() {
         .unwrap();
 
     let new_root = fx.dir.path().join("Elsewhere");
-    let moved_store = ArchiveStore::new(fx.history.clone(), new_root.clone());
+    let moved_store = ArchiveStore::new(
+        fx.history.clone(),
+        new_root.clone(),
+        FilenamePreset::default(),
+    );
     let fresh = moved_store
         .save_finalized(&fx.screenshot(), captured())
         .unwrap();
@@ -422,4 +446,125 @@ fn changing_archive_root_never_moves_or_deletes_existing_files() {
         report.kept_other_root, 0,
         "entries of other roots are never fetched"
     );
+}
+
+fn later() -> DateTime<Local> {
+    Local::now() + Duration::days(10)
+}
+
+#[test]
+fn month_junction_cannot_redirect_archive_writes() {
+    let fx = Fixture::new();
+    let outside = fx.dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(&fx.root).unwrap();
+    junction(&fx.root.join("2026-11"), &outside);
+
+    let err = fx
+        .archive()
+        .save_finalized(&fx.screenshot(), captured())
+        .unwrap_err();
+    assert!(
+        matches!(err, AppError::InvalidInput(_) | AppError::Io { .. }),
+        "{err:?}"
+    );
+    assert_eq!(files_under(&outside), 0, "nothing written outside the root");
+}
+
+#[test]
+fn cleanup_never_follows_a_month_junction_swapped_in_after_save() {
+    let fx = Fixture::new();
+    let archive = fx.archive();
+    let entry = archive
+        .save_finalized(&fx.screenshot(), captured())
+        .unwrap();
+    let name = entry.path.file_name().unwrap().to_owned();
+    // The month folder is moved away and replaced by a junction to an outside
+    // folder holding a byte-identical file under the recorded name.
+    let outside = fx.dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::copy(&entry.path, outside.join(&name)).unwrap();
+    fs::rename(fx.root.join("2026-11"), fx.root.join("moved")).unwrap();
+    junction(&fx.root.join("2026-11"), &outside);
+
+    let report = archive
+        .cleanup(&fx.policy(StorageMode::AlwaysSave, Some(1)), later())
+        .unwrap();
+    assert_eq!(report.removed, 0);
+    assert!(outside.join(&name).exists(), "outside sentinel survives");
+    assert!(fx.root.join("moved").join(&name).exists());
+}
+
+#[test]
+fn same_content_replacement_is_not_owned() {
+    let fx = Fixture::new();
+    let archive = fx.archive();
+    let entry = archive
+        .save_finalized(&fx.screenshot(), captured())
+        .unwrap();
+    let bytes = fs::read(&entry.path).unwrap();
+    fs::remove_file(&entry.path).unwrap();
+    fs::write(&entry.path, &bytes).unwrap(); // a different file, identical bytes
+
+    let report = archive
+        .cleanup(&fx.policy(StorageMode::AlwaysSave, Some(1)), later())
+        .unwrap();
+    assert_eq!((report.removed, report.kept_modified), (0, 1));
+    assert_eq!(fs::read(&entry.path).unwrap(), bytes);
+}
+
+#[test]
+fn redirected_root_is_a_legitimate_archive_root() {
+    // e.g. a Pictures folder redirected elsewhere: the root itself may be a
+    // junction; it is bound once and used for both saving and cleanup.
+    let fx = Fixture::new();
+    let real = fx.dir.path().join("OneDrive").join("VectrCap");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(fx.root.parent().unwrap()).unwrap();
+    junction(&fx.root, &real);
+
+    let archive = fx.archive();
+    let entry = archive
+        .save_finalized(&fx.screenshot(), captured())
+        .unwrap();
+    assert_eq!(files_under(&real.join("2026-11")), 1);
+    let report = archive
+        .cleanup(&fx.policy(StorageMode::AlwaysSave, Some(1)), later())
+        .unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(!entry.path.exists());
+}
+
+#[test]
+fn near_limit_name_collision_regenerates_within_the_cap() {
+    let fx = Fixture::new();
+    // 187 literals + 8-char id + ".webp" = exactly the 200-unit cap.
+    let preset = FilenamePreset {
+        prefix: String::new(),
+        template: format!("{}{{id}}", "a".repeat(187)),
+    };
+    preset.validate().unwrap();
+    let name = preset
+        .render(captured(), "0000abcd", OutputFormat::Png)
+        .unwrap();
+    assert_eq!(name.encode_utf16().count(), 199);
+    let work = fx.dir.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join(&name), b"png").unwrap();
+    let art = fx
+        .store
+        .stage_file(&work.join(&name), ArtifactKind::Screenshot)
+        .unwrap();
+    let month = fx.root.join("2026-11");
+    fs::create_dir_all(&month).unwrap();
+    fs::write(month.join(&name), b"someone else's file").unwrap();
+
+    let archive = ArchiveStore::new(fx.history.clone(), fx.root.clone(), preset);
+    let entry = archive.save_finalized(&art, captured()).unwrap();
+    let saved = entry.path.file_name().unwrap().to_str().unwrap();
+    assert_ne!(saved, name);
+    assert!(saved.encode_utf16().count() <= 200, "{saved}");
+    assert!(saved.starts_with(&"a".repeat(187)) && saved.ends_with(".png"));
+    assert_eq!(fs::read(&entry.path).unwrap(), b"png");
+    assert_eq!(fs::read(month.join(&name)).unwrap(), b"someone else's file");
 }

@@ -123,8 +123,14 @@ fn dot_segment_origins_are_rejected_before_normalization() {
             "LinkOrigin {s:?}"
         );
         let json = serde_json::to_string(s).unwrap();
-        assert!(serde_json::from_str::<ServerOrigin>(&json).is_err(), "serde {s:?}");
-        assert!(serde_json::from_str::<LinkOrigin>(&json).is_err(), "serde {s:?}");
+        assert!(
+            serde_json::from_str::<ServerOrigin>(&json).is_err(),
+            "serde {s:?}"
+        );
+        assert!(
+            serde_json::from_str::<LinkOrigin>(&json).is_err(),
+            "serde {s:?}"
+        );
     }
 
     // The same strings are refused inside a persisted settings document.
@@ -396,7 +402,10 @@ fn session_has_one_owner_per_server() {
         n += 1;
         let name = format!("{n}.bin");
         let art = store
-            .stage_file(&write(dir.path(), &name, name.as_bytes()), ArtifactKind::File)
+            .stage_file(
+                &write(dir.path(), &name, name.as_bytes()),
+                ArtifactKind::File,
+            )
             .unwrap();
         let job = history.create_job(&art, dest).unwrap();
         history.transition(job.id, JobStatus::Running).unwrap();
@@ -429,7 +438,11 @@ fn session_has_one_owner_per_server() {
         });
         claims.map(|c| c.join().unwrap())
     });
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
     let owners = [d, e]
         .iter()
         .filter(|j| history.job(**j).unwrap().unwrap().session == Some(t))
@@ -452,7 +465,10 @@ fn late_receipt_after_cancel_fail_or_interrupt_is_kept_and_bound() {
             n += 1;
             let name = format!("{n}.bin");
             let art = store
-                .stage_file(&write(dir.path(), &name, name.as_bytes()), ArtifactKind::File)
+                .stage_file(
+                    &write(dir.path(), &name, name.as_bytes()),
+                    ArtifactKind::File,
+                )
                 .unwrap();
             let job = history.create_job(&art, &snapshot()).unwrap();
             assert_eq!(job.attempt, 0, "no attempt has started yet");
@@ -492,11 +508,36 @@ fn late_receipt_after_cancel_fail_or_interrupt_is_kept_and_bound() {
 
     // Wrong session or an attempt that never started is refused, state unchanged.
     let invalid = |r: Result<(), AppError>| matches!(r, Err(AppError::InvalidInput(_)));
-    assert!(invalid(history.record_receipt(cancelled, 1, Some(s_fail), &receipt("a"))));
-    assert!(invalid(history.record_receipt(cancelled, 1, None, &receipt("a"))));
-    assert!(invalid(history.record_receipt(cancelled, 2, Some(s_cancel), &receipt("a"))));
-    assert!(invalid(history.record_receipt(cancelled, 0, Some(s_cancel), &receipt("a"))));
-    assert!(invalid(history.record_receipt(empty, 1, Some(s_cancel), &receipt("e"))));
+    assert!(invalid(history.record_receipt(
+        cancelled,
+        1,
+        Some(s_fail),
+        &receipt("a")
+    )));
+    assert!(invalid(history.record_receipt(
+        cancelled,
+        1,
+        None,
+        &receipt("a")
+    )));
+    assert!(invalid(history.record_receipt(
+        cancelled,
+        2,
+        Some(s_cancel),
+        &receipt("a")
+    )));
+    assert!(invalid(history.record_receipt(
+        cancelled,
+        0,
+        Some(s_cancel),
+        &receipt("a")
+    )));
+    assert!(invalid(history.record_receipt(
+        empty,
+        1,
+        Some(s_cancel),
+        &receipt("e")
+    )));
     assert_eq!(
         history.job(cancelled).unwrap().unwrap().status,
         JobStatus::Cancelled
@@ -512,18 +553,30 @@ fn late_receipt_after_cancel_fail_or_interrupt_is_kept_and_bound() {
     history
         .record_receipt(interrupted, 1, Some(s_interrupt), &receipt("c"))
         .unwrap();
-    history.record_receipt(empty, 1, None, &receipt("e")).unwrap();
+    history
+        .record_receipt(empty, 1, None, &receipt("e"))
+        .unwrap();
 
     // Same receipt again is idempotent; a conflicting one is refused.
     history
         .record_receipt(cancelled, 1, Some(s_cancel), &receipt("a"))
         .unwrap();
-    assert!(invalid(history.record_receipt(cancelled, 1, Some(s_cancel), &receipt("z"))));
+    assert!(invalid(history.record_receipt(
+        cancelled,
+        1,
+        Some(s_cancel),
+        &receipt("z")
+    )));
 
     drop(history);
     let history = History::open(&db).unwrap();
     assert!(history.recover_jobs().unwrap().is_empty(), "all settled");
-    for (job, name) in [(cancelled, "a"), (failed, "b"), (interrupted, "c"), (empty, "e")] {
+    for (job, name) in [
+        (cancelled, "a"),
+        (failed, "b"),
+        (interrupted, "c"),
+        (empty, "e"),
+    ] {
         assert_eq!(
             history.job(job).unwrap().unwrap().status,
             JobStatus::Completed(receipt(name))
