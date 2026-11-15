@@ -11,5 +11,6 @@ pub mod app;
 pub mod capture;
 pub mod persistence;
 pub mod platform;
+pub mod recording;
 pub mod ui;
 pub mod vectr;
