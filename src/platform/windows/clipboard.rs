@@ -11,6 +11,9 @@ use windows_sys::Win32::{
 
 pub trait ClipboardWriter: Send + Sync {
     fn write_text(&self, text: &str) -> Result<(), AppError>;
+    fn write_image(&self, _pixels: &image::RgbaImage) -> Result<(), AppError> {
+        Err(AppError::Persistence("image clipboard is unavailable"))
+    }
 }
 
 pub struct WindowsClipboard;
@@ -58,53 +61,97 @@ impl ClipboardWriter for WindowsClipboard {
         let mut units: Vec<u16> = text.encode_utf16().collect();
         units.push(0);
         let bytes = units.len().checked_mul(size_of::<u16>()).ok_or(error())?;
-        unsafe {
-            // Prepare memory before emptying the clipboard. Every failure before
-            // ownership transfer frees it, including a failed GlobalLock.
-            let allocation = Allocation(GlobalAlloc(GMEM_MOVEABLE, bytes));
-            if allocation.0.is_null() {
-                return Err(error());
-            }
-            let target = GlobalLock(allocation.0);
-            if target.is_null() {
-                return Err(error());
-            }
-            std::ptr::copy_nonoverlapping(units.as_ptr(), target.cast::<u16>(), units.len());
-            GlobalUnlock(allocation.0);
-            let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-            let owner = Owner(CreateWindowExW(
-                0,
-                class.as_ptr(),
-                std::ptr::null(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                HWND_MESSAGE,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            ));
-            if owner.0.is_null() {
-                return Err(error());
-            }
-            if OpenClipboard(owner.0) == 0 {
-                return Err(error());
-            }
-            let _guard = OpenGuard;
-            if EmptyClipboard() == 0 {
-                return Err(error());
-            }
-            const CF_UNICODETEXT: u32 = 13;
-            if SetClipboardData(CF_UNICODETEXT, allocation.0).is_null() {
-                return Err(error());
-            }
-            // The clipboard owns immediate-rendered data from this point.
-            std::mem::forget(allocation);
+        let mut data = Vec::with_capacity(bytes);
+        for unit in units {
+            data.extend_from_slice(&unit.to_le_bytes());
         }
-        Ok(())
+        set_clipboard(13, &data)
     }
+    fn write_image(&self, pixels: &image::RgbaImage) -> Result<(), AppError> {
+        set_clipboard(17, &dibv5_bytes(pixels)?)
+    }
+}
+
+/// CF_DIBV5 uses a top-down 32-bit bitmap with explicit RGBA masks and sRGB.
+/// Only the provided finalized pixels enter this serialization.
+pub fn dibv5_bytes(pixels: &image::RgbaImage) -> Result<Vec<u8>, AppError> {
+    crate::capture::geometry::PhysicalRect::new(0, 0, pixels.width(), pixels.height())?
+        .rgba_len()?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(124 + pixels.as_raw().len())
+        .map_err(|_| error())?;
+    bytes.resize(124, 0);
+    for (offset, value) in [
+        (0, 124u32),
+        (4, pixels.width()),
+        (8, (-(pixels.height() as i32)) as u32),
+        (16, 3),
+        (20, pixels.as_raw().len() as u32),
+        (40, 0x00ff0000),
+        (44, 0x0000ff00),
+        (48, 0x000000ff),
+        (52, 0xff000000),
+        (56, 0x73524742),
+        (108, 4),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[12..14].copy_from_slice(&1u16.to_le_bytes());
+    bytes[14..16].copy_from_slice(&32u16.to_le_bytes());
+    for p in pixels.pixels() {
+        bytes.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+    }
+    Ok(bytes)
+}
+
+#[allow(unsafe_code)]
+fn set_clipboard(format: u32, data: &[u8]) -> Result<(), AppError> {
+    unsafe {
+        // Prepare memory before emptying the clipboard. Every failure before
+        // ownership transfer frees it, including a failed GlobalLock.
+        let allocation = Allocation(GlobalAlloc(GMEM_MOVEABLE, data.len()));
+        if allocation.0.is_null() {
+            return Err(error());
+        }
+        let target = GlobalLock(allocation.0);
+        if target.is_null() {
+            return Err(error());
+        }
+        std::ptr::copy_nonoverlapping(data.as_ptr(), target.cast::<u8>(), data.len());
+        GlobalUnlock(allocation.0);
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let owner = Owner(CreateWindowExW(
+            0,
+            class.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        ));
+        if owner.0.is_null() {
+            return Err(error());
+        }
+        if OpenClipboard(owner.0) == 0 {
+            return Err(error());
+        }
+        let _guard = OpenGuard;
+        if EmptyClipboard() == 0 {
+            return Err(error());
+        }
+        if SetClipboardData(format, allocation.0).is_null() {
+            return Err(error());
+        }
+        // The clipboard owns immediate-rendered data from this point.
+        std::mem::forget(allocation);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

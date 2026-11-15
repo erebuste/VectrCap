@@ -222,8 +222,8 @@ impl PreparedImageExport {
             && self.options == *options
     }
 }
-/// Caps every Rust codec write before growing the output buffer. WebP's native
-/// encoder owns its intermediate buffer; its result is capped before copying.
+/// Caps Rust codec writes before growing the output buffer. The native WebP
+/// adapter applies the same cap to every emitted segment before allocation.
 struct BoundedOutput {
     bytes: Vec<u8>,
 }
@@ -297,13 +297,7 @@ pub fn prepare_export(
             )
             .map_err(|_| AppError::Encoder("lossless WebP encoding failed"))?,
         ExportFormat::WebpLossy => {
-            let native = webpx::Encoder::new_rgba(pixels.as_raw(), width, height)
-                .quality(f32::from(options.quality))
-                .encode_owned(webpx::Unstoppable)
-                .map_err(|_| AppError::Encoder("lossy WebP encoding failed"))?;
-            output.write_all(&native).map_err(|_| {
-                AppError::Encoder("WebP output exceeds memory or encoded size budget")
-            })?;
+            output.bytes = super::webp::encode_lossy(&pixels, options.quality, MAX_ENCODED_BYTES)?;
         }
     }
     if output.bytes.is_empty() {

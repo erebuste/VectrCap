@@ -27,6 +27,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct DesktopView {
+    pub capture_acquiring: Option<uuid::Uuid>,
+    pub capture_surface: Option<Arc<Mutex<super::controller::CaptureSurface>>>,
+    pub pins: Vec<super::controller::PinImage>,
     pub settings: Option<Settings>,
     pub window: Option<Window>,
     pub focus_revision: u64,
@@ -63,6 +66,9 @@ pub struct DesktopView {
 impl Default for DesktopView {
     fn default() -> Self {
         Self {
+            capture_acquiring: None,
+            capture_surface: None,
+            pins: vec![],
             settings: None,
             window: None,
             focus_revision: 0,
@@ -98,6 +104,9 @@ pub struct DesktopClient {
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 impl DesktopClient {
+    pub(crate) fn wake(&self) {
+        (self.wake)();
+    }
     pub fn snapshot(&self) -> DesktopView {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -201,6 +210,11 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    captures: tokio::task::JoinSet<(
+        uuid::Uuid,
+        Result<crate::capture::request::CaptureSnapshot, AppError>,
+    )>,
+    capture_cancel: Option<CancellationToken>,
     queue: Option<mpsc::Sender<QueueCommand>>,
     metadata: Option<ConnectionTask>,
     state: DesktopView,
@@ -218,6 +232,51 @@ impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::ArchiveMaintenance(task) => {
+                    let cancel = self.local_cancel.clone();
+                    self.local_actions.spawn_blocking(move || task.run(cancel));
+                }
+                AppEffect::AcquireCapture { session, request } => {
+                    let cancel = CancellationToken::new();
+                    self.capture_cancel = Some(cancel.clone());
+                    self.state.capture_acquiring = Some(session);
+                    let busy = self.captures.len() >= 2;
+                    self.captures.spawn(async move {
+                        // The current-thread runtime cannot start acquisition until
+                        // this effect batch publishes capture suppression to the UI.
+                        let result = tokio::task::spawn_blocking(move || {
+                            if busy {
+                                Err(AppError::InUse(
+                                    "capture acquisition is still stopping; try again",
+                                ))
+                            } else {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::platform::windows::capture::acquire_screenshot(
+                                        request, cancel,
+                                    )
+                                }))
+                                .unwrap_or(Err(
+                                    AppError::Capture("capture acquisition worker failed"),
+                                ))
+                            }
+                        })
+                        .await
+                        .unwrap_or(Err(AppError::Capture("capture acquisition worker failed")));
+                        (session, result)
+                    });
+                }
+                AppEffect::CancelCaptureAcquisition => {
+                    if let Some(cancel) = self.capture_cancel.take() {
+                        cancel.cancel();
+                    }
+                    self.state.capture_acquiring = None;
+                }
+                AppEffect::CaptureSurface(surface) => {
+                    self.state.capture_acquiring = None;
+                    self.state.capture_surface = surface;
+                }
+                AppEffect::PinImage(pin) => self.state.pins.push(pin),
+                AppEffect::ClosePin(id) => self.state.pins.retain(|pin| pin.id != id),
                 AppEffect::ShortcutRecorded { request, chord } => {
                     self.state.recorded_shortcut = Some((request, chord))
                 }
@@ -368,6 +427,9 @@ impl Effects {
                     }
                 }
                 AppEffect::DrainWorker => {
+                    if let Some(cancel) = self.capture_cancel.take() {
+                        cancel.cancel();
+                    }
                     self.local_cancel.cancel();
                     self.state.exit_requested = true;
                     self.state.lifecycle = Lifecycle::Draining;
@@ -431,6 +493,8 @@ async fn serve(
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
     let mut effects = Effects {
+        captures: tokio::task::JoinSet::new(),
+        capture_cancel: None,
         local_actions: tokio::task::JoinSet::new(),
         local_cancel: CancellationToken::new(),
         artifacts: artifacts.clone(),
@@ -447,13 +511,21 @@ async fn serve(
             ..Default::default()
         },
     };
-    effects.apply(vec![], &history).await?;
+    effects
+        .apply(controller.startup_effects(), &history)
+        .await?;
     let mut driver = tokio::spawn(queue.serve(uploader, queue_rx, effect_tx));
     effects.publish(&view, wake.as_ref());
     let mut effect_open = true;
     let mut driver_consumed = false;
     let outcome = loop {
         let results = tokio::select! {
+            result = effects.captures.join_next(), if !effects.captures.is_empty() => {
+                match result {
+                    Some(Ok((session, result))) => controller.on_event(AppEvent::CaptureAcquired { session, result }),
+                    _ => effects.state.capture_acquiring.map_or_else(Vec::new, |session| controller.on_event(AppEvent::CaptureAcquired { session, result: Err(AppError::Capture("capture acquisition worker failed")) })),
+                }
+            }
             result = effects.local_actions.join_next(), if !effects.local_actions.is_empty() => {
                 match result {Some(Ok(Ok(())))=>vec![],Some(Ok(Err(AppError::Cancelled)))=>vec![],Some(Ok(Err(error)))=>vec![AppEffect::Error(error)],_=>vec![AppEffect::Error(AppError::Persistence("local action worker failed"))]}
             }
@@ -531,6 +603,10 @@ async fn serve(
     // Even a snapshot/read failure must close and drain, not detach the driver
     // and let runtime teardown abort a request with an unrecorded outcome.
     effects.local_cancel.cancel();
+    if let Some(cancel) = effects.capture_cancel.take() {
+        cancel.cancel();
+    }
+    while effects.captures.join_next().await.is_some() {}
     while effects.local_actions.join_next().await.is_some() {}
     // A file already accepted into a batch durably becomes a job the moment
     // `on_event` runs, even though nothing reads the published view anymore;

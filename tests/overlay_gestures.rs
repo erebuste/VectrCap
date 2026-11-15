@@ -406,3 +406,44 @@ fn translated_annotations_check_all_coordinates_and_preserve_original_on_failure
     assert_eq!(moved.id(), original.id());
     assert!(matches!(moved, Annotation::Step { number: 1, .. }));
 }
+
+#[test]
+fn native_overlay_does_not_clamp_a_virtual_desktop_to_one_monitor() {
+    let overlay = session();
+    let builder = overlay.viewport_builder(2.0).unwrap();
+    assert_eq!(builder.clamp_size_to_monitor_size, Some(false));
+    assert_eq!(builder.inner_size, Some(Vec2::new(150.0, 100.0)));
+    assert_eq!(builder.position, Some(Pos2::new(-50.0, -25.0)));
+    assert!(overlay.viewport_builder(f32::NAN).is_err());
+}
+
+#[test]
+fn canvas_tab_keeps_subsequent_tool_shortcuts_in_the_canvas_context() {
+    let mut overlay = session();
+    let ctx = eframe::egui::Context::default();
+    let saved = ShortcutSettings::default();
+    for key in [None, Some(Key::R), Some(Key::Tab), Some(Key::F)] {
+        let events = key
+            .map(|key| Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            })
+            .into_iter()
+            .collect();
+        let mut output = ctx.run_ui(
+            eframe::egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                assert!(overlay.show(ui, &saved).is_none());
+            },
+        );
+        output.textures_delta.clear();
+    }
+    assert_eq!(overlay.tool(), Tool::Freehand);
+}

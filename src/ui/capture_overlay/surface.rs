@@ -83,6 +83,7 @@ impl CaptureOverlay {
             .with_title("VectrCap capture")
             .with_decorations(false)
             .with_resizable(false)
+            .with_clamp_size_to_monitor_size(false)
             .with_taskbar(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
             .with_position([
@@ -190,23 +191,53 @@ impl CaptureOverlay {
         ui: &mut egui::Ui,
         saved: &ShortcutSettings,
     ) -> Option<CaptureOverlayEvent> {
-        if self.cancelled {
-            return Some(CaptureOverlayEvent::Cancel);
-        }
-        let ctx = ui.ctx().clone();
-        let viewport = ui.max_rect();
+        let transform = match OverlayTransform::new(
+            self.document.bounds(),
+            ui.max_rect(),
+            ui.ctx().pixels_per_point(),
+        ) {
+            Ok(transform) => transform,
+            Err(error) => {
+                self.error = Some(error);
+                return None;
+            }
+        };
+        self.show_transformed(ui, saved, transform)
+    }
+    pub fn show_review(
+        &mut self,
+        ui: &mut egui::Ui,
+        saved: &ShortcutSettings,
+        viewport: &mut super::super::image_review::ImageViewport,
+    ) -> Option<CaptureOverlayEvent> {
+        let b = self.document.bounds();
+        let canvas = viewport.canvas(ui, (b.width(), b.height()));
         let transform =
-            match OverlayTransform::new(self.document.bounds(), viewport, ctx.pixels_per_point()) {
-                Ok(t) => t,
+            match OverlayTransform::for_review(b, canvas.rect, canvas.offset, canvas.zoom) {
+                Ok(transform) => transform,
                 Err(error) => {
                     self.error = Some(error);
                     return None;
                 }
             };
+        self.show_transformed(ui, saved, transform)
+    }
+    fn show_transformed(
+        &mut self,
+        ui: &mut egui::Ui,
+        saved: &ShortcutSettings,
+        transform: OverlayTransform,
+    ) -> Option<CaptureOverlayEvent> {
+        if self.cancelled {
+            return Some(CaptureOverlayEvent::Cancel);
+        }
+        let ctx = ui.ctx().clone();
+        let viewport = transform.viewport;
         let events = ctx.input(|i| i.events.clone());
         // Resolve non-text shortcuts before widgets so a canvas Tab can select
         // the saved Region tool; an already focused toolbar keeps native Tab.
         let mut consumed = Vec::new();
+        let mut canvas_tab = false;
         if self.text.is_none() && !self.finishing {
             for (index, event) in events.iter().enumerate() {
                 let focus = if self.chrome_focused {
@@ -215,7 +246,16 @@ impl CaptureOverlay {
                     ShortcutFocus::Normal
                 };
                 match self.handle_key_event(event, saved, focus, self.chrome_focused) {
-                    Ok(true) => consumed.push(index),
+                    Ok(true) => {
+                        canvas_tab |= matches!(
+                            event,
+                            egui::Event::Key {
+                                key: egui::Key::Tab,
+                                ..
+                            }
+                        );
+                        consumed.push(index);
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         self.error = Some(error);
@@ -358,6 +398,16 @@ impl CaptureOverlay {
                 }
             }
         }
+        // egui computes Tab traversal before this callback receives events.
+        // Removing a consumed canvas Tab from InputState alone cannot undo the
+        // focus that its widgets acquired during this pass.
+        if canvas_tab {
+            ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+        }
         self.chrome_focused = ctx.memory(|m| m.focused().is_some());
         let command = self
             .gesture
@@ -374,7 +424,7 @@ impl CaptureOverlay {
             let result = tiled.paint(
                 &paint,
                 viewport,
-                (0.0, 0.0),
+                transform.source_offset,
                 1.0 / f64::from(transform.pixels_per_point),
             );
             self.note(result);

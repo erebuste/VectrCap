@@ -277,6 +277,25 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_last_region(
+        &mut self,
+        region: Option<crate::capture::last_region::LastRegion>,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.last_region == region {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.last_region = region;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     pub fn set_appearance(&mut self, appearance: AppearancePreferences) -> Result<(), AppError> {
         self.ensure_not_corrupted()?;
         if self.settings.appearance == appearance {

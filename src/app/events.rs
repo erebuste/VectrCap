@@ -46,6 +46,23 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    StartCapture {
+        mode: crate::capture::request::CaptureMode,
+        selection: DestinationSelection,
+    },
+    FinishCapture {
+        session: Uuid,
+        finish: crate::ui::image_export::ImageFinish,
+        save_path: Option<PathBuf>,
+    },
+    RetryCaptureFinish {
+        session: Uuid,
+        decision: super::image_finish::ArchiveDecision,
+    },
+    CancelCapture(Uuid),
+    CancelActiveCapture,
+    ResumeCapture(Uuid),
+    ClosePin(Uuid),
     SetHistoryPreferences(crate::persistence::settings::HistoryPreferences),
     HistoryAction {
         ids: Vec<Uuid>,
@@ -169,6 +186,10 @@ impl From<QueueAction> for QueueCommand {
     }
 }
 pub enum AppEvent {
+    CaptureAcquired {
+        session: Uuid,
+        result: Result<crate::capture::request::CaptureSnapshot, AppError>,
+    },
     Queue(QueueEffect),
     WorkerStopped(Result<(), AppError>),
     ConnectionTest {
@@ -186,6 +207,15 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    ArchiveMaintenance(super::image_finish::ArchiveMaintenance),
+    AcquireCapture {
+        session: Uuid,
+        request: crate::capture::request::CaptureRequest,
+    },
+    CancelCaptureAcquisition,
+    CaptureSurface(Option<std::sync::Arc<std::sync::Mutex<super::controller::CaptureSurface>>>),
+    PinImage(super::controller::PinImage),
+    ClosePin(Uuid),
     ShortcutRecorded {
         request: Uuid,
         chord: super::shortcuts::KeyChord,

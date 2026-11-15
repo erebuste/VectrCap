@@ -26,6 +26,40 @@ pub enum ArchiveDecision {
     ContinueWithoutLocalCopy,
 }
 
+/// Startup recovery runs in the desktop's bounded worker set. Its classified
+/// failures are surfaced through the same error path as other local actions.
+pub struct ArchiveMaintenance {
+    history: Arc<History>,
+    policy: ArchivePolicy,
+    filename: FilenamePreset,
+}
+impl ArchiveMaintenance {
+    pub fn new(history: Arc<History>, policy: ArchivePolicy, filename: FilenamePreset) -> Self {
+        Self {
+            history,
+            policy,
+            filename,
+        }
+    }
+    pub fn run(self, cancel: tokio_util::sync::CancellationToken) -> Result<(), AppError> {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        self.policy.validate()?;
+        let archive = ArchiveStore::new(self.history, self.policy.resolved_root()?, self.filename);
+        archive.recover_partials()?;
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        archive.reconcile_uploaded(&self.policy)?;
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        archive.cleanup(&self.policy, Local::now())?;
+        Ok(())
+    }
+}
+
 pub struct ImageFinishTransaction {
     finish: ImageFinish,
     captured_at: DateTime<Local>,
@@ -34,6 +68,7 @@ pub struct ImageFinishTransaction {
     saved_path: Option<PathBuf>,
     archive_failed: bool,
     continued: bool,
+    archive_required: Option<bool>,
 }
 impl ImageFinishTransaction {
     pub fn new(finish: ImageFinish) -> Result<Self, AppError> {
@@ -51,6 +86,7 @@ impl ImageFinishTransaction {
             saved_path: None,
             archive_failed: false,
             continued: false,
+            archive_required: None,
         })
     }
     pub fn finish(&self) -> &ImageFinish {
@@ -99,14 +135,26 @@ impl ImageFinishTransaction {
             return Ok(());
         }
         let upload = self.finish.action == OverlayAction::Upload;
-        let archive = policy.should_auto_archive(upload) && !self.continued;
+        let archive = *self
+            .archive_required
+            .get_or_insert_with(|| policy.should_auto_archive(upload))
+            && !self.continued;
         if (upload || archive) && self.artifact.is_none() {
             let name = filename.render(
                 self.captured_at,
                 &random_suffix(),
                 self.finish.prepared.format().output_format(),
             )?;
-            self.artifact = Some(artifacts.stage_image(&self.finish.prepared, name)?);
+            match artifacts.stage_image(&self.finish.prepared, name) {
+                Ok(artifact) => self.artifact = Some(artifact),
+                Err(error) => {
+                    // Copy/Pin need this spool only to create the archive. A
+                    // failed local-copy prerequisite may be explicitly skipped;
+                    // an upload's immutable source may never be skipped.
+                    self.archive_failed = !upload;
+                    return Err(error);
+                }
+            }
         }
         if archive && self.archive.is_none() {
             let result = policy.resolved_root().and_then(|root| {

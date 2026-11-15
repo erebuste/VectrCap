@@ -129,6 +129,47 @@ impl WindowsCaptureSource {
         Self::default()
     }
 }
+
+/// Dedicated acquisition worker entry. All native adapters are created and
+/// dropped on this thread; cancellation never produces an output artifact.
+pub fn acquire_screenshot(
+    mut request: crate::capture::request::CaptureRequest,
+    cancel: CancellationToken,
+) -> Result<crate::capture::request::CaptureSnapshot, AppError> {
+    use crate::capture::request::{CaptureMode, CaptureService};
+    let mut source = WindowsCaptureSource::new();
+    if request.mode == CaptureMode::Window {
+        let pointer = source.pointer()?;
+        request.target = Some(
+            source
+                .windows()?
+                .into_iter()
+                .find(|w| w.bounds.contains(pointer))
+                .ok_or(AppError::Capture("no eligible window under the pointer"))?,
+        );
+    }
+    CaptureService::new(source, NativeCountdown::new(hide_app_chrome), cancel).snapshot(request)
+}
+
+#[allow(unsafe_code)]
+fn hide_app_chrome() -> Result<(), AppError> {
+    unsafe extern "system" fn hide(hwnd: windows_sys::Win32::Foundation::HWND, _: isize) -> i32 {
+        let mut pid = 0;
+        // SAFETY: EnumWindows lends each handle; Win32 tolerates destroyed windows.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == std::process::id() && IsWindowVisible(hwnd) != 0 {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        1
+    }
+    // SAFETY: synchronous callback; no pointers or retained native handles.
+    if unsafe { EnumWindows(Some(hide), 0) } == 0 {
+        return Err(AppError::Capture("capture chrome could not be hidden"));
+    }
+    Ok(())
+}
 impl CaptureSource for WindowsCaptureSource {
     fn prepare_window(&mut self, target: WindowCandidate) -> Result<(), AppError> {
         let _dpi = DpiContext::enter()?;

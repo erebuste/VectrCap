@@ -41,6 +41,20 @@ impl Tray {
                 return;
             }
             let command = match event.id.as_ref() {
+                "cancel-capture" => Some(AppCommand::CancelActiveCapture),
+                "capture-region" | "capture-window" | "capture-fullscreen" | "capture-last" => {
+                    use crate::capture::request::CaptureMode;
+                    let mode = match event.id.as_ref() {
+                        "capture-window" => CaptureMode::Window,
+                        "capture-fullscreen" => CaptureMode::Fullscreen,
+                        "capture-last" => CaptureMode::LastRegion,
+                        _ => CaptureMode::Region,
+                    };
+                    Some(AppCommand::StartCapture {
+                        mode,
+                        selection: Default::default(),
+                    })
+                }
                 "history" => Some(AppCommand::Show(Window::History)),
                 "uploads" => Some(AppCommand::Show(Window::Uploads)),
                 "settings" => Some(AppCommand::Show(Window::Settings)),
@@ -98,6 +112,22 @@ impl Tray {
     pub fn update(&mut self, destinations: &Destinations, revision: u64) -> Result<(), AppError> {
         if self.revision != Some(revision) {
             let menu = Menu::new();
+            for (id, label) in [
+                ("capture-region", "Capture region"),
+                ("capture-window", "Capture window under pointer"),
+                ("capture-fullscreen", "Capture fullscreen"),
+                ("capture-last", "Capture last region"),
+            ] {
+                menu.append(&MenuItem::with_id(id, label, true, None))
+                    .map_err(|_| error())?;
+            }
+            menu.append(&MenuItem::with_id(
+                "cancel-capture",
+                "Cancel active capture / delay",
+                true,
+                None,
+            ))
+            .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("upload-file", "Upload file", true, None))
                 .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("uploads", "Uploads", true, None))

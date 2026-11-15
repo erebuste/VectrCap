@@ -199,6 +199,10 @@ impl ShortcutAction {
                 ShortcutAction::ShowHistory
                     | ShortcutAction::ShowSettings
                     | ShortcutAction::UploadFile
+                    | ShortcutAction::RegionScreenshot
+                    | ShortcutAction::WindowScreenshot
+                    | ShortcutAction::FullscreenScreenshot
+                    | ShortcutAction::CaptureLastRegion
             )
     }
 
@@ -465,6 +469,22 @@ pub enum ShortcutOutcome {
 fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
     use crate::app::events::{AppCommand, Window};
     match action {
+        ShortcutAction::RegionScreenshot
+        | ShortcutAction::WindowScreenshot
+        | ShortcutAction::FullscreenScreenshot
+        | ShortcutAction::CaptureLastRegion => {
+            use crate::capture::request::CaptureMode;
+            let mode = match action {
+                ShortcutAction::WindowScreenshot => CaptureMode::Window,
+                ShortcutAction::FullscreenScreenshot => CaptureMode::Fullscreen,
+                ShortcutAction::CaptureLastRegion => CaptureMode::LastRegion,
+                _ => CaptureMode::Region,
+            };
+            Some(ShortcutOutcome::Command(AppCommand::StartCapture {
+                mode,
+                selection: DestinationSelection::Inherit,
+            }))
+        }
         ShortcutAction::ShowHistory => {
             Some(ShortcutOutcome::Command(AppCommand::Show(Window::History)))
         }
@@ -635,6 +655,18 @@ impl ShortcutManager {
         }
         let outcome = command_for(event.action)?;
         match outcome {
+            ShortcutOutcome::Command(crate::app::events::AppCommand::StartCapture {
+                mode, ..
+            }) => Some(ShortcutOutcome::Command(
+                crate::app::events::AppCommand::StartCapture {
+                    mode,
+                    selection: self
+                        .bindings
+                        .iter()
+                        .find(|b| b.action == event.action)?
+                        .destination,
+                },
+            )),
             ShortcutOutcome::OpenFilePicker(_) => Some(ShortcutOutcome::OpenFilePicker(
                 self.bindings
                     .iter()
@@ -981,7 +1013,7 @@ mod tests {
     #[test]
     fn unavailable_actions_are_never_registered_or_dispatched() {
         let (manager, fake) = manager_with(vec![binding(
-            ShortcutAction::RegionScreenshot,
+            ShortcutAction::ToggleScrollingCapture,
             chord(true, false, 0x52),
             true,
         )]);
@@ -990,11 +1022,11 @@ mod tests {
             "an unimplemented action's key must never be taken from the OS"
         );
         assert_eq!(
-            manager.status(ShortcutAction::RegionScreenshot),
+            manager.status(ShortcutAction::ToggleScrollingCapture),
             ShortcutStatus::NotYetImplemented
         );
         let event = ShortcutEvent {
-            action: ShortcutAction::RegionScreenshot,
+            action: ShortcutAction::ToggleScrollingCapture,
             repeat: false,
         };
         assert!(manager.handle(event, ShortcutFocus::Normal).is_none());

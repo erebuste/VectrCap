@@ -1,5 +1,6 @@
 //! Single owner for workflow/job acceptance and settings/credential transactions.
 //! There is no await point between reference inspection and durable commit.
+mod capture;
 use super::{
     destination_manager::{
         DestinationEdit, DestinationManager, DestinationReferences, DestinationRepository,
@@ -25,6 +26,7 @@ use crate::{
         windows::{clipboard::ClipboardWriter, shell_actions::ShellActions},
     },
 };
+pub use capture::{CaptureSurface, PinImage};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -154,6 +156,8 @@ struct FileBatch {
     completions: Vec<Option<JobCompletion>>,
 }
 pub struct AppController {
+    capture: Option<capture::CaptureWorkflow>,
+    pins: HashSet<Uuid>,
     batch_jobs: Vec<super::types::JobId>,
     history_query: crate::persistence::history::browser::HistoryQuery,
     manager: DestinationManager,
@@ -200,25 +204,11 @@ impl AppController {
             .destinations
             .is_empty()
             .then_some(Window::Settings);
-        // Cleanup can hash files, so keep it off the controller runtime.
-        if manager.settings().archive.cleanup_age_days.is_some() {
-            let policy = manager.settings().archive.clone();
-            let filename = manager.settings().filename.clone();
-            let history = history.clone();
-            std::thread::Builder::new()
-                .name("vectrcap-archive-cleanup".into())
-                .spawn(move || {
-                    if let Ok(root) = policy.resolved_root() {
-                        let archive =
-                            crate::persistence::archive::ArchiveStore::new(history, root, filename);
-                        let _ = archive.cleanup(&policy, chrono::Local::now());
-                    }
-                })
-                .map_err(|e| AppError::io("starting archive cleanup", &e))?;
-        }
         let mut notifications = NotificationCenter::new();
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
+            capture: None,
+            pins: HashSet::new(),
             manager,
             history,
             store,
@@ -237,6 +227,15 @@ impl AppController {
             lifecycle: Lifecycle::Running,
             window,
         })
+    }
+    pub fn startup_effects(&self) -> Vec<AppEffect> {
+        vec![AppEffect::ArchiveMaintenance(
+            super::image_finish::ArchiveMaintenance::new(
+                self.history.clone(),
+                self.settings().archive.clone(),
+                self.settings().filename.clone(),
+            ),
+        )]
     }
     pub fn shortcuts(&self) -> Option<&ShortcutManager> {
         self.shortcuts.as_ref()
@@ -777,7 +776,14 @@ impl AppController {
     }
     pub fn viewer_extension(artifact: &Artifact) -> Option<&'static str> {
         match artifact.kind {
-            ArtifactKind::Screenshot => Some("png"),
+            ArtifactKind::Screenshot => {
+                let extension = std::path::Path::new(&artifact.display_name)
+                    .extension()?
+                    .to_str()?;
+                ["png", "jpg", "jpeg", "webp"]
+                    .into_iter()
+                    .find(|known| known.eq_ignore_ascii_case(extension))
+            }
             ArtifactKind::Gif => Some("gif"),
             ArtifactKind::Mp4 => Some("mp4"),
             ArtifactKind::File => {
@@ -793,6 +799,40 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::StartCapture { mode, selection } => self.start_capture(mode, selection)?,
+            AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path,
+            } => self.finish_capture(session, Some(finish), save_path, Default::default()),
+            AppCommand::RetryCaptureFinish { session, decision } => {
+                self.finish_capture(session, None, None, decision)
+            }
+            AppCommand::CancelCapture(session) => self.cancel_capture(session),
+            AppCommand::CancelActiveCapture => {
+                if let Some(capture) = &self.capture {
+                    self.cancel_capture(capture.id)
+                } else {
+                    vec![]
+                }
+            }
+            AppCommand::ResumeCapture(session) => {
+                if let Some(capture) = &self.capture
+                    && capture.id == session
+                    && let Some(surface) = &capture.surface
+                {
+                    let mut surface = surface
+                        .lock()
+                        .map_err(|_| AppError::Capture("capture surface unavailable"))?;
+                    surface.working = false;
+                    surface.overlay.finish_failed(AppError::Cancelled);
+                }
+                vec![]
+            }
+            AppCommand::ClosePin(id) => {
+                self.pins.remove(&id);
+                vec![AppEffect::ClosePin(id)]
+            }
             AppCommand::SetHistoryPreferences(preferences) => {
                 self.manager.set_history_preferences(preferences)?;
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
@@ -809,6 +849,15 @@ impl AppController {
             }
             AppCommand::ShowBatchSummary(jobs) => self.show_batch_summary(jobs)?,
             AppCommand::Show(window) => {
+                if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.surface.is_none())
+                {
+                    return Err(AppError::InUse(
+                        "wait for capture acquisition or cancel it first",
+                    ));
+                }
                 self.shortcut_entry_active = None;
                 self.window = Some(window);
                 let mut effects = vec![AppEffect::Window(self.window)];
@@ -960,6 +1009,9 @@ impl AppController {
                 vec![]
             }
             AppCommand::NativeHotkeyFired(id) => {
+                if self.capture.is_some() {
+                    return Ok(vec![]);
+                }
                 if let Some(request) = self.shortcut_entry_active
                     && let Some(shortcuts) = &self.shortcuts
                     && let Some(action) = shortcuts.action_for_id(id)
@@ -1064,6 +1116,11 @@ impl AppController {
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
             AppCommand::Quit => {
+                let mut capture_effects = if let Some(capture) = &self.capture {
+                    self.cancel_capture(capture.id)
+                } else {
+                    vec![]
+                };
                 self.shortcuts = None;
                 self.lifecycle = Lifecycle::Draining;
                 // Workflows are deliberately NOT cleared here: a batch file
@@ -1074,12 +1131,14 @@ impl AppController {
                 // command but `Quit` itself reaches `apply` once Draining
                 // starts (checked in `dispatch`), so nothing new can be
                 // accepted into `workflows` from here on regardless.
-                vec![AppEffect::DrainWorker]
+                capture_effects.push(AppEffect::DrainWorker);
+                capture_effects
             }
         })
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::CaptureAcquired { session, result } => self.capture_acquired(session, result),
             AppEvent::WorkerStopped(result) => {
                 self.lifecycle = Lifecycle::Exited;
                 let mut effects = vec![];
@@ -1095,6 +1154,22 @@ impl AppController {
             AppEvent::Queue(crate::vectr::queue::QueueEffect::Changed(id)) => {
                 let mut effects = vec![];
                 if let Ok(Some(job)) = self.history.job(id) {
+                    if matches!(job.status, JobStatus::Completed(_))
+                        && self.settings().archive.storage_mode
+                            == crate::persistence::settings::StorageMode::PendingOrFailed
+                    {
+                        let result = self.settings().archive.resolved_root().and_then(|root| {
+                            crate::persistence::archive::ArchiveStore::new(
+                                self.history.clone(),
+                                root,
+                                self.settings().filename.clone(),
+                            )
+                            .reconcile_uploaded(&self.settings().archive)
+                        });
+                        if let Err(error) = result {
+                            effects.push(AppEffect::Error(error));
+                        }
+                    }
                     match self.completion_for(&job) {
                         Ok(Some(CompletionNotice::Job(completion))) => {
                             // A batch member's completion is collected into

@@ -522,3 +522,886 @@ fn nonautomatic_copy_pin_do_not_persist_and_upload_keeps_spool() {
         }
     }
 }
+
+#[derive(Default)]
+struct ImageClipboard {
+    images: std::sync::Mutex<Vec<Arc<RgbaImage>>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+impl vectrcap::platform::windows::clipboard::ClipboardWriter for ImageClipboard {
+    fn write_text(&self, _: &str) -> Result<(), vectrcap::app::error::AppError> {
+        Ok(())
+    }
+    fn write_image(&self, pixels: &RgbaImage) -> Result<(), vectrcap::app::error::AppError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(vectrcap::app::error::AppError::Persistence(
+                "injected image clipboard failure",
+            ));
+        }
+        self.images.lock().unwrap().push(Arc::new(pixels.clone()));
+        Ok(())
+    }
+}
+#[derive(Default)]
+struct FixtureCredentials(
+    std::sync::Mutex<std::collections::HashSet<vectrcap::app::destinations::CredentialKey>>,
+);
+impl vectrcap::platform::CredentialStore for FixtureCredentials {
+    fn read(
+        &self,
+        key: &vectrcap::app::destinations::CredentialKey,
+    ) -> Result<vectrcap::vectr::client::UploadToken, vectrcap::app::error::AppError> {
+        if !self.0.lock().unwrap().contains(key) {
+            return Err(vectrcap::app::error::AppError::NeedsSetup(
+                "fixture credential missing",
+            ));
+        }
+        vectrcap::vectr::client::UploadToken::new("synthetic".into())
+    }
+    fn write(
+        &self,
+        key: &vectrcap::app::destinations::CredentialKey,
+        _: &vectrcap::vectr::client::UploadToken,
+    ) -> Result<(), vectrcap::app::error::AppError> {
+        self.0.lock().unwrap().insert(key.clone());
+        Ok(())
+    }
+    fn delete(
+        &self,
+        key: &vectrcap::app::destinations::CredentialKey,
+    ) -> Result<(), vectrcap::app::error::AppError> {
+        self.0.lock().unwrap().remove(key);
+        Ok(())
+    }
+}
+
+struct FixtureShell;
+impl vectrcap::platform::windows::shell_actions::ShellActions for FixtureShell {
+    fn open_path(&self, _: &std::path::Path) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("no OS shell effect expected")
+    }
+    fn reveal_path(&self, _: &std::path::Path) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("no OS shell effect expected")
+    }
+    fn open_url(&self, _: &str) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("no network effect expected")
+    }
+}
+struct ControllerFixture {
+    storage: FinishFixture,
+    app: vectrcap::app::controller::AppController,
+    clipboard: Arc<ImageClipboard>,
+}
+impl ControllerFixture {
+    fn new() -> Self {
+        use vectrcap::app::{
+            controller::AppController, destination_manager::FileDestinationRepository,
+            events::AppCommand,
+        };
+        let storage = FinishFixture::new();
+        let clipboard = Arc::new(ImageClipboard::default());
+        let mut app = AppController::open(
+            Box::new(
+                FileDestinationRepository::open(&storage._dir.path().join("settings.json"))
+                    .unwrap(),
+            ),
+            storage.history.clone(),
+            Arc::new(FixtureCredentials::default()),
+            Arc::new(
+                vectrcap::persistence::artifacts::ArtifactStore::new(
+                    storage.artifacts.root().to_owned(),
+                )
+                .unwrap(),
+            ),
+            Arc::new(FixtureShell),
+            clipboard.clone(),
+        )
+        .unwrap();
+        let effects = app.dispatch(AppCommand::SetArchivePolicy {
+            policy: storage.policy.clone(),
+            revision: app.settings().revision,
+        });
+        assert_no_error(&effects);
+        Self {
+            storage,
+            app,
+            clipboard,
+        }
+    }
+    fn set_mode(&mut self, mode: vectrcap::persistence::settings::StorageMode) {
+        self.storage.policy.storage_mode = mode;
+        let effects = self
+            .app
+            .dispatch(vectrcap::app::events::AppCommand::SetArchivePolicy {
+                policy: self.storage.policy.clone(),
+                revision: self.app.settings().revision,
+            });
+        assert_no_error(&effects);
+    }
+    fn seed_destination(&mut self) {
+        use vectrcap::{
+            app::{destination_manager::DestinationEdit, events::AppCommand},
+            persistence::settings::ServerOrigin,
+            vectr::client::UploadToken,
+        };
+        let mut destinations = self.app.settings().destinations.clone();
+        let id = destinations
+            .add(
+                "Fixture",
+                ServerOrigin::parse("https://fixture.invalid").unwrap(),
+                None,
+            )
+            .unwrap();
+        let effects = self.app.dispatch(AppCommand::ApplyDestinations {
+            edit: DestinationEdit {
+                destinations,
+                tokens: vec![(id, UploadToken::new("synthetic".into()).unwrap())],
+            },
+            revision: self.app.settings().revision,
+        });
+        assert_no_error(&effects);
+    }
+    fn start(
+        &mut self,
+        mode: vectrcap::capture::request::CaptureMode,
+    ) -> (
+        uuid::Uuid,
+        Arc<std::sync::Mutex<vectrcap::app::controller::CaptureSurface>>,
+    ) {
+        use vectrcap::app::events::{AppCommand, AppEffect, AppEvent};
+        let effects = self.app.dispatch(AppCommand::StartCapture {
+            mode,
+            selection: Default::default(),
+        });
+        let (session, request) = effects
+            .into_iter()
+            .find_map(|e| match e {
+                AppEffect::AcquireCapture { session, request } => Some((session, request)),
+                _ => None,
+            })
+            .unwrap();
+        let snapshot = fixture_snapshot(request);
+        let surface = self
+            .app
+            .on_event(AppEvent::CaptureAcquired {
+                session,
+                result: Ok(snapshot),
+            })
+            .into_iter()
+            .find_map(|e| match e {
+                AppEffect::CaptureSurface(Some(surface)) => Some(surface),
+                _ => None,
+            })
+            .unwrap();
+        {
+            use vectrcap::ui::annotation_toolbar::AnnotationTool;
+            let mut state = surface.lock().unwrap();
+            state.overlay.clear_crop().unwrap();
+            state.overlay.set_tool(AnnotationTool::Region).unwrap();
+            state
+                .overlay
+                .pointer_down(PhysicalPoint { x: 0, y: 0 })
+                .unwrap();
+            state
+                .overlay
+                .pointer_move(PhysicalPoint { x: 20, y: 20 }, false)
+                .unwrap();
+            state
+                .overlay
+                .pointer_up(PhysicalPoint { x: 20, y: 20 }, false)
+                .unwrap();
+            state.overlay.set_tool(AnnotationTool::Redaction).unwrap();
+            state
+                .overlay
+                .pointer_down(PhysicalPoint { x: 0, y: 0 })
+                .unwrap();
+            state
+                .overlay
+                .pointer_up(PhysicalPoint { x: 12, y: 12 }, false)
+                .unwrap();
+        }
+        (session, surface)
+    }
+}
+fn assert_no_error(effects: &[vectrcap::app::events::AppEffect]) {
+    for effect in effects {
+        if let vectrcap::app::events::AppEffect::Error(error) = effect {
+            panic!("unexpected controller error: {error}");
+        }
+    }
+}
+fn fixture_snapshot(request: vectrcap::capture::request::CaptureRequest) -> CaptureSnapshot {
+    use vectrcap::{
+        app::error::AppError,
+        capture::{
+            request::{CaptureService, CaptureSource, Countdown},
+            windows::WindowCandidate,
+        },
+    };
+    struct Source;
+    impl CaptureSource for Source {
+        fn monitors(&mut self) -> Result<Vec<MonitorGeometry>, AppError> {
+            Ok(vec![MonitorGeometry::new(
+                "fixture".into(),
+                rect(-20, -10, 100, 80),
+                1.0,
+            )?])
+        }
+        fn pointer(&mut self) -> Result<PhysicalPoint, AppError> {
+            Ok(PhysicalPoint { x: 0, y: 0 })
+        }
+        fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError> {
+            Ok(vec![])
+        }
+        fn prepare_window(&mut self, _: WindowCandidate) -> Result<(), AppError> {
+            unreachable!()
+        }
+        fn desktop(
+            &mut self,
+            bounds: PhysicalRect,
+            _: &[MonitorGeometry],
+            _: bool,
+        ) -> Result<Vec<u8>, AppError> {
+            Ok(RgbaImage::from_fn(bounds.width(), bounds.height(), |x, y| {
+                Rgba([(x * 17) as u8, (y * 21) as u8, (x * y) as u8, 255])
+            })
+            .into_raw())
+        }
+        fn window(&mut self, _: WindowCandidate, _: bool) -> Result<Vec<u8>, AppError> {
+            unreachable!()
+        }
+    }
+    struct Clock;
+    impl Countdown for Clock {
+        fn wait(&mut self, _: u8, _: &tokio_util::sync::CancellationToken) -> Result<(), AppError> {
+            Ok(())
+        }
+        fn hide_chrome(&mut self) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+    CaptureService::new(Source, Clock, Default::default())
+        .snapshot(request)
+        .unwrap()
+}
+fn confirm_surface(
+    surface: &Arc<std::sync::Mutex<vectrcap::app::controller::CaptureSurface>>,
+    action: vectrcap::ui::capture_overlay::OverlayAction,
+    options: vectrcap::editor::export::ImageExportOptions,
+) -> vectrcap::ui::image_export::ImageFinish {
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut state = surface.lock().unwrap();
+        *state.overlay.output_mut().options_mut() = options;
+        state.overlay.prepare_output(move || {
+            tx.send(()).unwrap();
+        });
+    }
+    rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+    let mut state = surface.lock().unwrap();
+    state.overlay.prepare_output(|| {});
+    state.overlay.confirm_finish(action).unwrap()
+}
+fn archive_files(fx: &ControllerFixture) -> Vec<std::path::PathBuf> {
+    let root = fx.storage.policy.archive_root.as_ref().unwrap();
+    if !root.is_dir() {
+        return vec![];
+    }
+    std::fs::read_dir(root)
+        .unwrap()
+        .flat_map(|month| {
+            std::fs::read_dir(month.unwrap().path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+        })
+        .collect()
+}
+#[test]
+fn controller_copy_pin_and_upload_use_real_finish_pixels_in_every_format() {
+    use vectrcap::{
+        app::{
+            controller::AppController,
+            events::{AppCommand, AppEffect},
+        },
+        capture::request::CaptureMode,
+        editor::export::{ExportFormat, ImageExportOptions, Resize},
+        ui::capture_overlay::OverlayAction,
+    };
+    for format in [
+        ExportFormat::Png,
+        ExportFormat::Jpeg,
+        ExportFormat::WebpLossy,
+        ExportFormat::WebpLossless,
+    ] {
+        for action in [
+            OverlayAction::Copy,
+            OverlayAction::Pin,
+            OverlayAction::Upload,
+        ] {
+            let mut fx = ControllerFixture::new();
+            if action == OverlayAction::Upload {
+                fx.seed_destination();
+            }
+            let (session, surface) = fx.start(CaptureMode::Region);
+            let finish = confirm_surface(
+                &surface,
+                action,
+                ImageExportOptions::new(format, 73, Resize::Percent(50)).unwrap(),
+            );
+            let pixels = finish.prepared.pixels().clone();
+            let bytes = finish.prepared.encoded().clone();
+            let effects = fx.app.dispatch(AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path: None,
+            });
+            assert_no_error(&effects);
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, AppEffect::CaptureSurface(None)))
+            );
+            assert_eq!(
+                fx.app.settings().last_region.as_ref().unwrap().bounds(),
+                rect(0, 0, 20, 20)
+            );
+            if action == OverlayAction::Copy {
+                assert_eq!(
+                    fx.clipboard.images.lock().unwrap()[0].as_ref(),
+                    pixels.as_ref()
+                );
+            }
+            if action == OverlayAction::Pin {
+                let pin = effects
+                    .iter()
+                    .find_map(|e| {
+                        if let AppEffect::PinImage(pin) = e {
+                            Some(pin)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                assert!(Arc::ptr_eq(&pin.pixels, &pixels));
+                assert_eq!(pin.screen_location, Some(PhysicalPoint { x: 0, y: 0 }));
+            }
+            let paths = archive_files(&fx);
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].extension().unwrap(), format.extension());
+            assert_eq!(std::fs::read(&paths[0]).unwrap(), &*bytes);
+            assert_eq!(image::load_from_memory(&bytes).unwrap().to_rgba8(), *pixels);
+            let jobs = fx.storage.history.shell_jobs().unwrap();
+            if action == OverlayAction::Upload {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(std::fs::read(&jobs[0].artifact.path).unwrap(), &*bytes);
+                assert_eq!(
+                    AppController::viewer_extension(&jobs[0].artifact),
+                    Some(format.extension())
+                );
+            } else {
+                assert!(jobs.is_empty());
+                assert_eq!(
+                    std::fs::read_dir(fx.storage.artifacts.root())
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+}
+#[test]
+fn controller_archive_failure_then_explicit_continue_retains_editor() {
+    use vectrcap::{
+        app::{
+            events::{AppCommand, AppEffect},
+            image_finish::ArchiveDecision,
+        },
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    std::fs::write(fx.storage.policy.archive_root.as_ref().unwrap(), b"blocked").unwrap();
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Copy, Default::default());
+    let bytes = finish.prepared.encoded().clone();
+    let revision = surface.lock().unwrap().overlay.document().revision();
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    });
+    assert!(matches!(effects.as_slice(), [AppEffect::Error(_)]));
+    assert!(fx.app.settings().last_region.is_none());
+    assert!(fx.clipboard.images.lock().unwrap().is_empty());
+    assert!(surface.lock().unwrap().archive_failed);
+    let effects = fx.app.dispatch(AppCommand::RetryCaptureFinish {
+        session,
+        decision: ArchiveDecision::ContinueWithoutLocalCopy,
+    });
+    assert_no_error(&effects);
+    assert!(fx.app.settings().last_region.is_some());
+    assert_eq!(
+        surface.lock().unwrap().overlay.document().revision(),
+        revision
+    );
+    assert_eq!(
+        fx.clipboard.images.lock().unwrap()[0].as_ref(),
+        &image::load_from_memory(&bytes).unwrap().to_rgba8()
+    );
+}
+#[test]
+fn cancelled_failed_and_stale_sessions_never_update_last_region() {
+    use vectrcap::{
+        app::{
+            events::{AppCommand, AppEffect},
+            image_finish::ArchiveDecision,
+        },
+        capture::request::CaptureMode,
+        ui::{annotation_toolbar::AnnotationTool, capture_overlay::OverlayAction},
+    };
+    let mut fx = ControllerFixture::new();
+    fx.clipboard
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Copy, Default::default());
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    });
+    assert!(matches!(effects.as_slice(), [AppEffect::Error(_)]));
+    assert!(fx.app.settings().last_region.is_none());
+    {
+        let mut state = surface.lock().unwrap();
+        state.overlay.set_tool(AnnotationTool::Rectangle).unwrap();
+        state
+            .overlay
+            .pointer_down(PhysicalPoint { x: 2, y: 2 })
+            .unwrap();
+        state
+            .overlay
+            .pointer_up(PhysicalPoint { x: 8, y: 8 }, false)
+            .unwrap();
+    }
+    fx.clipboard
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let effects = fx.app.dispatch(AppCommand::RetryCaptureFinish {
+        session,
+        decision: ArchiveDecision::Retry,
+    });
+    assert!(matches!(effects.as_slice(), [AppEffect::Error(_)]));
+    assert!(fx.app.settings().last_region.is_none());
+    assert!(fx.clipboard.images.lock().unwrap().is_empty());
+    assert_no_error(&fx.app.dispatch(AppCommand::CancelCapture(session)));
+    assert!(fx.app.settings().last_region.is_none());
+    assert_eq!(
+        std::fs::read_dir(fx.storage.artifacts.root())
+            .unwrap()
+            .count(),
+        0
+    );
+}
+#[test]
+fn pending_archive_is_released_only_after_confirmed_upload_event() {
+    use vectrcap::{
+        app::{
+            events::{AppCommand, AppEffect, AppEvent},
+            types::UploadReceipt,
+        },
+        capture::request::CaptureMode,
+        persistence::{history::JobStatus, settings::StorageMode},
+        ui::capture_overlay::OverlayAction,
+        vectr::queue::QueueEffect,
+    };
+    let mut fx = ControllerFixture::new();
+    fx.seed_destination();
+    fx.set_mode(StorageMode::PendingOrFailed);
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Upload, Default::default());
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    });
+    assert_no_error(&effects);
+    let id = effects
+        .iter()
+        .find_map(|e| {
+            if let AppEffect::JobAccepted(id) = e {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let archive = archive_files(&fx).pop().unwrap();
+    fx.storage
+        .history
+        .transition(id, JobStatus::Running)
+        .unwrap();
+    let effects = fx.app.on_event(AppEvent::Queue(QueueEffect::Changed(id)));
+    assert_no_error(&effects);
+    assert!(archive.exists());
+    let job = fx.storage.history.job(id).unwrap().unwrap();
+    let session = uuid::Uuid::new_v4();
+    fx.storage.history.set_session(id, session).unwrap();
+    fx.storage
+        .history
+        .record_receipt(
+            id,
+            job.attempt,
+            Some(session),
+            &UploadReceipt::new("https://fixture.invalid/final.png", "final.png").unwrap(),
+        )
+        .unwrap();
+    assert!(
+        archive.exists(),
+        "receipt persistence precedes the controller settlement event"
+    );
+    assert_no_error(&fx.app.on_event(AppEvent::Queue(QueueEffect::Changed(id))));
+    assert!(!archive.exists());
+    assert!(
+        job.artifact.path.exists(),
+        "archive reconciliation cannot delete the upload spool"
+    );
+}
+#[test]
+fn cancelled_acquisition_ignores_late_snapshot_and_fullscreen_does_not_replace_region() {
+    use vectrcap::{
+        app::events::{AppCommand, AppEffect, AppEvent},
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    let effects = fx.app.dispatch(AppCommand::StartCapture {
+        mode: CaptureMode::Region,
+        selection: Default::default(),
+    });
+    let (session, request) = effects
+        .into_iter()
+        .find_map(|e| {
+            if let AppEffect::AcquireCapture { session, request } = e {
+                Some((session, request))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_no_error(&fx.app.dispatch(AppCommand::CancelCapture(session)));
+    assert!(
+        fx.app
+            .on_event(AppEvent::CaptureAcquired {
+                session,
+                result: Ok(fixture_snapshot(request))
+            })
+            .is_empty()
+    );
+    assert!(fx.app.settings().last_region.is_none());
+    let (session, surface) = fx.start(CaptureMode::Fullscreen);
+    let finish = confirm_surface(&surface, OverlayAction::Pin, Default::default());
+    assert_no_error(&fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    }));
+    assert!(fx.app.settings().last_region.is_none());
+    let (session, surface) = fx.start(CaptureMode::LastRegion);
+    let finish = confirm_surface(&surface, OverlayAction::Pin, Default::default());
+    assert_no_error(&fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    }));
+    assert_eq!(
+        fx.app.settings().last_region.as_ref().unwrap().bounds(),
+        rect(0, 0, 20, 20)
+    );
+}
+#[test]
+fn image_clipboard_serialization_preserves_top_down_final_rgba() {
+    let pixels = RgbaImage::from_fn(3, 2, |x, y| Rgba([x as u8 + 30, y as u8 + 40, 70, 128]));
+    let dib = vectrcap::platform::windows::clipboard::dibv5_bytes(&pixels).unwrap();
+    assert_eq!(&dib[8..12], &(-2i32).to_le_bytes());
+    assert_eq!(&dib[124..128], &[70, 40, 30, 128]);
+    // The BMP decoder is independent of our DIB serializer. Add only its file
+    // header so it can inspect every channel and the row orientation.
+    let mut bmp = vec![0u8; 14];
+    bmp[..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
+    bmp[10..14].copy_from_slice(&(138u32).to_le_bytes());
+    bmp.extend_from_slice(&dib);
+    let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(decoded, pixels);
+}
+
+#[test]
+fn copy_staging_failure_can_continue_in_memory_but_upload_cannot() {
+    use vectrcap::{
+        app::image_finish::{ArchiveDecision, ImageFinishTransaction},
+        ui::capture_overlay::OverlayAction,
+    };
+    for action in [OverlayAction::Copy, OverlayAction::Upload] {
+        let fx = FinishFixture::new();
+        std::fs::remove_dir(fx.artifacts.root()).unwrap();
+        std::fs::write(fx.artifacts.root(), b"blocked staging folder").unwrap();
+        let finish = image_finish(&selected_redacted_document(), action, Default::default());
+        let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+        assert!(
+            fx.persist(&mut transaction, ArchiveDecision::Retry)
+                .is_err()
+        );
+        let continued = fx.persist(&mut transaction, ArchiveDecision::ContinueWithoutLocalCopy);
+        assert_eq!(continued.is_ok(), action == OverlayAction::Copy);
+        assert!(transaction.artifact().is_none());
+        assert!(transaction.archive().is_none());
+    }
+}
+#[test]
+fn changing_storage_mode_cannot_silently_bypass_a_failed_archive() {
+    use vectrcap::{
+        app::image_finish::{ArchiveDecision, ImageFinishTransaction},
+        persistence::settings::StorageMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = FinishFixture::new();
+    std::fs::write(fx.policy.archive_root.as_ref().unwrap(), b"blocked").unwrap();
+    let mut transaction = ImageFinishTransaction::new(image_finish(
+        &selected_redacted_document(),
+        OverlayAction::Copy,
+        Default::default(),
+    ))
+    .unwrap();
+    assert!(
+        fx.persist(&mut transaction, ArchiveDecision::Retry)
+            .is_err()
+    );
+    fx.policy.storage_mode = StorageMode::NeverAutomatic;
+    assert!(
+        fx.persist(&mut transaction, ArchiveDecision::Retry)
+            .is_err()
+    );
+    fx.persist(&mut transaction, ArchiveDecision::ContinueWithoutLocalCopy)
+        .unwrap();
+}
+#[test]
+fn copy_retry_reuses_archive_and_committed_last_region_survives_restart() {
+    use vectrcap::{
+        app::{
+            controller::AppController, destination_manager::FileDestinationRepository,
+            events::AppCommand,
+        },
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    fx.clipboard
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Copy, Default::default());
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    });
+    assert!(matches!(
+        effects.as_slice(),
+        [vectrcap::app::events::AppEffect::Error(_)]
+    ));
+    let first = archive_files(&fx);
+    assert_eq!(first.len(), 1);
+    fx.clipboard
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Pressing the finish button again must be just as safe as the Retry button.
+    let finish = surface
+        .lock()
+        .unwrap()
+        .overlay
+        .confirm_finish(OverlayAction::Copy)
+        .unwrap();
+    assert_no_error(&fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    }));
+    assert_eq!(archive_files(&fx), first);
+    let expected = fx.app.settings().last_region.clone();
+    let path = fx.storage._dir.path().to_owned();
+    let history = fx.storage.history.clone();
+    drop(fx.app);
+    let reloaded = AppController::open(
+        Box::new(FileDestinationRepository::open(&path.join("settings.json")).unwrap()),
+        history,
+        Arc::new(FixtureCredentials::default()),
+        Arc::new(vectrcap::persistence::artifacts::ArtifactStore::new(path.join("spool")).unwrap()),
+        Arc::new(FixtureShell),
+        Arc::new(ImageClipboard::default()),
+    )
+    .unwrap();
+    assert_eq!(reloaded.settings().last_region, expected);
+    assert!(expected.is_some());
+}
+
+#[test]
+fn real_finish_quality_changes_never_replace_an_accepted_upload() {
+    use vectrcap::{
+        app::events::AppCommand,
+        capture::request::CaptureMode,
+        editor::export::{ExportFormat, ImageExportOptions, Resize},
+        persistence::settings::StorageMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    for format in [ExportFormat::Jpeg, ExportFormat::WebpLossy] {
+        let mut fx = ControllerFixture::new();
+        fx.seed_destination();
+        fx.set_mode(StorageMode::NeverAutomatic);
+        let mut encoded = Vec::new();
+        let mut artifacts = Vec::new();
+        for quality in [10, 95] {
+            let (session, surface) = fx.start(CaptureMode::Region);
+            let finish = confirm_surface(
+                &surface,
+                OverlayAction::Upload,
+                ImageExportOptions::new(format, quality, Resize::Width(15)).unwrap(),
+            );
+            assert_eq!(finish.prepared.dimensions(), (15, 15));
+            encoded.push(finish.prepared.encoded().clone());
+            assert_no_error(&fx.app.dispatch(AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path: None,
+            }));
+            let jobs = fx.storage.history.shell_jobs().unwrap();
+            artifacts.push(
+                jobs.iter()
+                    .find(|job| {
+                        !artifacts
+                            .iter()
+                            .any(|old: &vectrcap::app::types::Artifact| old.id == job.artifact.id)
+                    })
+                    .unwrap()
+                    .artifact
+                    .clone(),
+            );
+        }
+        assert_ne!(encoded[0], encoded[1]);
+        assert_ne!(encoded[0].len(), encoded[1].len());
+        for (artifact, expected) in artifacts.iter().zip(&encoded) {
+            assert_eq!(std::fs::read(&artifact.path).unwrap(), &**expected);
+        }
+        assert!(archive_files(&fx).is_empty());
+    }
+}
+
+#[test]
+fn cancellation_closes_even_when_a_staged_output_is_temporarily_locked() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use vectrcap::{
+        app::events::{AppCommand, AppEffect},
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    fx.clipboard
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Copy, Default::default());
+    assert!(matches!(
+        fx.app
+            .dispatch(AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path: None
+            })
+            .as_slice(),
+        [AppEffect::Error(_)]
+    ));
+    let path = std::fs::read_dir(fx.storage.artifacts.root())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // The borrowed read handle intentionally refuses delete sharing.
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(path)
+        .unwrap();
+    let effects = fx.app.dispatch(AppCommand::CancelCapture(session));
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::CaptureSurface(None)))
+    );
+    assert!(fx.app.settings().last_region.is_none());
+    drop(guard);
+    assert_eq!(
+        fx.storage.artifacts.recover(&Default::default()).unwrap(),
+        1
+    );
+    let effects = fx.app.dispatch(AppCommand::StartCapture {
+        mode: CaptureMode::Region,
+        selection: Default::default(),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::AcquireCapture { .. }))
+    );
+}
+#[test]
+fn acquisition_failure_is_visible_and_cannot_save_last_region() {
+    use vectrcap::{
+        app::{
+            error::AppError,
+            events::{AppCommand, AppEffect, AppEvent, Window},
+        },
+        capture::request::CaptureMode,
+    };
+    let mut fx = ControllerFixture::new();
+    let effects = fx.app.dispatch(AppCommand::StartCapture {
+        mode: CaptureMode::Region,
+        selection: Default::default(),
+    });
+    let session = effects
+        .iter()
+        .find_map(|e| {
+            if let AppEffect::AcquireCapture { session, .. } = e {
+                Some(*session)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let effects = fx.app.on_event(AppEvent::CaptureAcquired {
+        session,
+        result: Err(AppError::Capture("injected source failure")),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::Settings))))
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::Error(AppError::Capture(_))))
+    );
+    assert!(fx.app.settings().last_region.is_none());
+    assert!(archive_files(&fx).is_empty());
+    assert_eq!(
+        std::fs::read_dir(fx.storage.artifacts.root())
+            .unwrap()
+            .count(),
+        0
+    );
+}

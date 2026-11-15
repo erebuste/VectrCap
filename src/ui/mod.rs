@@ -1,4 +1,5 @@
 pub mod annotation_toolbar;
+pub mod capture_host;
 pub mod capture_overlay;
 pub mod destinations;
 pub mod image_export;

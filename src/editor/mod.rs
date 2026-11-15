@@ -7,6 +7,7 @@ pub mod export;
 pub mod render;
 pub mod shapes;
 pub mod text;
+mod webp;
 
 pub use commands::EditorCommand;
 pub use document::{Annotation, EditorDocument, Style};

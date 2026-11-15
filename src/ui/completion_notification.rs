@@ -90,6 +90,8 @@ pub fn draw(
 /// Completion windows never alter the main shell's visibility or focus.
 pub fn surface_visible(view: &DesktopView) -> bool {
     view.notifications_enabled
+        && view.capture_acquiring.is_none()
+        && view.capture_surface.is_none()
         && !view.notices.is_empty()
         && view.lifecycle == crate::app::events::Lifecycle::Running
 }

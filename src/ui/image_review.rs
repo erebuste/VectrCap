@@ -185,20 +185,16 @@ impl Default for ImageViewport {
         }
     }
 }
+pub(crate) struct ImageCanvas {
+    pub rect: egui::Rect,
+    pub response: egui::Response,
+    pub offset: (f64, f64),
+    pub zoom: f64,
+}
+
 impl ImageViewport {
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        pixels: &Arc<RgbaImage>,
-    ) -> Result<(egui::Response, Option<PhysicalPoint>), AppError> {
-        if self
-            .tiled
-            .as_ref()
-            .is_none_or(|t| !Arc::ptr_eq(t.pixels(), pixels))
-        {
-            self.tiled = Some(TiledImage::new(pixels.clone())?);
-        }
-        let min_zoom = (1.0 / f64::from(pixels.width().max(pixels.height()))).max(0.000001);
+    pub(crate) fn canvas(&mut self, ui: &mut egui::Ui, dimensions: (u32, u32)) -> ImageCanvas {
+        let min_zoom = (1.0 / f64::from(dimensions.0.max(dimensions.1))).max(0.000001);
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::Slider::new(&mut self.zoom, min_zoom..=32.0)
@@ -209,10 +205,10 @@ impl ImageViewport {
                 self.zoom = 1.0;
             }
             if ui.button("Fit image").clicked() {
-                self.zoom = (f64::from(ui.available_width()) / f64::from(pixels.width()))
+                self.zoom = (f64::from(ui.available_width()) / f64::from(dimensions.0))
                     .min(
                         f64::from((ui.available_height() - 60.0).max(1.0))
-                            / f64::from(pixels.height()),
+                            / f64::from(dimensions.1),
                     )
                     .clamp(min_zoom, 32.0);
                 self.offset = (0.0, 0.0);
@@ -222,8 +218,8 @@ impl ImageViewport {
             ui.available_width().max(1.0),
             (ui.available_height() - 60.0).max(80.0),
         );
-        let max_x = (f64::from(pixels.width()) - f64::from(size.x) / self.zoom).max(0.0);
-        let max_y = (f64::from(pixels.height()) - f64::from(size.y) / self.zoom).max(0.0);
+        let max_x = (f64::from(dimensions.0) - f64::from(size.x) / self.zoom).max(0.0);
+        let max_y = (f64::from(dimensions.1) - f64::from(size.y) / self.zoom).max(0.0);
         self.offset.0 = self.offset.0.clamp(0.0, max_x);
         self.offset.1 = self.offset.1.clamp(0.0, max_y);
         ui.add_enabled_ui(max_x > 0.0, |ui| {
@@ -242,6 +238,29 @@ impl ImageViewport {
             self.offset.0 = (self.offset.0 - f64::from(scroll.x) / self.zoom).clamp(0.0, max_x);
             self.offset.1 = (self.offset.1 - f64::from(scroll.y) / self.zoom).clamp(0.0, max_y);
         }
+        ImageCanvas {
+            rect,
+            response,
+            offset: self.offset,
+            zoom: self.zoom,
+        }
+    }
+
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        pixels: &Arc<RgbaImage>,
+    ) -> Result<(egui::Response, Option<PhysicalPoint>), AppError> {
+        if self
+            .tiled
+            .as_ref()
+            .is_none_or(|t| !Arc::ptr_eq(t.pixels(), pixels))
+        {
+            self.tiled = Some(TiledImage::new(pixels.clone())?);
+        }
+        let canvas = self.canvas(ui, pixels.dimensions());
+        let rect = canvas.rect;
+        let response = canvas.response;
         ui.painter()
             .rect_filled(rect, 0, egui::Color32::from_gray(40));
         self.tiled
@@ -271,10 +290,9 @@ impl ImageViewport {
 /// Reusable native egui review surface. The owner receives typed finish events;
 /// archive, clipboard, Pin and upload effects stay outside the image widgets.
 pub struct ImageReview {
-    document: crate::editor::EditorDocument,
-    output: super::image_export::ImageExportPane,
+    editor: super::capture_overlay::CaptureOverlay,
+    viewport: ImageViewport,
     open: bool,
-    error: Option<AppError>,
 }
 pub enum ImageReviewEvent {
     Finish(super::image_export::ImageFinish),
@@ -283,10 +301,9 @@ pub enum ImageReviewEvent {
 impl ImageReview {
     pub fn new(document: crate::editor::EditorDocument) -> Self {
         Self {
-            document,
-            output: Default::default(),
+            editor: super::capture_overlay::CaptureOverlay::new(document),
+            viewport: Default::default(),
             open: true,
-            error: None,
         }
     }
     pub fn from_image(pixels: Arc<RgbaImage>) -> Result<Self, AppError> {
@@ -295,47 +312,153 @@ impl ImageReview {
         )?))
     }
     pub fn document(&self) -> &crate::editor::EditorDocument {
-        &self.document
+        self.editor.document()
+    }
+    pub fn editor_mut(&mut self) -> &mut super::capture_overlay::CaptureOverlay {
+        &mut self.editor
     }
     pub fn apply(&mut self, command: crate::editor::EditorCommand) -> Result<(), AppError> {
-        self.document
-            .apply(command)
-            .inspect_err(|error| self.error = Some(error.clone()))?;
-        self.error = None;
-        Ok(())
+        self.editor.apply_command(command)
     }
-    /// A failed downstream save/copy must return the useful editable document
-    /// and selected output settings to the user, not discard this review.
     pub fn finish_failed(&mut self, error: AppError) {
-        self.output.set_finishing(false);
-        self.error = Some(error);
+        self.editor.finish_failed(error);
     }
     pub fn show(&mut self, ctx: &egui::Context) -> Option<ImageReviewEvent> {
+        self.show_with_shortcuts(ctx, &Default::default())
+    }
+    pub fn show_with_shortcuts(
+        &mut self,
+        ctx: &egui::Context,
+        saved: &crate::app::shortcuts::ShortcutSettings,
+    ) -> Option<ImageReviewEvent> {
         if !self.open {
             return None;
         }
         let mut open = self.open;
         let mut event = None;
         egui::Window::new("Image review")
-            .id(egui::Id::unique(("image-review", self.document.id())))
+            .id(egui::Id::unique(("image-review", self.document().id())))
             .open(&mut open)
             .default_size([900.0, 760.0])
-            .vscroll(true)
             .show(ctx, |ui| {
-                if let Some(error) = &self.error {
-                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                }
-                if ui.button("Cancel review").clicked() {
-                    event = Some(ImageReviewEvent::Cancel);
-                }
-                if let Some(finish) = self.output.draw(ui, &self.document) {
-                    event = Some(ImageReviewEvent::Finish(finish));
-                }
+                event = self
+                    .editor
+                    .show_review(ui, saved, &mut self.viewport)
+                    .map(|event| match event {
+                        super::capture_overlay::CaptureOverlayEvent::Finish(finish) => {
+                            ImageReviewEvent::Finish(finish)
+                        }
+                        super::capture_overlay::CaptureOverlayEvent::Cancel => {
+                            ImageReviewEvent::Cancel
+                        }
+                    });
             });
         if !open || matches!(event, Some(ImageReviewEvent::Cancel)) {
             self.open = false;
             return Some(ImageReviewEvent::Cancel);
         }
         event
+    }
+}
+
+#[cfg(test)]
+mod editing_tests {
+    use super::*;
+    use crate::ui::{
+        annotation_toolbar::AnnotationTool,
+        capture_overlay::{CaptureOverlay, OverlayTransform},
+    };
+    #[test]
+    fn zoomed_scrolled_review_uses_the_real_annotation_event_loop() {
+        let pixels = Arc::new(RgbaImage::from_pixel(
+            80,
+            4000,
+            image::Rgba([200, 100, 50, 255]),
+        ));
+        let mut editor =
+            CaptureOverlay::new(crate::editor::EditorDocument::from_image(pixels.clone()).unwrap());
+        editor.set_tool(AnnotationTool::Redaction).unwrap();
+        let mut viewport = ImageViewport {
+            zoom: 2.0,
+            offset: (0.0, 3000.0),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut canvas_rect = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(raw.clone(), |ui| {
+            canvas_rect = viewport.canvas(ui, (80, 4000)).rect;
+        });
+        output.textures_delta.clear();
+        // First establish floating chrome before targeting a point below it.
+        let mut output = ctx.run_ui(raw.clone(), |ui| {
+            assert!(
+                editor
+                    .show_review(ui, &Default::default(), &mut viewport)
+                    .is_none()
+            );
+        });
+        output.textures_delta.clear();
+        let transform = OverlayTransform::for_review(
+            editor.document().bounds(),
+            canvas_rect,
+            viewport.offset,
+            viewport.zoom,
+        )
+        .unwrap();
+        let start = PhysicalPoint { x: 10, y: 3300 };
+        let end = PhysicalPoint { x: 30, y: 3320 };
+        for (point, pressed) in [(start, true), (end, false)] {
+            let pos = transform.logical(point);
+            let mut input = raw.clone();
+            input.events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ];
+            let mut output = ctx.run_ui(input, |ui| {
+                assert!(
+                    editor
+                        .show_review(ui, &Default::default(), &mut viewport)
+                        .is_none()
+                );
+            });
+            output.textures_delta.clear();
+        }
+        let doc = editor.document();
+        assert_eq!(doc.annotations().len(), 1);
+        let crate::editor::Annotation::Redaction { bounds, .. } = doc.annotations()[0] else {
+            panic!("expected completed redaction");
+        };
+        assert_eq!(bounds, PhysicalRect::new(10, 3300, 20, 20).unwrap());
+        assert!(Arc::ptr_eq(doc.source(), &pixels));
+        assert_eq!(doc.screen_location(), None);
+        let exported = crate::editor::render_export(doc).unwrap();
+        assert_eq!(exported.get_pixel(15, 3305).0, [255, 60, 60, 255]);
+        assert_eq!(exported.get_pixel(0, 0).0, [200, 100, 50, 255]);
+    }
+    #[test]
+    fn review_transform_preserves_large_offsets_and_checks_input() {
+        let bounds = PhysicalRect::new(0, 0, 37, 200000).unwrap();
+        let view = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 500.0));
+        for zoom in [0.0025, 1.0, 2.0, 32.0] {
+            let t = OverlayTransform::for_review(bounds, view, (0.0, 199500.0), zoom).unwrap();
+            let point = PhysicalPoint { x: 7, y: 199501 };
+            let center = t.logical(point) + egui::Vec2::splat((0.5 * zoom) as f32);
+            assert_eq!(t.physical(center), Some(point));
+        }
+        assert!(OverlayTransform::for_review(bounds, view, (f64::NAN, 0.0), 1.0).is_err());
+        assert!(OverlayTransform::for_review(bounds, view, (0.0, 200000.0), 1.0).is_err());
+        assert!(OverlayTransform::for_review(bounds, view, (0.0, 0.0), 0.0).is_err());
     }
 }

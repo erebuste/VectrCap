@@ -98,6 +98,151 @@ fn pick_existing_files() -> Result<Option<Vec<PathBuf>>, AppError> {
     }
 }
 
+/// A native Save chooser selects a path only. Publication remains with the
+/// validated finish transaction and always refuses an existing destination.
+fn pick_image_save(extension: &str) -> Result<Option<PathBuf>, AppError> {
+    use windows::{
+        Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog},
+        core::PCWSTR,
+    };
+    let extension: Vec<u16> = extension.encode_utf16().chain([0]).collect();
+    let name: Vec<u16> = "VectrCap".encode_utf16().chain([0]).collect();
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|_| error())?;
+        let _com = Com;
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).map_err(|_| error())?;
+        dialog
+            .SetOptions(
+                dialog.GetOptions().map_err(|_| error())? | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST,
+            )
+            .map_err(|_| error())?;
+        dialog
+            .SetDefaultExtension(PCWSTR(extension.as_ptr()))
+            .map_err(|_| error())?;
+        dialog
+            .SetFileName(PCWSTR(name.as_ptr()))
+            .map_err(|_| error())?;
+        match dialog.Show(None) {
+            Ok(()) => {}
+            Err(e) if e.code().0 == ERROR_CANCELLED => return Ok(None),
+            Err(_) => return Err(error()),
+        }
+        let item = dialog.GetResult().map_err(|_| error())?;
+        let name = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|_| error())?;
+        let text = name.to_string().map_err(|_| error());
+        CoTaskMemFree(Some(name.0.cast()));
+        Ok(Some(PathBuf::from(text?)))
+    }
+}
+
+pub fn spawn_capture_save(
+    client: DesktopClient,
+    surface: Arc<std::sync::Mutex<crate::app::controller::CaptureSurface>>,
+    finish: crate::ui::image_export::ImageFinish,
+) {
+    spawn_capture_dialog(
+        client,
+        surface,
+        move |client, session| match pick_image_save(finish.prepared.extension())? {
+            Some(path) => client.submit(AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path: Some(path),
+            }),
+            None => client.submit(AppCommand::ResumeCapture(session)),
+        },
+    );
+}
+
+pub fn spawn_capture_archive_folder(
+    client: DesktopClient,
+    surface: Arc<std::sync::Mutex<crate::app::controller::CaptureSurface>>,
+    mut policy: crate::persistence::settings::ArchivePolicy,
+    revision: u64,
+) {
+    spawn_capture_dialog(client, surface, move |client, _| unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|_| error())?;
+        let _com = Com;
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER).map_err(|_| error())?;
+        dialog
+            .SetOptions(
+                FOS_FORCEFILESYSTEM
+                    | FOS_PATHMUSTEXIST
+                    | windows::Win32::UI::Shell::FOS_PICKFOLDERS,
+            )
+            .map_err(|_| error())?;
+        match dialog.Show(None) {
+            Ok(()) => {}
+            Err(e) if e.code().0 == ERROR_CANCELLED => return Ok(()),
+            Err(_) => return Err(error()),
+        }
+        let item = dialog.GetResult().map_err(|_| error())?;
+        let name = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|_| error())?;
+        let text = name.to_string().map_err(|_| error());
+        CoTaskMemFree(Some(name.0.cast()));
+        policy.archive_root = Some(PathBuf::from(text?));
+        policy.validate()?;
+        client.submit(AppCommand::SetArchivePolicy { policy, revision })
+    });
+}
+
+fn spawn_capture_dialog(
+    client: DesktopClient,
+    surface: Arc<std::sync::Mutex<crate::app::controller::CaptureSurface>>,
+    picker: impl FnOnce(&DesktopClient, uuid::Uuid) -> Result<(), AppError> + Send + 'static,
+) {
+    let Ok(mut state) = surface.lock() else {
+        client.report_error(error());
+        return;
+    };
+    if state.dialog_open {
+        return;
+    }
+    state.dialog_open = true;
+    let session = state.session;
+    drop(state);
+    let report = client.clone();
+    let reset = surface.clone();
+    if std::thread::Builder::new()
+        .name("vectrcap-capture-picker".into())
+        .spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| picker(&client, session)))
+                    .unwrap_or(Err(AppError::Persistence("capture picker worker failed")));
+            if let Ok(mut state) = surface.lock() {
+                state.dialog_open = false;
+                if let Err(error) = &result {
+                    state.working = false;
+                    state.overlay.finish_failed(error.clone());
+                }
+            }
+            if let Err(error) = result {
+                client.report_error(error);
+            }
+            // Even a cancelled picker must wake the hidden capture viewport.
+            client.wake();
+        })
+        .is_err()
+    {
+        if let Ok(mut state) = reset.lock() {
+            state.dialog_open = false;
+            state.working = false;
+            state.overlay.finish_failed(error());
+        }
+        report.report_error(error());
+    }
+}
+
 /// Single-flight gate: at most one native picker dialog may be open at a
 /// time. Acquiring it returns a guard that releases on drop, including on a
 /// panic inside the picker thread or a failed thread launch — so a failure
@@ -157,6 +302,13 @@ pub fn spawn_pick_with_selection<P>(
 {
     // Shutting down: never open a dialog, never touch a file.
     if client.snapshot().lifecycle != Lifecycle::Running {
+        return;
+    }
+    let view = client.snapshot();
+    if view.capture_acquiring.is_some() || view.capture_surface.is_some() {
+        client.report_error(AppError::InUse(
+            "finish or cancel the capture before choosing upload files",
+        ));
         return;
     }
     let Some(guard) = gate.try_acquire() else {

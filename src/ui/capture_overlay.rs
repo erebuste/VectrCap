@@ -30,6 +30,7 @@ pub struct OverlayTransform {
     bounds: PhysicalRect,
     viewport: egui::Rect,
     pixels_per_point: f32,
+    source_offset: (f64, f64),
 }
 impl OverlayTransform {
     pub fn new(
@@ -49,6 +50,38 @@ impl OverlayTransform {
             bounds,
             viewport,
             pixels_per_point,
+            source_offset: (0.0, 0.0),
+        })
+    }
+    /// Image-review zoom/pan changes presentation only. Source offsets remain
+    /// f64 and are subtracted before conversion to egui's f32 coordinates.
+    pub fn for_review(
+        bounds: PhysicalRect,
+        viewport: egui::Rect,
+        source_offset: (f64, f64),
+        zoom: f64,
+    ) -> Result<Self, AppError> {
+        bounds.rgba_len()?;
+        if !viewport.is_finite()
+            || !viewport.is_positive()
+            || !zoom.is_finite()
+            || !(0.000001..=32.0).contains(&zoom)
+            || !source_offset.0.is_finite()
+            || !source_offset.1.is_finite()
+            || source_offset.0 < 0.0
+            || source_offset.1 < 0.0
+            || source_offset.0 >= f64::from(bounds.width())
+            || source_offset.1 >= f64::from(bounds.height())
+        {
+            return Err(AppError::InvalidInput(
+                "image review view geometry is invalid",
+            ));
+        }
+        Ok(Self {
+            bounds,
+            viewport,
+            source_offset,
+            pixels_per_point: (1.0 / zoom) as f32,
         })
     }
     pub fn physical(&self, p: egui::Pos2) -> Option<PhysicalPoint> {
@@ -56,8 +89,10 @@ impl OverlayTransform {
             return None;
         }
         let x = f64::from(self.bounds.left())
+            + self.source_offset.0
             + f64::from(p.x - self.viewport.left()) * f64::from(self.pixels_per_point);
         let y = f64::from(self.bounds.top())
+            + self.source_offset.1
             + f64::from(p.y - self.viewport.top()) * f64::from(self.pixels_per_point);
         if x < f64::from(i32::MIN)
             || x > f64::from(i32::MAX)
@@ -75,9 +110,9 @@ impl OverlayTransform {
     pub fn logical(&self, p: PhysicalPoint) -> egui::Pos2 {
         self.viewport.min
             + egui::vec2(
-                ((i64::from(p.x) - i64::from(self.bounds.left())) as f64
+                (((i64::from(p.x) - i64::from(self.bounds.left())) as f64 - self.source_offset.0)
                     / f64::from(self.pixels_per_point)) as f32,
-                ((i64::from(p.y) - i64::from(self.bounds.top())) as f64
+                (((i64::from(p.y) - i64::from(self.bounds.top())) as f64 - self.source_offset.1)
                     / f64::from(self.pixels_per_point)) as f32,
             )
     }
@@ -228,6 +263,15 @@ impl CaptureOverlay {
         self.error = None;
         self.sync_selection()
     }
+    pub fn apply_command(&mut self, command: EditorCommand) -> Result<(), AppError> {
+        self.editable()?;
+        if self.has_active_edit() {
+            return Err(AppError::InUse(
+                "complete the active edit before applying a command",
+            ));
+        }
+        self.apply(command)
+    }
     pub fn set_tool(&mut self, tool: AnnotationTool) -> Result<(), AppError> {
         self.editable()?;
         if self.has_active_edit() {
@@ -372,6 +416,44 @@ impl CaptureOverlay {
         self.finishing = false;
         self.output.set_finishing(false);
         self.error = Some(error);
+    }
+    /// Recheck at the controller boundary, including edits made while a failed
+    /// archive was waiting for an explicit retry/continue decision.
+    pub fn validate_finish(
+        &self,
+        finish: &super::image_export::ImageFinish,
+    ) -> Result<(), AppError> {
+        if self.cancelled
+            || self.has_active_edit()
+            || finish.screen_location != self.document.screen_location()
+            || !finish
+                .prepared
+                .matches(&self.document, self.output.options())
+            || self.output.ready(&self.document).is_none()
+        {
+            return Err(AppError::InvalidInput(
+                "image finish is stale; confirm the current output",
+            ));
+        }
+        Ok(())
+    }
+    pub fn output_mut(&mut self) -> &mut ImageExportPane {
+        &mut self.output
+    }
+    pub fn prepare_output(&mut self, wake: impl FnOnce() + Send + 'static) {
+        self.output.update(&self.document, wake);
+    }
+    pub fn confirm_finish(
+        &mut self,
+        action: OverlayAction,
+    ) -> Result<super::image_export::ImageFinish, AppError> {
+        if self.has_active_edit() || self.cancelled || self.finishing {
+            return Err(AppError::InUse("complete the active edit before finishing"));
+        }
+        let finish = self.output.confirm(&self.document, action)?;
+        self.finishing = true;
+        self.output.set_finishing(true);
+        Ok(finish)
     }
     fn selection_outcome(
         &mut self,

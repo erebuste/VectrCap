@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
+    capture_host: super::capture_host::CaptureHost,
     shown_since: Arc<
         std::sync::Mutex<
             std::collections::HashMap<crate::app::notifications::NoticeId, std::time::Instant>,
@@ -41,6 +42,7 @@ impl Shell {
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
+            capture_host: Default::default(),
             view: client.snapshot(),
             client,
             tray,
@@ -85,6 +87,7 @@ impl eframe::App for Shell {
             self.submit(AppCommand::Show(Window::Settings));
         }
         self.view = self.client.snapshot();
+        self.capture_host.show(ctx, &self.client, &self.view);
         if self.picker_requests != self.view.picker_requests {
             self.picker_requests = self.view.picker_requests;
             crate::platform::windows::file_dialog::spawn_pick_and_upload_for(
