@@ -57,6 +57,23 @@ pub(crate) fn validate_text(text: &str) -> Result<(), AppError> {
     }
     Ok(())
 }
+pub(crate) fn measure(text: &str, size: f32) -> Result<(f32, f32), AppError> {
+    let mut width = 0.0f32;
+    let mut line = 0.0f32;
+    let mut height = size * 1.3;
+    for c in text.chars() {
+        if c == '\n' {
+            width = width.max(line);
+            line = 0.0;
+            height += size * 1.3;
+        } else if c == '\t' {
+            line += size * 2.0;
+        } else {
+            line += font_for(c)?.metrics(c, size).advance_width;
+        }
+    }
+    Ok((width.max(line), height))
+}
 pub(crate) fn draw(
     canvas: &mut Pixmap,
     crop: PhysicalRect,

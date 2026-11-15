@@ -30,9 +30,67 @@ pub fn render_export(document: &EditorDocument) -> Result<RgbaImage, AppError> {
         .ok_or(AppError::Encoder("output dimensions are invalid"))?;
     let mut canvas = tiny_skia::Pixmap::from_vec(data, size)
         .ok_or(AppError::Encoder("output buffer dimensions are invalid"))?;
+    super::effects::spotlight(&mut canvas, crop, document.annotations());
     for a in document.annotations() {
         a.validate()?;
         match a {
+            Annotation::Ellipse { bounds, style, .. } => {
+                super::shapes::shape(&mut canvas, &super::shapes::ellipse(*bounds, crop)?, style)
+            }
+            Annotation::Line {
+                start,
+                end,
+                color,
+                width,
+                ..
+            } => super::shapes::stroke(&mut canvas, &[*start, *end], crop, *color, *width)?,
+            Annotation::Arrow {
+                start,
+                end,
+                color,
+                width,
+                ..
+            } => super::shapes::arrow(&mut canvas, *start, *end, crop, *color, *width)?,
+            Annotation::Step {
+                center,
+                radius,
+                color,
+                number,
+                ..
+            } => super::shapes::step(&mut canvas, crop, *center, *radius, *color, *number)?,
+            Annotation::Highlight {
+                bounds,
+                color,
+                opacity,
+                ..
+            } => {
+                let color = [
+                    color[0],
+                    color[1],
+                    color[2],
+                    (opacity * 255.0).round() as u8,
+                ];
+                canvas.fill_path(
+                    &super::shapes::rectangle(*bounds, crop)?,
+                    &super::shapes::paint(color),
+                    tiny_skia::FillRule::Winding,
+                    tiny_skia::Transform::identity(),
+                    None,
+                );
+            }
+            Annotation::Spotlight { .. } => {}
+            Annotation::SmartEraseStroke {
+                points,
+                color,
+                width,
+                ..
+            } => super::shapes::stroke(
+                &mut canvas,
+                points,
+                crop,
+                [color[0], color[1], color[2], 255],
+                *width,
+            )?,
             Annotation::Rectangle { bounds, style, .. } => super::shapes::shape(
                 &mut canvas,
                 &super::shapes::rectangle(*bounds, crop)?,

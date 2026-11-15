@@ -28,6 +28,28 @@ pub(crate) fn validate_width(width: f32) -> Result<(), AppError> {
     }
     Ok(())
 }
+fn validate_points(points: &[PhysicalPoint]) -> Result<(), AppError> {
+    let first = points
+        .first()
+        .ok_or(AppError::InvalidInput("stroke must not be empty"))?;
+    let (mut left, mut top, mut right, mut bottom) = (first.x, first.y, first.x, first.y);
+    for p in points {
+        left = left.min(p.x);
+        top = top.min(p.y);
+        right = right.max(p.x);
+        bottom = bottom.max(p.y);
+    }
+    let width = left
+        .abs_diff(right)
+        .checked_add(1)
+        .ok_or(AppError::InvalidInput("stroke geometry overflows"))?;
+    let height = top
+        .abs_diff(bottom)
+        .checked_add(1)
+        .ok_or(AppError::InvalidInput("stroke geometry overflows"))?;
+    PhysicalRect::new(left, top, width, height)?.rgba_len()?;
+    Ok(())
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub(crate) stroke: [u8; 4],
@@ -46,6 +68,49 @@ impl Style {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Annotation {
+    Ellipse {
+        id: Uuid,
+        bounds: PhysicalRect,
+        style: Style,
+    },
+    Line {
+        id: Uuid,
+        start: PhysicalPoint,
+        end: PhysicalPoint,
+        color: [u8; 4],
+        width: f32,
+    },
+    Arrow {
+        id: Uuid,
+        start: PhysicalPoint,
+        end: PhysicalPoint,
+        color: [u8; 4],
+        width: f32,
+    },
+    Step {
+        id: Uuid,
+        center: PhysicalPoint,
+        radius: f32,
+        color: [u8; 4],
+        number: u32,
+    },
+    Highlight {
+        id: Uuid,
+        bounds: PhysicalRect,
+        color: [u8; 3],
+        opacity: f32,
+    },
+    Spotlight {
+        id: Uuid,
+        bounds: PhysicalRect,
+        dim: f32,
+    },
+    SmartEraseStroke {
+        id: Uuid,
+        points: Arc<[PhysicalPoint]>,
+        color: [u8; 3],
+        width: f32,
+    },
     Rectangle {
         id: Uuid,
         bounds: PhysicalRect,
@@ -73,6 +138,13 @@ pub enum Annotation {
 impl Annotation {
     pub fn id(&self) -> Uuid {
         match self {
+            Self::Ellipse { id, .. }
+            | Self::Line { id, .. }
+            | Self::Arrow { id, .. }
+            | Self::Step { id, .. }
+            | Self::Highlight { id, .. }
+            | Self::Spotlight { id, .. }
+            | Self::SmartEraseStroke { id, .. } => *id,
             Self::Rectangle { id, .. }
             | Self::Freehand { id, .. }
             | Self::Text { id, .. }
@@ -84,6 +156,56 @@ impl Annotation {
             id: Uuid::new_v4(),
             bounds,
             style,
+        })
+    }
+    pub fn ellipse(bounds: PhysicalRect, style: Style) -> Result<Self, AppError> {
+        Self::checked(Self::Ellipse {
+            id: Uuid::new_v4(),
+            bounds,
+            style,
+        })
+    }
+    pub fn line(
+        start: PhysicalPoint,
+        end: PhysicalPoint,
+        color: [u8; 4],
+        width: f32,
+    ) -> Result<Self, AppError> {
+        Self::checked(Self::Line {
+            id: Uuid::new_v4(),
+            start,
+            end,
+            color,
+            width,
+        })
+    }
+    pub fn arrow(
+        start: PhysicalPoint,
+        end: PhysicalPoint,
+        color: [u8; 4],
+        width: f32,
+    ) -> Result<Self, AppError> {
+        Self::checked(Self::Arrow {
+            id: Uuid::new_v4(),
+            start,
+            end,
+            color,
+            width,
+        })
+    }
+    pub fn highlight(bounds: PhysicalRect, color: [u8; 3], opacity: f32) -> Result<Self, AppError> {
+        Self::checked(Self::Highlight {
+            id: Uuid::new_v4(),
+            bounds,
+            color,
+            opacity,
+        })
+    }
+    pub fn spotlight(bounds: PhysicalRect, dim: f32) -> Result<Self, AppError> {
+        Self::checked(Self::Spotlight {
+            id: Uuid::new_v4(),
+            bounds,
+            dim,
         })
     }
     pub fn freehand(
@@ -124,7 +246,7 @@ impl Annotation {
         Ok(value)
     }
     pub(crate) fn point_count(&self) -> usize {
-        if let Self::Freehand { points, .. } = self {
+        if let Self::Freehand { points, .. } | Self::SmartEraseStroke { points, .. } = self {
             points.len()
         } else {
             0
@@ -135,20 +257,60 @@ impl Annotation {
             return Err(AppError::InvalidInput("annotation ID must not be nil"));
         }
         match self {
-            Self::Rectangle { bounds, style, .. } => {
+            Self::Rectangle { bounds, style, .. } | Self::Ellipse { bounds, style, .. } => {
                 bounds.rgba_len()?;
                 validate_width(style.width)?;
             }
             Self::Redaction { bounds, .. } => {
                 bounds.rgba_len()?;
             }
-            Self::Freehand { points, width, .. } => {
+            Self::Line {
+                start, end, width, ..
+            }
+            | Self::Arrow {
+                start, end, width, ..
+            } => {
+                validate_width(*width)?;
+                if start == end {
+                    return Err(AppError::InvalidInput("line endpoints must be distinct"));
+                }
+                validate_points(&[*start, *end])?;
+            }
+            Self::Step {
+                center,
+                radius,
+                number,
+                ..
+            } => {
+                if !radius.is_finite() || !(4.0..=512.0).contains(radius) || *number == 0 {
+                    return Err(AppError::InvalidInput("step radius or number is invalid"));
+                }
+                let extent = radius.ceil() as i64;
+                let left = i32::try_from(i64::from(center.x) - extent)
+                    .map_err(|_| AppError::InvalidInput("step geometry overflows"))?;
+                let top = i32::try_from(i64::from(center.y) - extent)
+                    .map_err(|_| AppError::InvalidInput("step geometry overflows"))?;
+                PhysicalRect::new(left, top, (extent * 2) as u32, (extent * 2) as u32)?
+                    .rgba_len()?;
+            }
+            Self::Highlight {
+                bounds, opacity, ..
+            } => {
+                bounds.rgba_len()?;
+                super::effects::validate_opacity(*opacity)?;
+            }
+            Self::Spotlight { bounds, dim, .. } => {
+                bounds.rgba_len()?;
+                super::effects::validate_opacity(*dim)?;
+            }
+            Self::Freehand { points, width, .. } | Self::SmartEraseStroke { points, width, .. } => {
                 validate_width(*width)?;
                 if points.is_empty() || points.len() > MAX_STROKE_POINTS {
                     return Err(AppError::InvalidInput(
                         "stroke must contain 1 to 20000 points",
                     ));
                 }
+                validate_points(points)?;
             }
             Self::Text { content, size, .. } => {
                 if !size.is_finite()
@@ -170,6 +332,7 @@ impl Annotation {
 struct State {
     annotations: Arc<Vec<Annotation>>,
     crop: Option<PhysicalRect>,
+    next_step: u32,
 }
 /// Clones share the immutable source and all stroke/text storage. Each revision
 /// is local to this document identity; undo/redo never reuse a prior revision.
@@ -232,6 +395,7 @@ impl EditorDocument {
             state: State {
                 annotations: Arc::new(vec![]),
                 crop,
+                next_step: 1,
             },
             undo: VecDeque::new(),
             redo: VecDeque::new(),
@@ -255,6 +419,9 @@ impl EditorDocument {
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn next_step(&self) -> u32 {
+        self.state.next_step
     }
     pub fn export_revision(&self) -> super::export::DocumentRevision {
         let mut document = self.clone();
@@ -323,6 +490,28 @@ impl EditorDocument {
     pub fn apply(&mut self, command: EditorCommand) -> Result<(), AppError> {
         let mut next = self.state.clone();
         match command {
+            EditorCommand::Step {
+                center,
+                radius,
+                color,
+            } => {
+                if next.annotations.len() >= MAX_ANNOTATIONS {
+                    return Err(AppError::InvalidInput("annotation count exceeded"));
+                }
+                let annotation = Annotation::Step {
+                    id: Uuid::new_v4(),
+                    center,
+                    radius,
+                    color,
+                    number: next.next_step,
+                };
+                annotation.validate()?;
+                next.next_step = next
+                    .next_step
+                    .checked_add(1)
+                    .ok_or(AppError::InvalidInput("step counter exhausted"))?;
+                Arc::make_mut(&mut next.annotations).push(annotation);
+            }
             EditorCommand::Crop(crop) => {
                 if let Some(r) = crop {
                     self.validate_crop(r)?;
@@ -331,6 +520,11 @@ impl EditorDocument {
             }
             EditorCommand::Insert(annotation) => {
                 annotation.validate()?;
+                if matches!(annotation, Annotation::Step { .. }) {
+                    return Err(AppError::InvalidInput(
+                        "insert step markers through the numbered step command",
+                    ));
+                }
                 if next.annotations.len() >= MAX_ANNOTATIONS
                     || next.annotations.iter().any(|a| a.id() == annotation.id())
                 {
@@ -347,6 +541,14 @@ impl EditorDocument {
                     .iter()
                     .position(|a| a.id() == annotation.id())
                     .ok_or(AppError::InvalidInput("annotation no longer exists"))?;
+                let old = &next.annotations[index];
+                if std::mem::discriminant(old) != std::mem::discriminant(&annotation)
+                    || matches!((old,&annotation),(Annotation::Step{number:a,..},Annotation::Step{number:b,..}) if a!=b)
+                {
+                    return Err(AppError::InvalidInput(
+                        "modification cannot change the annotation kind or step number",
+                    ));
+                }
                 Arc::make_mut(&mut next.annotations)[index] = annotation;
             }
             EditorCommand::Erase(ids) => {
