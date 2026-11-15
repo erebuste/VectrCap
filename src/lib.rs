@@ -11,6 +11,7 @@ pub mod app;
 pub mod capture;
 pub mod editor;
 pub mod persistence;
+pub mod pin;
 pub mod platform;
 pub mod recording;
 pub mod ui;
