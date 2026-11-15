@@ -360,6 +360,11 @@ impl AppController {
                             true,
                             false,
                         )?;
+                        if r.history_record_failed() {
+                            out.push(AppEffect::Error(AppError::Persistence(
+                                "recording saved, but its History entry could not be recorded",
+                            )));
+                        }
                         let artifact = r
                             .artifact()
                             .cloned()

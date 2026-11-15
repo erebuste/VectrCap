@@ -196,20 +196,20 @@ impl AppController {
                     .map(AppEffect::Pin),
             );
         }
-        let can_discard = if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
-            r.handle(crate::workflow::runner::TaskInput::Cancel);
-            match self.history.save_task_workflow(r) {
-                Ok(()) => true,
-                Err(e) => {
-                    effects.push(AppEffect::Error(e));
-                    false
-                }
+        if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
+            let mut snapshot = r.clone();
+            snapshot.handle(crate::workflow::runner::TaskInput::Cancel);
+            if let Err(e) = self.history.save_task_workflow(&snapshot) {
+                // The cancelled state did not commit; keep the capture session
+                // (and its still-active on-disk row) rather than discarding or
+                // closing, so disk recovery cannot resurrect work the user asked
+                // to cancel, and the user can retry the cancel.
+                effects.push(AppEffect::Error(e));
+                return effects;
             }
-        } else {
-            true
-        };
-        if can_discard
-            && let Some(pending) = &mut capture.pending
+            *r = snapshot;
+        }
+        if let Some(pending) = &mut capture.pending
             && let Err(error) = pending.discard_unadmitted(&self.artifacts)
         {
             // A locked orphan can be recovered later. It must not trap a
@@ -237,8 +237,10 @@ impl AppController {
             && capture.id == session
         {
             if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
-                r.handle(crate::workflow::runner::TaskInput::Cancel);
-                self.history.save_task_workflow(r)?;
+                let mut snapshot = r.clone();
+                snapshot.handle(crate::workflow::runner::TaskInput::Cancel);
+                self.history.save_task_workflow(&snapshot)?;
+                *r = snapshot;
             }
             self.task_images.remove(&capture.context.id);
             capture.context.id = Uuid::new_v4();
@@ -341,9 +343,11 @@ impl AppController {
             });
             if !same {
                 if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
-                    r.handle(crate::workflow::runner::TaskInput::Cancel);
+                    let mut snapshot = r.clone();
+                    snapshot.handle(crate::workflow::runner::TaskInput::Cancel);
                     // This checkpoint gates retirement of the old source.
-                    self.history.save_task_workflow(r)?;
+                    self.history.save_task_workflow(&snapshot)?;
+                    *r = snapshot;
                     self.task_images.remove(&capture.context.id);
                     capture.context.id = Uuid::new_v4();
                 }
@@ -468,7 +472,11 @@ impl AppController {
             }
             _ => return Err(AppError::InvalidInput("choose an image finish action")),
         };
-        if self.task_runners.contains_key(&capture.context.id) {
+        let retryable = self
+            .task_runners
+            .get(&capture.context.id)
+            .is_some_and(|r| !r.complete());
+        if retryable {
             let step = self.task_runners[&capture.context.id]
                 .states()
                 .iter()
@@ -492,6 +500,14 @@ impl AppController {
                 effects.extend(out);
             }
         } else {
+            // A missing or already-cancelled/complete runner must never be treated
+            // as "nothing to do, so the finish succeeded" -- that silently drops the
+            // action the user just requested (e.g. re-finishing the same image after
+            // cancelling a prior failed attempt). Start a fresh runner under a new id.
+            if self.task_runners.contains_key(&capture.context.id) {
+                self.task_images.remove(&capture.context.id);
+                capture.context.id = Uuid::new_v4();
+            }
             let mut context = capture.context.clone();
             context.intent = intent;
             if pending.archive_skipped() {

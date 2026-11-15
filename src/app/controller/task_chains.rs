@@ -203,6 +203,20 @@ impl AppController {
         let Some(mut r) = self.task_runners.remove(&id) else {
             return vec![];
         };
+        if matches!(input, TaskInput::Cancel) {
+            // Cancel skips every unfinished step at once with no Execute effect
+            // to roll back individually via CheckpointFailed, unlike the ordinary
+            // per-step chain below. Probe the checkpoint on a clone first, so the
+            // real runner is only ever mutated to "cancelled" once that state is
+            // actually committed -- otherwise disk recovery could resurrect work
+            // the user asked to cancel.
+            let mut probe = r.clone();
+            probe.handle(TaskInput::Cancel);
+            if let Err(e) = self.history.save_task_workflow(&probe) {
+                self.task_runners.insert(id, r);
+                return vec![AppEffect::Error(e)];
+            }
+        }
         let mut pending = r.handle(input);
         let mut out = vec![];
         // Each transition is durably checkpointed BEFORE its next effect.
