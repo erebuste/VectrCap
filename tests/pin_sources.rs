@@ -388,6 +388,24 @@ fn clipboard_dib_roundtrip_retains_alpha_and_orientation() {
 }
 
 #[test]
+fn encoded_clipboard_image_preserves_alpha_and_rejects_text() {
+    let pixels = RgbaImage::from_pixel(3, 2, Rgba([10, 20, 30, 40]));
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(pixels.clone())
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .unwrap();
+    assert_eq!(
+        vectrcap::pin::source::load_pin_bytes(encoded.get_ref())
+            .unwrap()
+            .pixels()
+            .as_ref(),
+        &pixels
+    );
+    assert!(vectrcap::pin::source::load_pin_bytes(b"https://fixture.invalid/image.png").is_err());
+    assert!(vectrcap::pin::source::load_pin_bytes(&[]).is_err());
+}
+
+#[test]
 fn pin_shortcuts_are_available_without_reserved_defaults() {
     use vectrcap::app::shortcuts::{ShortcutAction, ShortcutBinding};
     for action in [
@@ -461,7 +479,8 @@ fn native_capture_hiding_is_synchronous_nested_and_rolls_back_failure() {
     assert!(registry.suspend_for_capture().is_err());
     assert!(os.lock().unwrap().visible.values().all(|v| *v));
     assert!(!registry.suspended());
-    registry.unregister(a);
+    registry.retire(a).unwrap();
+    assert!(!os.lock().unwrap().visible[&1]);
     registry.unregister(b);
     assert!(!registry.register(a, 999).is_ok());
 }

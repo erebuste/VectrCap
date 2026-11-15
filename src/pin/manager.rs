@@ -265,6 +265,20 @@ impl<S: PinWindowSystem> PinWindowRegistry<S> {
     pub fn unregister(&mut self, id: PinId) {
         self.windows.remove(&id);
     }
+    /// Hide and synchronize before forgetting a HWND. Egui closes deferred
+    /// viewports later; removing a still-visible handle here could otherwise
+    /// let a simultaneous snapshot capture that final frame.
+    pub fn retire(&mut self, id: PinId) -> Result<(), AppError> {
+        if let Some(pin) = self.windows.get(&id)
+            && self.system.is_owned(id, pin.handle)
+            && self.system.is_visible(pin.handle)
+        {
+            self.system.set_visible(pin.handle, false)?;
+            self.system.flush()?;
+        }
+        self.windows.remove(&id);
+        Ok(())
+    }
     pub fn register(&mut self, id: PinId, handle: usize) -> Result<bool, AppError> {
         if !self.system.is_owned(id, handle) {
             return Err(AppError::Capture("pin window identity changed"));

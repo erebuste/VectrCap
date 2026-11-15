@@ -5,6 +5,11 @@ use crate::{
 };
 use eframe::egui::{self, Color32, Key, PointerButton, Rect, Vec2};
 
+fn hover_control(ui: &mut egui::Ui, icon: &str, label: &str, hint: &str) -> egui::Response {
+    let response = ui.small_button(icon).on_hover_text(hint);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
+    response
+}
 pub fn viewport_title(id: crate::pin::PinId) -> String {
     format!("VectrCap pin {id:?}")
 }
@@ -109,6 +114,7 @@ pub struct PinWindow {
     pub options_open: bool,
     options_id: crate::pin::PinId,
     drag_remainder: Vec2,
+    drag_pointer: Option<crate::capture::geometry::PhysicalPoint>,
     wheel_remainder: f32,
     wheel_ctrl: bool,
 }
@@ -120,13 +126,30 @@ impl Default for PinWindow {
             options_open: false,
             options_id: crate::pin::PinId::new(),
             drag_remainder: Vec2::ZERO,
+            drag_pointer: None,
             wheel_remainder: 0.0,
             wheel_ctrl: false,
         }
     }
 }
 impl PinWindow {
+    pub fn show_at_pointer(
+        &mut self,
+        ui: &mut egui::Ui,
+        pin: &PinSnapshot,
+        pointer: crate::capture::geometry::PhysicalPoint,
+    ) -> Vec<PinInput> {
+        self.show_inner(ui, pin, Some(pointer))
+    }
     pub fn show(&mut self, ui: &mut egui::Ui, pin: &PinSnapshot) -> Vec<PinInput> {
+        self.show_inner(ui, pin, None)
+    }
+    fn show_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        pin: &PinSnapshot,
+        pointer: Option<crate::capture::geometry::PhysicalPoint>,
+    ) -> Vec<PinInput> {
         let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(false));
         let mut inputs = keyboard_inputs(ui.ctx(), focused, ui.ctx().text_edit_focused());
         if ui.ctx().input(|i| i.viewport().close_requested()) {
@@ -222,6 +245,15 @@ impl PinWindow {
             ui.scope_id().with("pin-image"),
             egui::Sense::click_and_drag(),
         );
+        let dragging = response.dragged_by(PointerButton::Primary);
+        if !dragging {
+            self.drag_pointer =
+                if response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()) {
+                    pointer
+                } else {
+                    None
+                };
+        }
         let hover = response.hovered() || self.options_open || ui.ctx().is_pointer_over_egui();
         let mut toolbar = None;
         if hover {
@@ -236,28 +268,32 @@ impl PinWindow {
                                 .num_columns(2)
                                 .spacing([1.0, 1.0])
                                 .show(ui, |ui| {
-                                    if ui
-                                        .small_button("C")
-                                        .on_hover_text("Copy image (Ctrl+C)")
+                                    if hover_control(ui, "C", "Copy image", "Copy image (Ctrl+C)")
                                         .clicked()
                                     {
                                         inputs.push(PinInput::Copy);
                                     }
-                                    if ui
-                                        .small_button("R")
-                                        .on_hover_text("Reset zoom and opacity (middle click)")
-                                        .clicked()
+                                    if hover_control(
+                                        ui,
+                                        "R",
+                                        "Reset",
+                                        "Reset zoom and opacity (middle click)",
+                                    )
+                                    .clicked()
                                     {
                                         inputs.push(PinInput::Reset);
                                     }
                                     ui.end_row();
-                                    if ui.small_button("⋯").on_hover_text("Options").clicked() {
+                                    if hover_control(ui, "⋯", "Options", "Options").clicked() {
                                         self.options_open = !self.options_open;
                                     }
-                                    if ui
-                                        .small_button("×")
-                                        .on_hover_text("Close (Escape / right click)")
-                                        .clicked()
+                                    if hover_control(
+                                        ui,
+                                        "×",
+                                        "Close",
+                                        "Close (Escape / right click)",
+                                    )
+                                    .clicked()
                                     {
                                         inputs.push(PinInput::Close);
                                     }
@@ -273,16 +309,28 @@ impl PinWindow {
                 .pointer_hover_pos()
                 .is_some_and(|p| rect.contains(p))
         });
-        if !over_chrome && !self.options_open {
+        if !over_chrome || dragging {
             if response.double_clicked_by(PointerButton::Primary) {
                 inputs.push(PinInput::ToggleMinimized);
-            } else if response.dragged_by(PointerButton::Primary) {
-                self.drag_remainder += response.drag_delta() * scale;
-                let (dx, dy) = (
-                    self.drag_remainder.x.trunc() as i32,
-                    self.drag_remainder.y.trunc() as i32,
-                );
-                self.drag_remainder -= egui::vec2(dx as f32, dy as f32);
+            } else if dragging {
+                let (dx, dy) = if let Some(pointer) = pointer {
+                    let previous = self.drag_pointer.replace(pointer).unwrap_or(pointer);
+                    (
+                        pointer.x.checked_sub(previous.x).unwrap_or(0),
+                        pointer.y.checked_sub(previous.y).unwrap_or(0),
+                    )
+                } else {
+                    // Headless/embedded surfaces do not move an HWND. Native
+                    // hosts supply physical screen coordinates above, avoiding
+                    // feedback when movement changes local pointer positions.
+                    self.drag_remainder += response.drag_delta() * scale;
+                    let delta = (
+                        self.drag_remainder.x.trunc() as i32,
+                        self.drag_remainder.y.trunc() as i32,
+                    );
+                    self.drag_remainder -= egui::vec2(delta.0 as f32, delta.1 as f32);
+                    delta
+                };
                 if dx != 0 || dy != 0 {
                     inputs.push(PinInput::Move { dx, dy });
                 }
@@ -427,10 +475,33 @@ impl PinHost {
                     let Ok(mut window) = window.lock() else {
                         return;
                     };
-                    for input in window.show(ui, pin) {
+                    let pointer = match native::physical_pointer() {
+                        Ok(pointer) => pointer,
+                        Err(error) => {
+                            live_client.report_error(error);
+                            return;
+                        }
+                    };
+                    for input in window.show_at_pointer(ui, pin, pointer) {
                         if let Err(error) = live_client.submit(AppCommand::Pin { id, input }) {
                             live_client.report_error(error);
                         }
+                    }
+                    if let Some(error) = &live.error
+                        && ui.ctx().input(|i| i.viewport().focused.unwrap_or(false))
+                    {
+                        egui::Area::new(egui::Id::unique(("pin-error", id)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(2.0, (ui.max_rect().bottom() - 60.0).max(2.0)))
+                            .show(ui.ctx(), |ui| {
+                                ui.set_max_width(360.0);
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        error.to_string(),
+                                    );
+                                });
+                            });
                     }
                 },
             );
@@ -453,6 +524,7 @@ impl PinHost {
                     let Some(pin) = live.pins.iter().find(|p| p.id == id).filter(|_| live.lifecycle == Lifecycle::Running) else { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); return; };
                     if !pin.visible || native::pins_suspended() { return; }
                     ui.heading("Pin options");
+                    if let Some(error) = &live.error { ui.colored_label(ui.visuals().error_fg_color, error.to_string()); }
                     ui.label(format!("Zoom {}% · Opacity {}%", pin.state.zoom_percent(), pin.state.opacity_percent()));
                     if let Some(label) = pin.image.source_label() { ui.label(label); }
                     egui::ScrollArea::vertical().show(ui, |ui| {

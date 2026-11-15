@@ -88,6 +88,14 @@ pub fn load_pin_history(artifact: &Artifact) -> Result<PinnedImage, AppError> {
         MAX_ENCODED_BYTES as u64,
     )?))
 }
+pub fn load_pin_bytes(bytes: &[u8]) -> Result<PinnedImage, AppError> {
+    if bytes.is_empty() || bytes.len() > MAX_ENCODED_BYTES {
+        return Err(AppError::InvalidInput(
+            "clipboard image exceeds the 128-MiB encoded-image budget or is empty",
+        ));
+    }
+    decode(std::io::Cursor::new(bytes))
+}
 fn decode<R: BufRead + Seek>(mut source: R) -> Result<PinnedImage, AppError> {
     let reader = ImageReader::new(&mut source)
         .with_guessed_format()
@@ -208,6 +216,17 @@ impl DibLayout {
         })
     }
     pub fn decode(&self, bytes: &[u8]) -> Result<PinnedImage, AppError> {
+        let required = self
+            .offset
+            .checked_add(
+                self.stride
+                    .checked_mul(self.height as usize)
+                    .ok_or_else(invalid_image)?,
+            )
+            .ok_or_else(invalid_image)?;
+        if bytes.len() < required {
+            return Err(invalid_image());
+        }
         let len = PhysicalRect::new(0, 0, self.width, self.height)?.rgba_len()?;
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(len)

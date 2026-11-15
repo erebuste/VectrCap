@@ -247,8 +247,10 @@ pub fn pins_suspended() -> bool {
     native_pins().lock().map_or(true, |pins| pins.suspended())
 }
 pub fn unregister_pin_window(id: crate::pin::PinId) {
-    if let Ok(mut pins) = native_pins().lock() {
-        pins.unregister(id);
+    if let Ok(mut pins) = native_pins().lock()
+        && let Err(error) = pins.retire(id)
+    {
+        eprintln!("retiring reference window failed: {error}");
     }
 }
 #[allow(unsafe_code)]
@@ -278,6 +280,12 @@ pub fn sync_pin_window(
     visible: bool,
     topmost: bool,
 ) -> Result<bool, AppError> {
+    PhysicalRect::new(position.x, position.y, size.0, size.1)?;
+    if size.0.max(size.1) > 32760 {
+        return Err(AppError::InvalidInput(
+            "pin viewport dimensions exceed native limits",
+        ));
+    }
     let Some(hwnd) = find_pin(id) else {
         return Ok(false);
     };
@@ -286,11 +294,6 @@ pub fn sync_pin_window(
         .lock()
         .map_err(|_| AppError::Capture("native pin registry unavailable"))?;
     pins.register(id, hwnd as usize)?;
-    if size.0 == 0 || size.1 == 0 || size.0.max(size.1) > 32760 {
-        return Err(AppError::InvalidInput(
-            "pin viewport dimensions exceed native limits",
-        ));
-    }
     let mut current = RECT::default();
     unsafe {
         if GetWindowRect(hwnd, &mut current) == 0 {

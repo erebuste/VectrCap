@@ -60,7 +60,10 @@ impl Drop for Allocation {
 impl ClipboardWriter for WindowsClipboard {
     #[allow(unsafe_code)]
     fn read_image(&self) -> Result<crate::pin::PinnedImage, AppError> {
-        use windows_sys::Win32::System::{DataExchange::GetClipboardData, Memory::GlobalSize};
+        use windows_sys::Win32::System::{
+            DataExchange::{GetClipboardData, RegisterClipboardFormatW},
+            Memory::GlobalSize,
+        };
         // Keep the clipboard open and global memory locked through validation
         // and decode. Another app cannot replace the data between the two.
         unsafe {
@@ -72,13 +75,27 @@ impl ClipboardWriter for WindowsClipboard {
             if handle.is_null() {
                 handle = GetClipboardData(8);
             }
+            let mut png = false;
+            if handle.is_null() {
+                let format = RegisterClipboardFormatW(windows_sys::core::w!("PNG"));
+                if format != 0 {
+                    handle = GetClipboardData(format);
+                    png = !handle.is_null();
+                }
+            }
             if handle.is_null() {
                 return Err(AppError::InvalidInput(
                     "clipboard does not contain an image; text and URLs cannot be pinned",
                 ));
             }
             let size = GlobalSize(handle);
-            if !(40..=256_000_000 + 1024 * 1024).contains(&size) {
+            let valid_size = if png {
+                size > 0 && size <= crate::editor::export::MAX_ENCODED_BYTES
+            } else {
+                (40..=crate::capture::geometry::MAX_CAPTURE_PIXELS as usize * 4 + 1024 * 1024)
+                    .contains(&size)
+            };
+            if !valid_size {
                 return Err(AppError::InvalidInput(
                     "clipboard image exceeds the decoded-image budget",
                 ));
@@ -96,6 +113,12 @@ impl ClipboardWriter for WindowsClipboard {
                 }
             }
             let _locked = Locked(handle);
+            if png {
+                return crate::pin::source::load_pin_bytes(std::slice::from_raw_parts(
+                    pointer.cast::<u8>(),
+                    size,
+                ));
+            }
             let header = std::slice::from_raw_parts(pointer.cast::<u8>(), size.min(124));
             let layout = crate::pin::source::DibLayout::parse(header, size)?;
             layout.decode(std::slice::from_raw_parts(pointer.cast::<u8>(), size))

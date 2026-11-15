@@ -240,3 +240,255 @@ fn pin_display_preview_is_bounded_and_source_is_unchanged() {
     let too_wide = PinnedImage::new(Arc::new(RgbaImage::new(40_000, 1)), None).unwrap();
     assert!(m.open(too_wide, None).is_err());
 }
+
+fn pin_frame(
+    ctx: &eframe::egui::Context,
+    window: &mut vectrcap::ui::pin_window::PinWindow,
+    pin: &vectrcap::pin::PinSnapshot,
+    time: f64,
+    events: Vec<eframe::egui::Event>,
+) -> Vec<PinInput> {
+    pin_frame_with_pointer(ctx, window, pin, time, events, None)
+}
+fn pin_frame_with_pointer(
+    ctx: &eframe::egui::Context,
+    window: &mut vectrcap::ui::pin_window::PinWindow,
+    pin: &vectrcap::pin::PinSnapshot,
+    time: f64,
+    events: Vec<eframe::egui::Event>,
+    pointer: Option<PhysicalPoint>,
+) -> Vec<PinInput> {
+    let mut inputs = vec![];
+    let mut output = ctx.run_ui(
+        eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(400.0, 300.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            inputs = if let Some(pointer) = pointer {
+                window.show_at_pointer(ui, pin, pointer)
+            } else {
+                window.show(ui, pin)
+            };
+        },
+    );
+    output.textures_delta.clear();
+    inputs
+}
+
+#[test]
+fn dragging_uses_screen_pixels_without_feedback_from_window_movement() {
+    use eframe::egui::{Context, Event, Modifiers, PointerButton, pos2};
+    let ctx = Context::default();
+    let mut m = manager();
+    let id = m.open(image(400, 300), None).unwrap();
+    let pin = m.get(id).unwrap();
+    let mut window = vectrcap::ui::pin_window::PinWindow::default();
+    let start = PhysicalPoint { x: 1000, y: 1000 };
+    pin_frame_with_pointer(
+        &ctx,
+        &mut window,
+        pin,
+        0.0,
+        vec![Event::PointerMoved(pos2(250.0, 150.0))],
+        Some(start),
+    );
+    pin_frame_with_pointer(
+        &ctx,
+        &mut window,
+        pin,
+        1.0,
+        vec![Event::PointerButton {
+            pos: pos2(250.0, 150.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }],
+        Some(start),
+    );
+    let moved = PhysicalPoint { x: 1025, y: 1015 };
+    let inputs = pin_frame_with_pointer(
+        &ctx,
+        &mut window,
+        pin,
+        1.1,
+        vec![Event::PointerMoved(pos2(275.0, 165.0))],
+        Some(moved),
+    );
+    assert!(matches!(
+        inputs.as_slice(),
+        [PinInput::Move { dx: 25, dy: 15 }]
+    ));
+    // Moving the HWND changes local cursor coordinates without moving the
+    // physical cursor. That correction must never drag the pin back again.
+    let inputs = pin_frame_with_pointer(
+        &ctx,
+        &mut window,
+        pin,
+        1.2,
+        vec![Event::PointerMoved(pos2(250.0, 150.0))],
+        Some(moved),
+    );
+    assert!(
+        !inputs
+            .iter()
+            .any(|input| matches!(input, PinInput::Move { .. }))
+    );
+}
+#[test]
+fn pin_pointer_controls_work_with_options_open() {
+    use eframe::egui::{Context, Event, Modifiers, PointerButton, pos2};
+    let ctx = Context::default();
+    let mut m = manager();
+    let id = m.open(image(400, 300), None).unwrap();
+    let pin = m.get(id).unwrap();
+    let mut window = vectrcap::ui::pin_window::PinWindow::default();
+    window.options_open = true;
+    pin_frame(
+        &ctx,
+        &mut window,
+        pin,
+        0.0,
+        vec![Event::PointerMoved(pos2(250.0, 150.0))],
+    );
+    for (index, button) in [PointerButton::Middle, PointerButton::Secondary]
+        .into_iter()
+        .enumerate()
+    {
+        let at = 1.0 + index as f64;
+        pin_frame(
+            &ctx,
+            &mut window,
+            pin,
+            at,
+            vec![Event::PointerButton {
+                pos: pos2(250.0, 150.0),
+                button,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        let inputs = pin_frame(
+            &ctx,
+            &mut window,
+            pin,
+            at + 0.1,
+            vec![Event::PointerButton {
+                pos: pos2(250.0, 150.0),
+                button,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(matches!(
+            (button, inputs.as_slice()),
+            (PointerButton::Middle, [PinInput::Reset])
+                | (PointerButton::Secondary, [PinInput::Close])
+        ));
+    }
+}
+#[test]
+fn pin_wheel_drag_double_click_and_texture_release_are_headless() {
+    use eframe::egui::{Context, Event, Modifiers, MouseWheelUnit, PointerButton, pos2, vec2};
+    let ctx = Context::default();
+    let mut m = manager();
+    let source = image(400, 300);
+    let weak = Arc::downgrade(source.pixels());
+    let id = m.open(source, None).unwrap();
+    let mut window = vectrcap::ui::pin_window::PinWindow::default();
+    let pin = m.get(id).unwrap().clone();
+    pin_frame(
+        &ctx,
+        &mut window,
+        &pin,
+        0.0,
+        vec![Event::PointerMoved(pos2(250.0, 150.0))],
+    );
+    for (time, modifiers, delta) in [(1.0, Modifiers::NONE, 1.0), (2.0, Modifiers::CTRL, -1.0)] {
+        let inputs = pin_frame(
+            &ctx,
+            &mut window,
+            &pin,
+            time,
+            vec![Event::MouseWheel {
+                source: eframe::egui::MouseWheelSource::Unknown,
+                phase: eframe::egui::TouchPhase::Move,
+                unit: MouseWheelUnit::Line,
+                delta: vec2(0.0, delta),
+                modifiers,
+            }],
+        );
+        assert!(matches!(
+            inputs.as_slice(),
+            [PinInput::Zoom(1)] | [PinInput::Opacity(-1)]
+        ));
+    }
+    let button = |pressed| Event::PointerButton {
+        pos: pos2(250.0, 150.0),
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    };
+    pin_frame(&ctx, &mut window, &pin, 3.0, vec![button(true)]);
+    pin_frame(&ctx, &mut window, &pin, 3.05, vec![button(false)]);
+    pin_frame(&ctx, &mut window, &pin, 3.1, vec![button(true)]);
+    assert!(matches!(
+        pin_frame(&ctx, &mut window, &pin, 3.15, vec![button(false)]).as_slice(),
+        [PinInput::ToggleMinimized]
+    ));
+    pin_frame(&ctx, &mut window, &pin, 4.0, vec![button(true)]);
+    assert!(
+        pin_frame(
+            &ctx,
+            &mut window,
+            &pin,
+            4.1,
+            vec![Event::PointerMoved(pos2(275.0, 165.0))]
+        )
+        .iter()
+        .any(|input| matches!(input, PinInput::Move { dx, dy } if *dx > 0 && *dy > 0))
+    );
+    drop(pin);
+    m.close_all();
+    assert!(
+        weak.upgrade().is_none(),
+        "CPU source released after closing"
+    );
+    drop(window);
+    let mut output = ctx.run_ui(Default::default(), |_| {});
+    assert!(
+        !output.textures_delta.free.is_empty(),
+        "GPU texture handle released"
+    );
+    output.textures_delta.clear();
+}
+
+#[test]
+fn repeated_pin_open_close_releases_image_and_texture_ownership() {
+    let ctx = eframe::egui::Context::default();
+    let mut m = manager();
+    for cycle in 0..32 {
+        let source = image(20, 10);
+        let weak = Arc::downgrade(source.pixels());
+        let id = m.open(source, None).unwrap();
+        let mut window = vectrcap::ui::pin_window::PinWindow::default();
+        pin_frame(
+            &ctx,
+            &mut window,
+            m.get(id).unwrap(),
+            f64::from(cycle),
+            vec![],
+        );
+        m.close_all();
+        assert!(weak.upgrade().is_none());
+        drop(window);
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        assert!(!output.textures_delta.free.is_empty());
+        output.textures_delta.clear();
+    }
+}
