@@ -10,6 +10,7 @@ use vectrcap::{
             CaptureMode, CaptureRequest, CaptureService, CaptureSource, Countdown, CursorImage,
             ScreenshotPreferences, SnapshotHint, composite_cursor,
         },
+        selection::SelectionModel,
         windows::{WindowCandidate, WindowId},
     },
 };
@@ -43,6 +44,8 @@ struct Source {
     changed_target: bool,
     layouts: usize,
     changed_layout: bool,
+    pointer: Point,
+    window_bounds: Rect,
 }
 impl CaptureSource for Source {
     fn prepare_window(&mut self, _target: WindowCandidate) -> Result<(), AppError> {
@@ -58,7 +61,7 @@ impl CaptureSource for Source {
         }
     }
     fn pointer(&mut self) -> Result<Point, AppError> {
-        Ok(Point { x: 0, y: 1 })
+        Ok(self.pointer)
     }
     fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError> {
         Ok(vec![WindowCandidate {
@@ -69,7 +72,7 @@ impl CaptureSource for Source {
                     1
                 },
             )?,
-            bounds: rect(),
+            bounds: self.window_bounds,
         }])
     }
     fn desktop(
@@ -83,14 +86,14 @@ impl CaptureSource for Source {
             .push(if cursor { "desktop_cursor" } else { "desktop" });
         Ok(vec![7; 800])
     }
-    fn window(&mut self, _target: WindowCandidate, _cursor: bool) -> Result<Vec<u8>, AppError> {
+    fn window(&mut self, target: WindowCandidate, _cursor: bool) -> Result<Vec<u8>, AppError> {
         if !self.events.borrow().contains(&"prepare_window") {
             return Err(AppError::Capture(
                 "target source was not fixed before countdown",
             ));
         }
         self.events.borrow_mut().push("window");
-        Ok(vec![9; 800])
+        Ok(vec![9; target.bounds.rgba_len()?])
     }
 }
 fn request(mode: CaptureMode) -> CaptureRequest {
@@ -111,6 +114,8 @@ fn run(
         changed_target,
         layouts: 0,
         changed_layout,
+        pointer: Point { x: 0, y: 1 },
+        window_bounds: rect(),
     };
     let clock = Clock {
         events: events.clone(),
@@ -120,6 +125,194 @@ fn run(
         CaptureService::new(source, clock, CancellationToken::new()).snapshot(req),
         events,
     )
+}
+#[test]
+fn window_selection_accepts_launch_pointer_outside_target() {
+    // Both positions are on a display, but only the second shares the target's monitor.
+    for pointer in [Point { x: -8, y: 8 }, Point { x: 8, y: 8 }] {
+        for active_monitor_only in [false, true] {
+            let events = Rc::new(RefCell::new(vec![]));
+            let target = WindowCandidate {
+                id: WindowId::new(1).unwrap(),
+                bounds: Rect::new(1, 1, 2, 2).unwrap(),
+            };
+            let source = Source {
+                events: events.clone(),
+                changed_target: false,
+                layouts: 0,
+                changed_layout: false,
+                pointer,
+                window_bounds: target.bounds,
+            };
+            let source = SplitMonitors(source);
+            let clock = Clock {
+                events,
+                cancel: false,
+            };
+            let mut req = request(CaptureMode::Window);
+            req.preferences.active_monitor_only = active_monitor_only;
+            req.target = Some(target);
+            let snapshot = CaptureService::new(source, clock, CancellationToken::new())
+                .snapshot(req)
+                .unwrap();
+            assert_eq!(snapshot.launch_pointer(), Some(pointer));
+            let model =
+                SelectionModel::new(&snapshot, snapshot.preferences().clone(), pointer, (4, 4))
+                    .expect("a window capture must not require hovering its target");
+            assert_eq!(model.crop(), Some(Rect::new(1, 1, 2, 2).unwrap()));
+            assert_eq!(model.permitted_bounds(), Rect::new(1, 1, 2, 2).unwrap());
+            assert!(
+                SelectionModel::new(
+                    &snapshot,
+                    snapshot.preferences().clone(),
+                    Point { x: 30, y: 30 },
+                    (4, 4),
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+struct SplitMonitors(Source);
+impl CaptureSource for SplitMonitors {
+    fn monitors(&mut self) -> Result<Vec<MonitorGeometry>, AppError> {
+        Ok(vec![
+            MonitorGeometry::new("left".into(), Rect::new(-10, 0, 10, 10)?, 1.0)?,
+            MonitorGeometry::new("right".into(), Rect::new(0, 0, 10, 10)?, 1.0)?,
+        ])
+    }
+    fn pointer(&mut self) -> Result<Point, AppError> {
+        self.0.pointer()
+    }
+    fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError> {
+        self.0.windows()
+    }
+    fn prepare_window(&mut self, target: WindowCandidate) -> Result<(), AppError> {
+        self.0.prepare_window(target)
+    }
+    fn desktop(
+        &mut self,
+        bounds: Rect,
+        monitors: &[MonitorGeometry],
+        cursor: bool,
+    ) -> Result<Vec<u8>, AppError> {
+        self.0.desktop(bounds, monitors, cursor)
+    }
+    fn window(&mut self, target: WindowCandidate, cursor: bool) -> Result<Vec<u8>, AppError> {
+        self.0.window(target, cursor)
+    }
+}
+
+struct ChangingWindowInventory {
+    source: Source,
+    before: Vec<WindowCandidate>,
+    after: Vec<WindowCandidate>,
+    captured: bool,
+}
+impl CaptureSource for ChangingWindowInventory {
+    fn monitors(&mut self) -> Result<Vec<MonitorGeometry>, AppError> {
+        self.source.monitors()
+    }
+    fn pointer(&mut self) -> Result<Point, AppError> {
+        self.source.pointer()
+    }
+    fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError> {
+        Ok(if self.captured {
+            &self.after
+        } else {
+            &self.before
+        }
+        .clone())
+    }
+    fn prepare_window(&mut self, target: WindowCandidate) -> Result<(), AppError> {
+        self.source.prepare_window(target)
+    }
+    fn desktop(
+        &mut self,
+        bounds: Rect,
+        monitors: &[MonitorGeometry],
+        cursor: bool,
+    ) -> Result<Vec<u8>, AppError> {
+        self.captured = true;
+        self.source.desktop(bounds, monitors, cursor)
+    }
+    fn window(&mut self, target: WindowCandidate, cursor: bool) -> Result<Vec<u8>, AppError> {
+        self.captured = true;
+        self.source.window(target, cursor)
+    }
+}
+
+#[test]
+fn capture_ignores_window_reordering_but_rejects_inventory_changes() {
+    let first = WindowCandidate {
+        id: WindowId::new(1).unwrap(),
+        bounds: rect(),
+    };
+    let second = WindowCandidate {
+        id: WindowId::new(2).unwrap(),
+        bounds: Rect::new(-5, 1, 4, 3).unwrap(),
+    };
+    let moved = WindowCandidate {
+        bounds: Rect::new(-4, 1, 4, 3).unwrap(),
+        ..second
+    };
+    let resized = WindowCandidate {
+        bounds: Rect::new(-5, 1, 5, 3).unwrap(),
+        ..second
+    };
+    let added = WindowCandidate {
+        id: WindowId::new(3).unwrap(),
+        bounds: second.bounds,
+    };
+    for mode in [
+        CaptureMode::Region,
+        CaptureMode::Window,
+        CaptureMode::Fullscreen,
+        CaptureMode::LastRegion,
+    ] {
+        for (after, succeeds) in [
+            (vec![second, first], true),
+            (vec![first], false),
+            (vec![first, second, added], false),
+            (vec![first, moved], false),
+            (vec![first, resized], false),
+            (vec![first, added], false),
+        ] {
+            let events = Rc::new(RefCell::new(vec![]));
+            let source = ChangingWindowInventory {
+                source: Source {
+                    events: events.clone(),
+                    changed_target: false,
+                    layouts: 0,
+                    changed_layout: false,
+                    pointer: Point { x: 0, y: 1 },
+                    window_bounds: rect(),
+                },
+                before: vec![first, second],
+                after: after.clone(),
+                captured: false,
+            };
+            let mut req = request(mode);
+            req.target = Some(first);
+            let clock = Clock {
+                events,
+                cancel: false,
+            };
+            let result = CaptureService::new(source, clock, CancellationToken::new()).snapshot(req);
+            if succeeds {
+                let snapshot = result.expect("z-order alone must not invalidate a capture");
+                // Hover still uses the frozen, frontmost-first inventory.
+                assert_eq!(snapshot.windows(), &[first, second]);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    AppError::Capture("window layout changed while capturing; try again"),
+                    "mode {mode:?}, inventory {after:?}"
+                );
+            }
+        }
+    }
 }
 #[test]
 fn last_region_uses_fresh_pixels_and_no_old_annotations() {

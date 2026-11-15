@@ -70,19 +70,31 @@ impl Drop for ProcessMta {
 /// This owns one COM usage lease, never a window, frame, or capture session.
 #[allow(unsafe_code)]
 pub fn initialize_capture_runtime() -> Result<(), AppError> {
-    static MTA: std::sync::OnceLock<Result<ProcessMta, AppError>> = std::sync::OnceLock::new();
-    match MTA.get_or_init(|| {
+    static MTA: std::sync::Mutex<Option<ProcessMta>> = std::sync::Mutex::new(None);
+    ensure_runtime_lease(&MTA, || {
         let mut cookie = std::ptr::null_mut();
         // SAFETY: a writable local cookie output; the successful lease is owned above.
         if unsafe { windows_sys::Win32::System::Com::CoIncrementMTAUsage(&mut cookie) } < 0 {
             return Err(AppError::Capture("capture MTA initialization failed"));
         }
         Ok(ProcessMta(cookie as usize))
-    }) {
-        Ok(_) => Ok(()),
-        Err(error) => Err(error.clone()),
-    }
+    })
 }
+fn ensure_runtime_lease<T>(
+    lease: &std::sync::Mutex<Option<T>>,
+    initialize: impl FnOnce() -> Result<T, AppError>,
+) -> Result<(), AppError> {
+    let mut lease = lease
+        .lock()
+        .map_err(|_| AppError::Capture("capture runtime initialization lock is poisoned"))?;
+    // Serialize acquisition as well as publication: racing retries must not
+    // increment COM usage twice. Errors leave no lease and may be retried.
+    if lease.is_none() {
+        *lease = Some(initialize()?);
+    }
+    Ok(())
+}
+
 impl Apartment {
     #[allow(unsafe_code)]
     fn enter() -> Result<Self, AppError> {
@@ -176,14 +188,11 @@ impl CaptureSource for WindowsCaptureSource {
         Ok(result)
     }
     fn window(&mut self, target: WindowCandidate, cursor: bool) -> Result<Vec<u8>, AppError> {
-        let _dpi = DpiContext::enter()?;
-        if self.prepared.is_none() {
-            self.prepare_window(target)?;
-        }
         let (prepared, item) = self
             .prepared
             .take()
             .ok_or(AppError::Capture("window source was not prepared"))?;
+        let _dpi = DpiContext::enter()?;
         if prepared != target {
             return Err(AppError::Capture(
                 "prepared window target changed; select again",
@@ -540,5 +549,73 @@ impl<F: FnMut() -> Result<(), AppError>> Countdown for NativeCountdown<F> {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn capture_runtime_retries_failure_and_retains_success() {
+        let lease = Default::default();
+        let attempts = AtomicUsize::new(0);
+        let failure = AppError::Capture("injected transient MTA failure");
+        assert_eq!(
+            ensure_runtime_lease(&lease, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<usize, _>(failure.clone())
+            }),
+            Err(failure)
+        );
+        assert_eq!(
+            ensure_runtime_lease(&lease, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(42usize)
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_runtime_lease(&lease, || {
+                panic!("a successful lifetime lease must not be acquired again")
+            }),
+            Ok(())
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn capture_runtime_concurrent_retries_acquire_one_successful_lease() {
+        let lease = Default::default();
+        assert!(
+            ensure_runtime_lease(&lease, || Err::<usize, _>(AppError::Capture(
+                "transient MTA failure"
+            )))
+            .is_err()
+        );
+        let attempts = AtomicUsize::new(0);
+        let start = Barrier::new(8);
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        ensure_runtime_lease(&lease, || {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            std::thread::yield_now();
+                            Ok(42usize)
+                        })
+                    })
+                })
+                .collect();
+            for thread in threads {
+                assert_eq!(thread.join().unwrap(), Ok(()));
+            }
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

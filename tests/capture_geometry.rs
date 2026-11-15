@@ -5,6 +5,29 @@ use vectrcap::capture::geometry::{
 fn r(x: i32, y: i32, w: u32, h: u32) -> Rect {
     Rect::new(x, y, w, h).unwrap()
 }
+#[cfg(windows)]
+#[test]
+fn window_capture_requires_preparation_before_resolving_target() {
+    use vectrcap::{
+        app::error::AppError,
+        capture::{
+            request::CaptureSource,
+            windows::{WindowCandidate, WindowId},
+        },
+        platform::windows::capture::WindowsCaptureSource,
+    };
+    let mut source = WindowsCaptureSource::new();
+    let target = WindowCandidate {
+        id: WindowId::new(1).unwrap(),
+        bounds: r(0, 0, 10, 10),
+    };
+    for cursor in [false, true] {
+        assert_eq!(
+            source.window(target, cursor).unwrap_err(),
+            AppError::Capture("window source was not prepared")
+        );
+    }
+}
 #[test]
 fn negative_origin_and_mixed_dpi_match_pixels() {
     let m = MonitorGeometry::new("left".into(), r(-1920, -200, 1920, 1080), 1.5).unwrap();

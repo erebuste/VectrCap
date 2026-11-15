@@ -9,6 +9,7 @@ use super::{
 };
 use crate::app::error::AppError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CaptureMode {
@@ -115,6 +116,7 @@ pub enum SnapshotHint {
     LayoutChanged,
 }
 pub struct CaptureSnapshot {
+    pub(crate) mode: CaptureMode,
     pub(crate) pixels: Vec<u8>,
     pub(crate) bounds: PhysicalRect,
     pub(crate) monitors: Vec<MonitorGeometry>,
@@ -153,6 +155,7 @@ impl CaptureSnapshot {
             return Err(AppError::Capture("snapshot pixels or geometry are invalid"));
         }
         Ok(Self {
+            mode: CaptureMode::Region,
             pixels,
             bounds,
             monitors,
@@ -216,12 +219,21 @@ pub trait CaptureSource {
         monitors: &[MonitorGeometry],
         cursor: bool,
     ) -> Result<Vec<u8>, AppError>;
+    /// Acquire only the source retained by prepare_window before any delay.
+    /// Return an error if no source was prepared; never resolve a new source here.
     fn window(&mut self, target: WindowCandidate, cursor: bool) -> Result<Vec<u8>, AppError>;
 }
 pub struct CaptureService<S, C> {
     source: S,
     countdown: C,
     cancel: CancellationToken,
+}
+/// Compare identities and geometry without changing the frozen hover z-order.
+fn same_window_layout(a: &[WindowCandidate], b: &[WindowCandidate]) -> bool {
+    let a_set: HashSet<_> = a.iter().collect();
+    let b_set: HashSet<_> = b.iter().collect();
+    // Native inventories contain each candidate once; reject malformed duplicates.
+    a.len() == b.len() && a_set.len() == a.len() && a_set == b_set
 }
 impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
     pub fn new(source: S, countdown: C, cancel: CancellationToken) -> Self {
@@ -287,12 +299,13 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
         if !same_layout(&layout, &self.source.monitors()?) {
             return Err(AppError::Capture("display layout changed while capturing"));
         }
-        if self.source.windows()? != windows {
+        if !same_window_layout(&windows, &self.source.windows()?) {
             return Err(AppError::Capture(
                 "window layout changed while capturing; try again",
             ));
         }
         let mut snapshot = CaptureSnapshot::new(pixels, bounds, layout, windows)?;
+        snapshot.mode = request.mode;
         match request.mode {
             CaptureMode::Window | CaptureMode::Fullscreen => snapshot.initial_crop = Some(bounds),
             CaptureMode::LastRegion => match request.last_region {

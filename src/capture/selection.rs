@@ -2,7 +2,7 @@
 use super::{
     geometry::{MonitorGeometry, PhysicalPoint, PhysicalRect, same_layout},
     preferences::{CaptureMouseAction, MouseButton, RegionCapturePreferences, SizePreset},
-    request::CaptureSnapshot,
+    request::{CaptureMode, CaptureSnapshot},
     windows::WindowCandidate,
 };
 use crate::app::error::AppError;
@@ -90,7 +90,15 @@ impl SelectionModel {
             .monitors
             .iter()
             .find(|m| m.bounds().contains(pointer))
-            .and_then(|m| m.bounds().intersection(snapshot.bounds))
+            .and_then(|m| {
+                if snapshot.mode == CaptureMode::Window {
+                    // An explicit window fixes the source independently of the launch
+                    // monitor. Region-only restrictions must not clip its initial crop.
+                    Some(snapshot.bounds)
+                } else {
+                    m.bounds().intersection(snapshot.bounds)
+                }
+            })
             .ok_or(AppError::Capture(
                 "launch pointer is outside the capture source",
             ))?;

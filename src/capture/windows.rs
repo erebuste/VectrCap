@@ -12,7 +12,7 @@ impl WindowId {
         Ok(Self(token))
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowCandidate {
     pub id: WindowId,
     pub bounds: PhysicalRect,
