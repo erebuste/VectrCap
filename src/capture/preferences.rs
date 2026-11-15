@@ -40,6 +40,9 @@ pub struct RegionCapturePreferences {
     pub window_detection: bool,
     pub dim_percent: u8,
     pub show_position_size: bool,
+    /// The legacy position/size switch remains a master gate for older files.
+    pub show_coordinates: bool,
+    pub show_dimensions: bool,
     pub show_magnifier: bool,
     pub lens_shape: LensShape,
     pub lens_source_count: u8,
@@ -60,6 +63,8 @@ impl Default for RegionCapturePreferences {
             window_detection: true,
             dim_percent: 20,
             show_position_size: true,
+            show_coordinates: true,
+            show_dimensions: true,
             show_magnifier: true,
             lens_shape: LensShape::Circle,
             lens_source_count: 15,

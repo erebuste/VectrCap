@@ -257,6 +257,26 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_region_preferences(
+        &mut self,
+        preferences: crate::capture::preferences::RegionCapturePreferences,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        preferences.validate()?;
+        if self.settings.region == preferences {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.region = preferences;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     pub fn set_appearance(&mut self, appearance: AppearancePreferences) -> Result<(), AppError> {
         self.ensure_not_corrupted()?;
         if self.settings.appearance == appearance {

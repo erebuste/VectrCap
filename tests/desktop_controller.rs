@@ -124,6 +124,47 @@ fn controller(root: &std::path::Path, store: Arc<Store>) -> AppController {
     )
     .unwrap()
 }
+
+#[test]
+fn region_settings_validate_and_persist_through_controller() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store.clone());
+    let mut prefs = app.settings().region.clone();
+    prefs.show_coordinates = false;
+    prefs.show_hex = true;
+    let revision = app.settings().revision;
+    let effects = app.dispatch(AppCommand::SetRegionPreferences {
+        preferences: prefs.clone(),
+        revision,
+    });
+    assert!(matches!(effects.as_slice(), [AppEffect::SettingsSaved(_)]));
+    assert_eq!(app.settings().region, prefs);
+    let next_revision = app.settings().revision;
+    let mut invalid = prefs.clone();
+    invalid.lens_source_count = 10;
+    assert!(matches!(
+        app.dispatch(AppCommand::SetRegionPreferences {
+            preferences: invalid,
+            revision: next_revision
+        })
+        .as_slice(),
+        [AppEffect::Error(_)]
+    ));
+    assert_eq!(app.settings().region, prefs);
+    assert_eq!(app.settings().revision, next_revision);
+    assert!(matches!(
+        app.dispatch(AppCommand::SetRegionPreferences {
+            preferences: Default::default(),
+            revision
+        })
+        .as_slice(),
+        [AppEffect::Error(_)]
+    ));
+    drop(app);
+    let reloaded = controller(dir.path(), store);
+    assert_eq!(reloaded.settings().region, prefs);
+}
 fn seed(app: &mut AppController, name: &str, origin: ServerOrigin, value: &str) -> DestinationId {
     let revision = app.settings().revision;
     let mut destinations = app.settings().destinations.clone();

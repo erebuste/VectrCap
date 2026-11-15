@@ -14,6 +14,7 @@ use eframe::egui::{self, Ui};
 use uuid::Uuid;
 #[derive(Default)]
 pub struct SettingsPane {
+    region: Option<super::region_settings::RegionSettingsPane>,
     draft: Option<ConnectionDraft>,
     saving: Option<Uuid>,
     error: Option<AppError>,
@@ -45,6 +46,7 @@ impl SettingsPane {
     /// runs every frame regardless of which window is active, so switching
     /// tabs mid-save must not cause the eventual save_result to be dropped.
     pub fn clear(&mut self, ctx: &egui::Context) {
+        self.region = None;
         self.draft = None;
         self.remove = None;
         self.shortcuts = None;
@@ -81,6 +83,14 @@ impl SettingsPane {
         recorded_shortcut: Option<(Uuid, crate::app::shortcuts::KeyChord)>,
     ) -> Vec<AppCommand> {
         let mut commands = vec![];
+        ui.collapsing("Region capture", |ui| {
+            let pane = self
+                .region
+                .get_or_insert_with(|| super::region_settings::RegionSettingsPane::new(settings));
+            if let Some(command) = pane.draw(ui, settings) {
+                commands.push(command);
+            }
+        });
         let mut enabled = notifications_enabled;
         if ui
             .checkbox(&mut enabled, "Show completion notifications")

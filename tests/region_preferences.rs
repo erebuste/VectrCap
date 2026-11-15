@@ -293,3 +293,35 @@ fn screenshot_and_last_region_settings_roundtrip_and_validate() {
     json["last_region"]["bounds"]["width"] = serde_json::json!(0);
     assert!(serde_json::from_value::<Settings>(json).is_err());
 }
+
+#[test]
+fn independent_information_fields_preserve_legacy_hidden_readouts() {
+    let mut json = serde_json::to_value(Settings::default()).unwrap();
+    let region = json["region"].as_object_mut().unwrap();
+    region.remove("show_coordinates");
+    region.remove("show_dimensions");
+    region.insert("show_position_size".into(), serde_json::json!(false));
+    let legacy: Settings = serde_json::from_value(json).unwrap();
+    let doc = vectrcap::editor::EditorDocument::from_image(std::sync::Arc::new(
+        image::RgbaImage::new(10, 10),
+    ))
+    .unwrap();
+    assert!(
+        vectrcap::ui::magnifier::CaptureReadout::sample(&doc, Point { x: 1, y: 2 }, &legacy.region)
+            .unwrap()
+            .lines()
+            .is_empty()
+    );
+    let mut settings = Settings::default();
+    settings.region.show_coordinates = false;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    settings.save(&path).unwrap();
+    let loaded = Settings::load(&path).unwrap();
+    assert_eq!(
+        vectrcap::ui::magnifier::CaptureReadout::sample(&doc, Point { x: 1, y: 2 }, &loaded.region)
+            .unwrap()
+            .lines(),
+        ["Width: 10  Height: 10"]
+    );
+}

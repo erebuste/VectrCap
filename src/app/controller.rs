@@ -1039,6 +1039,14 @@ impl AppController {
                 self.manager.set_appearance(appearance)?;
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
+            AppCommand::SetRegionPreferences {
+                preferences,
+                revision,
+            } => {
+                self.manager.ensure_revision(revision)?;
+                self.manager.set_region_preferences(preferences)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
             AppCommand::SetStartup { startup, revision } => {
                 self.manager.ensure_revision(revision)?;
                 crate::platform::windows::startup::apply(

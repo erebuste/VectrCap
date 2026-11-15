@@ -132,6 +132,10 @@ pub enum AppCommand {
         appearance: AppearancePreferences,
         revision: u64,
     },
+    SetRegionPreferences {
+        preferences: crate::capture::preferences::RegionCapturePreferences,
+        revision: u64,
+    },
     SetStartup {
         startup: StartupPreference,
         revision: u64,
