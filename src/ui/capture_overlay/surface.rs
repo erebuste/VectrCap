@@ -102,7 +102,7 @@ impl CaptureOverlay {
     }
     fn toolbar(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
         if self.recording_selection {
-            egui::Window::new("Select recording area").default_pos(viewport.min+egui::vec2(12.0,12.0)).show(ctx,|ui|{
+            egui::Window::new(self.selection_title).default_pos(viewport.min+egui::vec2(12.0,12.0)).show(ctx,|ui|{
                 ui.label("Select and resize a fixed rectangle on one monitor. Enter starts the countdown.");ui.label(&self.recording_summary);
                 if ui.button("Start countdown").clicked(){let r=self.handle(OverlayInput::Enter).map(|_|());self.note(r);}
                 if ui.button("Cancel").clicked(){let r=self.handle(OverlayInput::Escape).map(|_|());self.note(r);}

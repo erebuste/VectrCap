@@ -41,6 +41,7 @@ impl Tray {
                 return;
             }
             let command = match event.id.as_ref() {
+                "scrolling" => Some(AppCommand::ToggleScrolling),
                 "record-gif" => Some(AppCommand::ToggleRecording { mp4: false }),
                 "record-mp4" => Some(AppCommand::ToggleRecording { mp4: true }),
                 "record-stop" => Some(AppCommand::Recording(
@@ -137,6 +138,7 @@ impl Tray {
                     .map_err(|_| error())?;
             }
             for (id, label) in [
+                ("scrolling", "Scrolling capture (manual)"),
                 ("record-gif", "Start / stop GIF recording"),
                 ("record-mp4", "Start / stop MP4 recording"),
                 ("record-stop", "Stop current recording"),

@@ -152,6 +152,7 @@ pub enum CaptureOverlayEvent {
 pub struct CaptureOverlay {
     recording_selection: bool,
     recording_summary: String,
+    selection_title: &'static str,
     tool: AnnotationTool,
     last_drawing_tool: AnnotationTool,
     document: EditorDocument,
@@ -182,6 +183,7 @@ impl CaptureOverlay {
         Self {
             recording_selection: false,
             recording_summary: String::new(),
+            selection_title: "Select recording area",
             tool: Default::default(),
             last_drawing_tool: AnnotationTool::Freehand,
             document,
@@ -224,6 +226,10 @@ impl CaptureOverlay {
     }
     pub fn set_recording_summary(&mut self, summary: String) {
         self.recording_summary = summary;
+    }
+    pub fn set_scrolling_selection(&mut self) {
+        self.set_recording_selection();
+        self.selection_title = "Select scrolling viewport";
     }
     pub fn set_recording_selection(&mut self) {
         self.recording_selection = true;

@@ -47,6 +47,15 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    ToggleScrolling,
+    ToggleScrollingFor(DestinationSelection),
+    ScrollingSelection {
+        session: Uuid,
+        rect: crate::capture::geometry::PhysicalRect,
+    },
+    ScrollingSelectionClosed(Uuid),
+    ScrollingControl(crate::scrolling::runtime::ScrollControl),
+
     StartAudioTest(crate::recording::options::AudioOptions),
     StopAudioTest,
     RefreshAudioEndpoints,
@@ -221,6 +230,11 @@ impl From<QueueAction> for QueueCommand {
     }
 }
 pub enum AppEvent {
+    ScrollingAcquired {
+        session: Uuid,
+        result: Result<crate::platform::windows::capture::ScrollingSelectionSnapshot, AppError>,
+    },
+    Scrolling(crate::scrolling::runtime::RuntimeEvent),
     RecordingAcquired {
         session: Uuid,
         result: Result<crate::capture::request::CaptureSnapshot, AppError>,
@@ -257,6 +271,13 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    AcquireScrolling(Uuid),
+    CancelScrolling,
+    StartScrolling {
+        session: Uuid,
+        target: crate::platform::windows::windows::ScrollingTarget,
+    },
+    ScrollingControl(crate::scrolling::runtime::ScrollControl),
     StartAudioTest(crate::recording::options::AudioOptions),
     RefreshAudioEndpoints,
     StopAudioTest,

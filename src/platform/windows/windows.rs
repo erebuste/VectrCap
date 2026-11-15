@@ -21,7 +21,7 @@ pub(crate) struct NativeWindow {
     pub tid: u32,
     pub bounds: PhysicalRect,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Windows {
     entries: HashMap<WindowId, NativeWindow>,
 }
@@ -357,6 +357,62 @@ impl Drop for PinCaptureGuard {
             if let Err(error) = result {
                 eprintln!("restoring reference windows after capture failed: {error}");
             }
+        }
+    }
+}
+
+/// Original HWND/PID/TID and display layout; never resolves a replacement target.
+pub struct ScrollingTarget {
+    windows: Windows,
+    candidate: WindowCandidate,
+    viewport: PhysicalRect,
+    monitor: crate::capture::geometry::MonitorGeometry,
+}
+impl ScrollingTarget {
+    pub fn new(
+        windows: Windows,
+        candidate: WindowCandidate,
+        viewport: PhysicalRect,
+        monitor: crate::capture::geometry::MonitorGeometry,
+    ) -> Result<Self, AppError> {
+        if !candidate.bounds.contains_rect(viewport) || !monitor.bounds().contains_rect(viewport) {
+            return Err(AppError::Capture(
+                "scroll viewport must stay inside the original window and one monitor",
+            ));
+        }
+        windows.resolve(candidate)?;
+        Ok(Self {
+            windows,
+            candidate,
+            viewport,
+            monitor,
+        })
+    }
+    pub(crate) fn native(&self) -> Result<NativeWindow, AppError> {
+        self.windows.resolve(self.candidate)
+    }
+    #[allow(unsafe_code)]
+    pub fn identity(&self) -> Result<crate::scrolling::TargetIdentity, AppError> {
+        let native = self.native()?;
+        let monitors = super::monitors::enumerate_monitors()?;
+        if !monitors.iter().any(|m| m == &self.monitor) {
+            return Err(AppError::Capture("scroll display geometry changed"));
+        }
+        Ok(crate::scrolling::TargetIdentity {
+            target: self.candidate.id,
+            monitor_id: self.monitor.id().to_owned(),
+            window_rect: self.candidate.bounds,
+            viewport: self.viewport,
+            focused: unsafe { GetForegroundWindow() as usize == native.hwnd },
+        })
+    }
+    pub fn options(&self) -> crate::scrolling::ScrollOptions {
+        crate::scrolling::ScrollOptions {
+            target: self.candidate.id,
+            monitor_id: self.monitor.id().to_owned(),
+            rect: self.viewport,
+            maximum_duration: std::time::Duration::from_secs(600),
+            maximum_segments: 1000,
         }
     }
 }

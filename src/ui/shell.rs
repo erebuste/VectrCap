@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
+    scrolling_host: super::scrolling_controls::ScrollingHost,
     recording_host: super::recording_overlay::RecordingHost,
     pin_sources: super::pin_sources::PinSources,
     capture_host: super::capture_host::CaptureHost,
@@ -44,6 +45,7 @@ impl Shell {
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
+            scrolling_host: Default::default(),
             recording_host: Default::default(),
             pin_sources: Default::default(),
             capture_host: Default::default(),
@@ -95,6 +97,7 @@ impl eframe::App for Shell {
         }
         self.view = self.client.snapshot();
         self.capture_host.show(ctx, &self.client, &self.view);
+        self.scrolling_host.show(ctx, &self.client, &self.view);
         self.recording_host.show(ctx, &self.client, &self.view);
         self.pin_sources
             .show(ctx, &self.client, &self.view, &self.picker_gate);

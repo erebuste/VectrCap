@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct DesktopView {
+    pub scrolling: Option<super::controller::ScrollingView>,
     pub recording: Option<super::controller::RecordingView>,
     pub audio_test_stop: u64,
     pub audio_meter: Option<Result<f32, AppError>>,
@@ -72,6 +73,7 @@ pub struct DesktopView {
 impl Default for DesktopView {
     fn default() -> Self {
         Self {
+            scrolling: None,
             recording: None,
             audio_test_stop: 0,
             audio_meter: None,
@@ -222,6 +224,14 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    scrolling_selections: tokio::task::JoinSet<(
+        uuid::Uuid,
+        Result<crate::platform::windows::capture::ScrollingSelectionSnapshot, AppError>,
+    )>,
+    scrolling_cancel: Option<CancellationToken>,
+    scroller: Option<(uuid::Uuid, crate::scrolling::runtime::ScrollingRuntime)>,
+    scrolling_events: tokio::sync::mpsc::Sender<crate::scrolling::runtime::RuntimeEvent>,
+    scrolling_failure: Option<crate::scrolling::runtime::RuntimeEvent>,
     recording_selections: tokio::task::JoinSet<(
         uuid::Uuid,
         Result<crate::capture::request::CaptureSnapshot, AppError>,
@@ -257,6 +267,60 @@ impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::AcquireScrolling(session) => {
+                    let cancel = CancellationToken::new();
+                    self.scrolling_cancel = Some(cancel.clone());
+                    self.scrolling_selections.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::platform::windows::capture::acquire_scrolling_selection(cancel)
+                        })
+                        .await
+                        .unwrap_or(Err(AppError::Capture("scroll selection worker failed")));
+                        (session, result)
+                    });
+                }
+                AppEffect::CancelScrolling => {
+                    if let Some(cancel) = self.scrolling_cancel.take() {
+                        cancel.cancel();
+                    }
+                    if let Some((_, runtime)) = self.scroller.take() {
+                        let _ = runtime.control(crate::scrolling::runtime::ScrollControl::Cancel);
+                        tokio::task::spawn_blocking(move || runtime.join());
+                    }
+                }
+                AppEffect::StartScrolling { session, target } => {
+                    let options = target.options();
+                    match crate::scrolling::runtime::ScrollingRuntime::start(
+                        session,
+                        target,
+                        self.scrolling_events.clone(),
+                    ) {
+                        Ok(runtime) => self.scroller = Some((session, runtime)),
+                        Err(error) => {
+                            self.scrolling_failure =
+                                Some(crate::scrolling::runtime::RuntimeEvent {
+                                    session,
+                                    update: crate::scrolling::runtime::ScrollUpdate {
+                                        state: crate::scrolling::session::ScrollState::Cancelled,
+                                        options,
+                                        accepted_segments: 0,
+                                        dimensions: None,
+                                        partial_reason: Some("Scrolling worker could not start"),
+                                        countdown: std::time::Duration::ZERO,
+                                    },
+                                    review: None,
+                                    error: Some(error),
+                                });
+                        }
+                    }
+                }
+                AppEffect::ScrollingControl(control) => {
+                    if let Some((_, runtime)) = &self.scroller
+                        && let Err(error) = runtime.control(control)
+                    {
+                        self.state.error = Some(error);
+                    }
+                }
                 AppEffect::StartAudioTest(options) => {
                     if let Some(m) = self.audio_test.take() {
                         let _ = tokio::task::spawn_blocking(move || m.stop()).await;
@@ -632,10 +696,16 @@ async fn serve(
     let uploader = Arc::new(Uploader::new(history.clone(), artifacts.clone(), factory));
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
+    let (scrolling_events, mut scrolling_rx) = tokio::sync::mpsc::channel(2);
     let (recording_events, mut recording_rx) = tokio::sync::mpsc::channel(32);
     let mut recording_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     recording_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut effects = Effects {
+        scrolling_selections: tokio::task::JoinSet::new(),
+        scrolling_cancel: None,
+        scroller: None,
+        scrolling_events,
+        scrolling_failure: None,
         recording_selections: tokio::task::JoinSet::new(),
         recording_cancel: None,
         recorder: None,
@@ -671,84 +741,96 @@ async fn serve(
     let mut effect_open = true;
     let mut driver_consumed = false;
     let outcome = loop {
-        let results = tokio::select! {
-            _=recording_tick.tick(), if controller.recording_view().is_some() || effects.audio_test.is_some() => controller.dispatch(AppCommand::Recording(crate::recording::session::RecordingInput::Tick(controller.recording_origin().elapsed()))),
-            Some(message)=recording_rx.recv()=>{if matches!(message.input,crate::recording::session::RecordingInput::Finalized(_)){effects.recorder=None;}controller.on_event(AppEvent::RecordingWorker{session:message.session,input:message.input})},
-            result=effects.audio_endpoints.join_next(), if !effects.audio_endpoints.is_empty()=>{match result{Some(Ok(Ok(e)))=>effects.state.audio_endpoints=e,Some(Ok(Err(e)))=>effects.state.error=Some(e),_=>effects.state.error=Some(AppError::Capture("audio endpoint query failed"))}vec![]},
-            result=effects.recording_selections.join_next(), if !effects.recording_selections.is_empty()=>{
-                match result{Some(Ok((session,result)))=>controller.on_event(AppEvent::RecordingAcquired{session,result}),_=>controller.dispatch(AppCommand::Recording(crate::recording::session::RecordingInput::Failed(AppError::Capture("recording selection worker failed"))))}
-            }
+        let results = if let Some(failure) = effects.scrolling_failure.take() {
+            controller.on_event(AppEvent::Scrolling(failure))
+        } else {
+            tokio::select! {
+                Some(event)=scrolling_rx.recv()=>{
+                    if event.is_terminal() && effects.scroller.as_ref().is_some_and(|(id,_)|*id==event.session) && let Some((_,runtime))=effects.scroller.take(){tokio::task::spawn_blocking(move||runtime.join());}
+                    controller.on_event(AppEvent::Scrolling(event))
+                },
+                result=effects.scrolling_selections.join_next(), if !effects.scrolling_selections.is_empty()=>{
+                    match result{Some(Ok((session,result)))=>controller.on_event(AppEvent::ScrollingAcquired{session,result}),_=>controller.dispatch(AppCommand::ScrollingControl(crate::scrolling::runtime::ScrollControl::Cancel))}
+                },
+                _=recording_tick.tick(), if controller.recording_view().is_some() || effects.audio_test.is_some() => controller.dispatch(AppCommand::Recording(crate::recording::session::RecordingInput::Tick(controller.recording_origin().elapsed()))),
+                Some(message)=recording_rx.recv()=>{if matches!(message.input,crate::recording::session::RecordingInput::Finalized(_)){effects.recorder=None;}controller.on_event(AppEvent::RecordingWorker{session:message.session,input:message.input})},
+                result=effects.audio_endpoints.join_next(), if !effects.audio_endpoints.is_empty()=>{match result{Some(Ok(Ok(e)))=>effects.state.audio_endpoints=e,Some(Ok(Err(e)))=>effects.state.error=Some(e),_=>effects.state.error=Some(AppError::Capture("audio endpoint query failed"))}vec![]},
+                result=effects.recording_selections.join_next(), if !effects.recording_selections.is_empty()=>{
+                    match result{Some(Ok((session,result)))=>controller.on_event(AppEvent::RecordingAcquired{session,result}),_=>controller.dispatch(AppCommand::Recording(crate::recording::session::RecordingInput::Failed(AppError::Capture("recording selection worker failed"))))}
+                }
 
-            result = effects.pin_areas.join_next(), if !effects.pin_areas.is_empty() => {
-                controller.on_event(AppEvent::PinWorkAreas { result: result.and_then(Result::ok).unwrap_or(Err(AppError::Capture("pin monitor worker failed"))) })
-            }
-            result = effects.pin_loads.join_next(), if !effects.pin_loads.is_empty() => {
-                match result {
-                    Some(Ok((request, result))) => controller.on_event(AppEvent::PinLoaded { request, result }),
-                    _ => vec![AppEffect::Error(AppError::Capture("pin source worker failed"))],
+                result = effects.pin_areas.join_next(), if !effects.pin_areas.is_empty() => {
+                    controller.on_event(AppEvent::PinWorkAreas { result: result.and_then(Result::ok).unwrap_or(Err(AppError::Capture("pin monitor worker failed"))) })
                 }
-            }
-            result = effects.captures.join_next(), if !effects.captures.is_empty() => {
-                match result {
-                    Some(Ok((session, result))) => controller.on_event(AppEvent::CaptureAcquired { session, result }),
-                    _ => effects.state.capture_acquiring.map_or_else(Vec::new, |session| controller.on_event(AppEvent::CaptureAcquired { session, result: Err(AppError::Capture("capture acquisition worker failed")) })),
-                }
-            }
-            result = effects.local_actions.join_next(), if !effects.local_actions.is_empty() => {
-                match result {Some(Ok(Ok(())))=>vec![],Some(Ok(Err(AppError::Cancelled)))=>vec![],Some(Ok(Err(error)))=>vec![AppEffect::Error(error)],_=>vec![AppEffect::Error(AppError::Persistence("local action worker failed"))]}
-            }
-            // No lifecycle guard: a file already accepted into a batch must
-            // still become a durable job even if Quit arrives mid-staging.
-            result = effects.staging.join_next_with_id(), if !effects.staging.is_empty() => {
-                match result {
-                    Some(Ok((id, (batch, index, display_name, outcome)))) => {
-                        effects.staging_meta.remove(&id);
-                        controller.on_event(AppEvent::FileStaged { batch, index, display_name, outcome })
+                result = effects.pin_loads.join_next(), if !effects.pin_loads.is_empty() => {
+                    match result {
+                        Some(Ok((request, result))) => controller.on_event(AppEvent::PinLoaded { request, result }),
+                        _ => vec![AppEffect::Error(AppError::Capture("pin source worker failed"))],
                     }
-                    // A panicked/aborted staging task still resolves its
-                    // exact batch slot via the metadata recorded at spawn
-                    // time, instead of leaving that batch permanently
-                    // pending with no `FileStaged` ever arriving for it.
-                    Some(Err(join_error)) => match effects.staging_meta.remove(&join_error.id()) {
-                        Some((batch, index, display_name)) => controller.on_event(AppEvent::FileStaged {
-                            batch, index, display_name,
-                            outcome: Err(AppError::Persistence("file staging worker failed")),
-                        }),
-                        None => vec![AppEffect::Error(AppError::Persistence("file staging worker failed"))],
-                    },
-                    None => vec![],
                 }
-            }
-            _ = stop.cancelled(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::Quit),
-            command = commands.recv(), if controller.lifecycle == Lifecycle::Running => {
-                effects.state.error = None;
-                controller.dispatch(command.unwrap_or(AppCommand::Quit))
-            }
-            effect = effect_rx.recv(), if effect_open => {
-                match effect {
-                    Some(effect) => {
-                        if let QueueEffect::Progress { job, acknowledged, speed } = &effect { effects.state.transfers.insert(*job, (*acknowledged, *speed)); }
-                        controller.on_event(AppEvent::Queue(effect))
+                result = effects.captures.join_next(), if !effects.captures.is_empty() => {
+                    match result {
+                        Some(Ok((session, result))) => controller.on_event(AppEvent::CaptureAcquired { session, result }),
+                        _ => effects.state.capture_acquiring.map_or_else(Vec::new, |session| controller.on_event(AppEvent::CaptureAcquired { session, result: Err(AppError::Capture("capture acquisition worker failed")) })),
                     }
-                    None => { effect_open = false; vec![] }
                 }
-            }
-            result = &mut driver => {
-                driver_consumed = true;
-                let result = result.unwrap_or(Err(AppError::Persistence("upload driver failed")));
-                controller.on_event(AppEvent::WorkerStopped(result))
-            }
-            result = async { match effects.metadata.as_mut() { Some(task) => task.await, None => std::future::pending().await } } => {
-                effects.metadata = None;
-                match result {
-                    Ok((request, result)) => controller.on_event(AppEvent::ConnectionTest { request, result }),
-                    Err(_) => vec![AppEffect::Error(AppError::Network)],
+                result = effects.local_actions.join_next(), if !effects.local_actions.is_empty() => {
+                    match result {Some(Ok(Ok(())))=>vec![],Some(Ok(Err(AppError::Cancelled)))=>vec![],Some(Ok(Err(error)))=>vec![AppEffect::Error(error)],_=>vec![AppEffect::Error(AppError::Persistence("local action worker failed"))]}
+                }
+                // No lifecycle guard: a file already accepted into a batch must
+                // still become a durable job even if Quit arrives mid-staging.
+                result = effects.staging.join_next_with_id(), if !effects.staging.is_empty() => {
+                    match result {
+                        Some(Ok((id, (batch, index, display_name, outcome)))) => {
+                            effects.staging_meta.remove(&id);
+                            controller.on_event(AppEvent::FileStaged { batch, index, display_name, outcome })
+                        }
+                        // A panicked/aborted staging task still resolves its
+                        // exact batch slot via the metadata recorded at spawn
+                        // time, instead of leaving that batch permanently
+                        // pending with no `FileStaged` ever arriving for it.
+                        Some(Err(join_error)) => match effects.staging_meta.remove(&join_error.id()) {
+                            Some((batch, index, display_name)) => controller.on_event(AppEvent::FileStaged {
+                                batch, index, display_name,
+                                outcome: Err(AppError::Persistence("file staging worker failed")),
+                            }),
+                            None => vec![AppEffect::Error(AppError::Persistence("file staging worker failed"))],
+                        },
+                        None => vec![],
+                    }
+                }
+                _ = stop.cancelled(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::Quit),
+                command = commands.recv(), if controller.lifecycle == Lifecycle::Running => {
+                    effects.state.error = None;
+                    controller.dispatch(command.unwrap_or(AppCommand::Quit))
+                }
+                effect = effect_rx.recv(), if effect_open => {
+                    match effect {
+                        Some(effect) => {
+                            if let QueueEffect::Progress { job, acknowledged, speed } = &effect { effects.state.transfers.insert(*job, (*acknowledged, *speed)); }
+                            controller.on_event(AppEvent::Queue(effect))
+                        }
+                        None => { effect_open = false; vec![] }
+                    }
+                }
+                result = &mut driver => {
+                    driver_consumed = true;
+                    let result = result.unwrap_or(Err(AppError::Persistence("upload driver failed")));
+                    controller.on_event(AppEvent::WorkerStopped(result))
+                }
+                result = async { match effects.metadata.as_mut() { Some(task) => task.await, None => std::future::pending().await } } => {
+                    effects.metadata = None;
+                    match result {
+                        Ok((request, result)) => controller.on_event(AppEvent::ConnectionTest { request, result }),
+                        Err(_) => vec![AppEffect::Error(AppError::Network)],
+                    }
                 }
             }
         };
         if let Some(m) = &effects.audio_test {
             effects.state.audio_meter = m.status.lock().ok().map(|s| s.clone());
         }
+        effects.state.scrolling = controller.scrolling_view();
         effects.state.recording = controller.recording_view();
         effects.state.accepted_workflows = controller.active_workflow_count();
         effects.state.batch_summary = match controller.batch_summary() {
@@ -777,6 +859,14 @@ async fn serve(
     if let Some(m) = effects.audio_test.take() {
         let _ = tokio::task::spawn_blocking(move || m.stop()).await;
     }
+    scrolling_rx.close();
+    if let Some(cancel) = effects.scrolling_cancel.take() {
+        cancel.cancel();
+    }
+    if let Some((_, runtime)) = effects.scroller.take() {
+        let _ = tokio::task::spawn_blocking(move || runtime.join()).await;
+    }
+    while effects.scrolling_selections.join_next().await.is_some() {}
     if let Some(c) = effects.recording_cancel.take() {
         c.cancel();
     }

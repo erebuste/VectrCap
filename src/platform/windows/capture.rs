@@ -50,7 +50,7 @@ impl From<PreparedWindowItem> for GraphicsCaptureItemType {
         Self::Window((value.item, value.window))
     }
 }
-struct Apartment {
+pub(crate) struct Apartment {
     owned: bool,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -97,7 +97,7 @@ fn ensure_runtime_lease<T>(
 
 impl Apartment {
     #[allow(unsafe_code)]
-    fn enter() -> Result<Self, AppError> {
+    pub(crate) fn enter() -> Result<Self, AppError> {
         initialize_capture_runtime()?;
         // windows-sys 0.61 has no WinRT module; use the already-pinned WGC projection.
         use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
@@ -599,6 +599,40 @@ impl<F: FnMut() -> Result<(), AppError>> Countdown for NativeCountdown<F> {
         }
         Ok(())
     }
+}
+
+/// The frozen selection and its original native identity table travel together.
+pub struct ScrollingSelectionSnapshot {
+    pub snapshot: crate::capture::request::CaptureSnapshot,
+    pub windows: Windows,
+}
+pub fn acquire_scrolling_selection(
+    cancel: CancellationToken,
+) -> Result<ScrollingSelectionSnapshot, AppError> {
+    use crate::capture::{
+        preferences::RegionCapturePreferences,
+        request::{CaptureMode, CaptureRequest, CaptureService},
+    };
+    let pins = super::windows::PinCaptureGuard::begin()?;
+    let mut service = CaptureService::new(
+        WindowsCaptureSource::new(),
+        NativeCountdown::new(hide_app_chrome),
+        cancel,
+    );
+    let result = service.snapshot(CaptureRequest::new(
+        CaptureMode::Region,
+        0,
+        false,
+        RegionCapturePreferences::default(),
+    )?);
+    let windows = service.into_source().windows;
+    if let Err(error) = pins.restore() {
+        eprintln!("restoring reference windows failed: {error}");
+    }
+    Ok(ScrollingSelectionSnapshot {
+        snapshot: result?,
+        windows,
+    })
 }
 
 #[cfg(test)]

@@ -26,3 +26,6 @@ pub mod audio_sources;
 pub mod recording_overlay;
 pub mod recording_review;
 pub mod recording_settings;
+pub mod scrolling_review;
+
+pub mod scrolling_controls;

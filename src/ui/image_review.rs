@@ -311,6 +311,9 @@ impl ImageReview {
             pixels,
         )?))
     }
+    pub fn into_editor(self) -> super::capture_overlay::CaptureOverlay {
+        self.editor
+    }
     pub fn document(&self) -> &crate::editor::EditorDocument {
         self.editor.document()
     }

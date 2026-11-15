@@ -198,7 +198,8 @@ impl ShortcutAction {
         self.scope() == ShortcutScope::Editor
             || matches!(
                 self,
-                ShortcutAction::ToggleGifRecording
+                ShortcutAction::ToggleScrollingCapture
+                    | ShortcutAction::ToggleGifRecording
                     | ShortcutAction::ToggleMp4Recording
                     | ShortcutAction::StopRecording
                     | ShortcutAction::PauseResumeRecording
@@ -485,6 +486,9 @@ fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
         return Some(ShortcutOutcome::Command(command));
     }
     match action {
+        ShortcutAction::ToggleScrollingCapture => {
+            Some(ShortcutOutcome::Command(AppCommand::ToggleScrolling))
+        }
         ShortcutAction::PinSourceChooser
         | ShortcutAction::PinFromScreen
         | ShortcutAction::PinFromClipboard
@@ -685,6 +689,14 @@ impl ShortcutManager {
         }
         let outcome = command_for(event.action)?;
         match outcome {
+            ShortcutOutcome::Command(crate::app::events::AppCommand::ToggleScrolling) => Some(
+                ShortcutOutcome::Command(crate::app::events::AppCommand::ToggleScrollingFor(
+                    self.bindings
+                        .iter()
+                        .find(|b| b.action == event.action)?
+                        .destination,
+                )),
+            ),
             ShortcutOutcome::Command(crate::app::events::AppCommand::ToggleRecording { mp4 }) => {
                 Some(ShortcutOutcome::Command(
                     crate::app::events::AppCommand::ToggleRecordingFor {
@@ -1055,7 +1067,7 @@ mod tests {
     #[test]
     fn unavailable_actions_are_never_registered_or_dispatched() {
         let (manager, fake) = manager_with(vec![binding(
-            ShortcutAction::ToggleScrollingCapture,
+            ShortcutAction::ScreenColorPicker,
             chord(true, false, 0x52),
             true,
         )]);
@@ -1064,11 +1076,11 @@ mod tests {
             "an unimplemented action's key must never be taken from the OS"
         );
         assert_eq!(
-            manager.status(ShortcutAction::ToggleScrollingCapture),
+            manager.status(ShortcutAction::ScreenColorPicker),
             ShortcutStatus::NotYetImplemented
         );
         let event = ShortcutEvent {
-            action: ShortcutAction::ToggleScrollingCapture,
+            action: ShortcutAction::ScreenColorPicker,
             repeat: false,
         };
         assert!(manager.handle(event, ShortcutFocus::Normal).is_none());

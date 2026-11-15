@@ -17,6 +17,8 @@ use std::path::PathBuf;
 /// against this same document; snapshots never duplicate frozen image buffers.
 pub struct CaptureSurface {
     pub intended_pin: bool,
+    pub scrolling_review: Option<crate::ui::scrolling_review::ScrollReviewStatus>,
+    pub review_viewport: crate::ui::image_review::ImageViewport,
     pub session: Uuid,
     pub overlay: CaptureOverlay,
     pub archive_failed: bool,
@@ -41,7 +43,8 @@ impl AppController {
         mode: CaptureMode,
         selection: DestinationSelection,
     ) -> Result<Vec<AppEffect>, AppError> {
-        if self.capture.is_some()
+        if self.scrolling.is_some()
+            || self.capture.is_some()
             || self
                 .recording
                 .as_ref()
@@ -118,6 +121,8 @@ impl AppController {
             let overlay = CaptureOverlay::from_snapshot(snapshot, pointer, (4, 4))?;
             Ok(Arc::new(Mutex::new(CaptureSurface {
                 intended_pin: capture.intended_pin,
+                scrolling_review: None,
+                review_viewport: Default::default(),
                 session,
                 overlay,
                 archive_failed: false,
@@ -262,6 +267,15 @@ impl AppController {
         let mut surface = surface
             .lock()
             .map_err(|_| AppError::Capture("capture surface unavailable"))?;
+        if surface
+            .scrolling_review
+            .as_ref()
+            .is_some_and(|r| !r.accepted)
+        {
+            return Err(AppError::InUse(
+                "accept the partial scrolling result before output",
+            ));
+        }
         let mut discard_error = None;
         if let Some(finish) = finish {
             surface.overlay.validate_finish(&finish)?;
@@ -307,6 +321,19 @@ impl AppController {
             let image =
                 crate::pin::PinnedImage::new(pending.finish().prepared.pixels().clone(), None)?;
             self.pins.check_capacity(&image)?;
+            if self.pins.snapshots().is_empty() {
+                self.pins.update_work_areas(
+                    capture.monitors.iter().map(|m| m.bounds()).collect(),
+                    pending.finish().screen_location.unwrap_or(
+                        crate::capture::geometry::PhysicalPoint {
+                            x: crop.left(),
+                            y: crop.top(),
+                        },
+                    ),
+                )?;
+            }
+            self.pins
+                .validate_open(&image, pending.finish().screen_location)?;
             Some(image)
         } else {
             None
@@ -354,20 +381,6 @@ impl AppController {
                 .clipboard
                 .write_image(pending.finish().prepared.pixels())?,
             OverlayAction::Pin => {
-                // Capture snapshots carry verified monitor geometry. Native source
-                // entry points supply actual work areas; capture-origin placement
-                // remains the selected physical location whenever reachable.
-                if self.pins.snapshots().is_empty() {
-                    self.pins.update_work_areas(
-                        capture.monitors.iter().map(|m| m.bounds()).collect(),
-                        pending.finish().screen_location.unwrap_or(
-                            crate::capture::geometry::PhysicalPoint {
-                                x: crop.left(),
-                                y: crop.top(),
-                            },
-                        ),
-                    )?;
-                }
                 let id = self.pins.open(
                     pin_image.expect("pin image validated before persistence"),
                     pending.finish().screen_location,
@@ -400,5 +413,41 @@ impl AppController {
         }
         surface.pending_finish = false;
         Ok(effects)
+    }
+}
+
+impl AppController {
+    pub(super) fn open_scrolling_review(
+        &mut self,
+        id: Uuid,
+        review: crate::scrolling::session::ScrollReview,
+        monitors: Vec<MonitorGeometry>,
+        selection: DestinationSelection,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        let (overlay, status) =
+            crate::ui::scrolling_review::ScrollingReview::new(review)?.into_parts();
+        let surface = Arc::new(Mutex::new(CaptureSurface {
+            intended_pin: false,
+            scrolling_review: Some(status),
+            review_viewport: Default::default(),
+            session: id,
+            overlay,
+            archive_failed: false,
+            pending_finish: false,
+            native_scale: 1.0,
+            dialog_open: false,
+            working: false,
+        }));
+        self.capture = Some(CaptureWorkflow {
+            intended_pin: false,
+            id,
+            surface: Some(surface.clone()),
+            mode: CaptureMode::Fullscreen,
+            selection,
+            monitors,
+            pending: None,
+            save_path: None,
+        });
+        Ok(vec![AppEffect::CaptureSurface(Some(surface))])
     }
 }

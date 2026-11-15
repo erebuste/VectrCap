@@ -243,6 +243,9 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
             cancel,
         }
     }
+    pub fn into_source(self) -> S {
+        self.source
+    }
     fn check_cancel(&self) -> Result<(), AppError> {
         if self.cancel.is_cancelled() {
             Err(AppError::Cancelled)

@@ -2,6 +2,7 @@
 //! There is no await point between reference inspection and durable commit.
 mod capture;
 mod recording;
+mod scrolling;
 use super::{
     destination_manager::{
         DestinationEdit, DestinationManager, DestinationReferences, DestinationRepository,
@@ -29,6 +30,7 @@ use crate::{
 };
 pub use capture::CaptureSurface;
 pub use recording::{RecordingSelection, RecordingView};
+pub use scrolling::ScrollingView;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -159,6 +161,7 @@ struct FileBatch {
 }
 pub struct AppController {
     capture: Option<capture::CaptureWorkflow>,
+    scrolling: Option<scrolling::ScrollingWorkflow>,
     recording: Option<recording::RecordingWorkflow>,
     recording_origin: std::time::Instant,
     pins: crate::pin::PinManager,
@@ -213,6 +216,7 @@ impl AppController {
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
             capture: None,
+            scrolling: None,
             recording: None,
             recording_origin: std::time::Instant::now(),
             pins: crate::pin::PinManager::default(),
@@ -868,6 +872,36 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::ToggleScrolling => self.toggle_scrolling(DestinationSelection::Inherit)?,
+            AppCommand::ToggleScrollingFor(selection) => self.toggle_scrolling(selection)?,
+            AppCommand::ScrollingSelection { session, rect } => {
+                match self.select_scrolling(session, rect) {
+                    Ok(effects) => effects,
+                    Err(error) => {
+                        if let Some(surface) =
+                            self.scrolling.as_ref().and_then(|w| w.selection.as_ref())
+                            && let Ok(mut surface) = surface.lock()
+                        {
+                            surface.overlay.finish_failed(error.clone());
+                        }
+                        vec![AppEffect::Error(error)]
+                    }
+                }
+            }
+            AppCommand::ScrollingSelectionClosed(id) => self.scrolling_selection_closed(id),
+            AppCommand::ScrollingControl(control) => {
+                if matches!(control, crate::scrolling::runtime::ScrollControl::Cancel) {
+                    self.cancel_scrolling()
+                } else if let Some(w) = &self.scrolling {
+                    if w.selection.is_some() {
+                        self.cancel_scrolling()
+                    } else {
+                        vec![AppEffect::ScrollingControl(control)]
+                    }
+                } else {
+                    vec![]
+                }
+            }
             AppCommand::StartAudioTest(options) => {
                 options.validate()?;
                 if self
@@ -1282,6 +1316,11 @@ impl AppController {
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
             AppCommand::Quit => {
+                let scrolling_effects = if self.scrolling.is_some() {
+                    self.cancel_scrolling()
+                } else {
+                    vec![]
+                };
                 if self
                     .recording
                     .as_ref()
@@ -1296,6 +1335,7 @@ impl AppController {
                 } else {
                     vec![]
                 };
+                capture_effects.extend(scrolling_effects);
                 self.shortcuts = None;
                 self.pin_load = None;
                 capture_effects.extend(self.pins.close_all().into_iter().map(AppEffect::Pin));
@@ -1316,6 +1356,10 @@ impl AppController {
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::ScrollingAcquired { session, result } => {
+                self.scrolling_acquired(session, result)
+            }
+            AppEvent::Scrolling(event) => self.scrolling_event(event),
             AppEvent::RecordingAcquired { session, result } => {
                 self.recording_acquired(session, result)
             }

@@ -90,6 +90,7 @@ impl ShortcutRegistrar for Win32HotkeyBackend {
 pub struct HotkeyBridge {
     window: HWND,
     client: Option<Box<crate::app::desktop::DesktopClient>>,
+    _scrolling_events: crate::scrolling::runtime::TargetEventHooks,
 }
 
 const REGISTER_MESSAGE: u32 = 0x8000 + 241;
@@ -105,6 +106,7 @@ impl HotkeyBridge {
         client: crate::app::desktop::DesktopClient,
     ) -> Result<Self, AppError> {
         let client = Box::new(client);
+        let scrolling_events = crate::scrolling::runtime::TargetEventHooks::attach()?;
         unsafe {
             if windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
                 window,
@@ -132,6 +134,7 @@ impl HotkeyBridge {
         Ok(Self {
             window,
             client: Some(client),
+            _scrolling_events: scrolling_events,
         })
     }
 }
@@ -162,8 +165,12 @@ unsafe extern "system" fn hotkey_message(
         return unsafe { UnregisterHotKey(window, wparam as i32) } as isize;
     }
     if let Some(reason) = super::recording_events::interruption_for_message(message, wparam) {
+        crate::scrolling::runtime::invalidate_candidates();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let client = &*(data as *const crate::app::desktop::DesktopClient);
+            let _ = client.submit(crate::app::events::AppCommand::ScrollingControl(
+                crate::scrolling::runtime::ScrollControl::Interrupt(reason.label()),
+            ));
             let _ = client.submit(crate::app::events::AppCommand::Recording(
                 crate::recording::session::RecordingInput::Interrupt(reason),
             ));

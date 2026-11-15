@@ -23,7 +23,13 @@ impl CaptureHost {
         }
         if let Some(surface) = &view.capture_surface {
             if let Ok(state) = surface.try_lock() {
-                match state.overlay.viewport_builder(state.native_scale) {
+                match if state.scrolling_review.is_some() {
+                    Ok(egui::ViewportBuilder::default()
+                        .with_title("VectrCap scrolling image review")
+                        .with_inner_size([1000.0, 800.0]))
+                } else {
+                    state.overlay.viewport_builder(state.native_scale)
+                } {
                     Ok(builder) => self.capture_builder = Some((state.session, builder)),
                     Err(error) => client.report_error(error),
                 }
@@ -82,12 +88,23 @@ impl CaptureHost {
                                 }
                             });
                         }
+                        if let Some(status)=&mut state.scrolling_review {
+                            ui.label(format!("Scrolling capture: {} accepted segments",status.segments));
+                            if let Some(reason)=status.reason {
+                                ui.label(format!("Partial result: {reason}"));
+                                if !status.accepted && ui.button("Accept reliable partial result").clicked(){status.accepted=true;}
+                            }
+                        }
+                        let partial_blocked=state.scrolling_review.as_ref().is_some_and(|r|!r.accepted);
                         let event = if ui.ctx().input(|i| i.viewport().close_requested()) {
                             Some(CaptureOverlayEvent::Cancel)
                         } else {
-                            view.settings
-                                .as_ref()
-                                .and_then(|settings| state.overlay.show(ui, &settings.shortcuts))
+                            view.settings.as_ref().and_then(|settings| {
+                                if state.scrolling_review.is_some(){
+                                    let super::super::app::controller::CaptureSurface{overlay,review_viewport,..}=&mut *state;
+                                    ui.add_enabled_ui(!partial_blocked,|ui|overlay.show_review(ui,&settings.shortcuts,review_viewport)).inner
+                                }else{state.overlay.show(ui,&settings.shortcuts)}
+                            })
                         };
                         let mut save = None;
                         match event {

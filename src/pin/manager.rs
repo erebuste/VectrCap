@@ -69,6 +69,16 @@ impl PinManager {
         }
         Ok(())
     }
+    /// Validate both pixel capacity and a reachable display before persistence.
+    pub fn validate_open(
+        &self,
+        image: &PinnedImage,
+        placement: Option<PhysicalPoint>,
+    ) -> Result<(), AppError> {
+        self.check_capacity(image)?;
+        self.area_for(placement.or(self.pointer))?;
+        Ok(())
+    }
     pub fn open(
         &mut self,
         image: PinnedImage,

@@ -88,7 +88,7 @@ impl AppController {
         if self.recording.is_some() {
             return self.recording_input(RecordingInput::ToggleFormat(mp4));
         }
-        if self.capture.is_some() {
+        if self.scrolling.is_some() || self.capture.is_some() {
             return Err(AppError::InUse("a capture session is already active"));
         }
         self.manager.ensure_not_corrupted()?;
