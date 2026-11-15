@@ -19,6 +19,7 @@ pub enum OverlayInput {
     Finish(OverlayAction),
 }
 pub struct CaptureOverlay {
+    tool: super::annotation_toolbar::AnnotationTool,
     document: EditorDocument,
     text: Option<Annotation>,
     finish_visible: bool,
@@ -27,6 +28,7 @@ pub struct CaptureOverlay {
 impl CaptureOverlay {
     pub fn new(document: EditorDocument) -> Self {
         Self {
+            tool: Default::default(),
             document,
             text: None,
             finish_visible: false,
@@ -35,6 +37,48 @@ impl CaptureOverlay {
     }
     pub fn document(&self) -> &EditorDocument {
         &self.document
+    }
+    pub fn tool(&self) -> super::annotation_toolbar::AnnotationTool {
+        self.tool
+    }
+    pub fn handle_chord(
+        &mut self,
+        saved: &crate::app::shortcuts::ShortcutSettings,
+        chord: crate::app::shortcuts::KeyChord,
+        focus: crate::app::shortcuts::ShortcutFocus,
+        repeat: bool,
+    ) -> Result<bool, AppError> {
+        use crate::app::shortcuts::ShortcutFocus;
+        if self.cancelled {
+            return Err(AppError::Cancelled);
+        }
+        if focus != ShortcutFocus::Normal || repeat || self.text.is_some() {
+            return Ok(false);
+        }
+        if chord.ctrl && !chord.alt && !chord.shift && !chord.win {
+            match chord.key.vk() {
+                0x5A => {
+                    self.document.undo()?;
+                    self.finish_visible = false;
+                    return Ok(true);
+                }
+                0x59 => {
+                    self.document.redo()?;
+                    self.finish_visible = false;
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+        if let Some(tool) = saved
+            .editor_action_for(chord, focus, repeat)
+            .and_then(super::annotation_toolbar::AnnotationTool::from_shortcut)
+        {
+            self.tool = tool;
+            self.finish_visible = false;
+            return Ok(true);
+        }
+        Ok(false)
     }
     pub fn begin_text(
         &mut self,

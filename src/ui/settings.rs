@@ -139,7 +139,7 @@ impl SettingsPane {
         });
         let shortcut_panel = ui.collapsing("Keyboard shortcuts", |ui| {
             use crate::platform::windows::hotkeys::{ShortcutRecorder, chord_label};
-            ui.label("Capture and editor assignments are saved for later activation; their keys are not registered yet. Apply validates all assignments together. Conflicts keep the previous settings.");
+            ui.label("Editor shortcuts apply only in the editor. Unavailable global actions keep their saved assignments without registering keys. Apply validates all assignments together; conflicts keep the previous settings.");
             let bindings = self.shortcuts.get_or_insert_with(|| settings.shortcuts.effective());
             for binding in bindings.iter_mut() {
                 if let Some((_, status)) = statuses.iter().find(|(action, _)| *action == binding.action) { ui.label(format!("Current registration: {status:?}")); }
@@ -185,7 +185,7 @@ impl SettingsPane {
                         }
                         if ui.button("Reset").clicked() {
                             commands.push(AppCommand::ResetShortcuts { actions: Some(vec![binding.action]), revision: settings.revision });
-                            *binding = crate::app::shortcuts::ShortcutBinding::unassigned(binding.action);
+                            *binding = crate::app::shortcuts::ShortcutBinding::default_for(binding.action);
                         }
                         if ui.button("Clear").clicked() { binding.chord = None; binding.enabled = false; }
                     });

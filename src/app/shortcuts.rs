@@ -7,13 +7,14 @@
 //! `ShortcutRegistrar`, so the policy here is fully testable with a fake.
 //!
 //! Only a few approved global actions have a real handler today (Show
-//! History, Show settings, Upload file). Every other approved action from
+//! History, Show settings, Upload file). Other global actions from
 //! the spec's hotkey section is modeled and persisted — so a saved
 //! assignment survives restarts and is ready the moment its owning
 //! capture/recording/editor feature ships — but [`ShortcutAction::is_available_now`]
 //! is false for them, and this module never asks the registrar to claim
 //! their key: an unimplemented action must never silently take a combination
-//! away from the OS or another app while doing nothing.
+//! away from the OS or another app while doing nothing. Editor tools resolve
+//! locally through saved bindings and never use native global registration.
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -125,7 +126,8 @@ pub enum ShortcutAction {
     CloseAllPins,
     ScreenColorPicker,
     Ruler,
-    // Editor tool shortcuts (Task 6's overlay does not exist yet).
+    // Editor-local tool shortcuts.
+    ToolRegion,
     ToolRectangle,
     ToolEllipse,
     ToolLine,
@@ -163,6 +165,7 @@ impl ShortcutAction {
             CloseAllPins,
             ScreenColorPicker,
             Ruler,
+            ToolRegion,
             ToolRectangle,
             ToolEllipse,
             ToolLine,
@@ -180,10 +183,9 @@ impl ShortcutAction {
     pub fn scope(&self) -> ShortcutScope {
         use ShortcutAction::*;
         match self {
-            ToolRectangle | ToolEllipse | ToolLine | ToolArrow | ToolFreehand | ToolText
-            | ToolStep | ToolHighlight | ToolSpotlight | ToolAnnotationEraser | ToolSmartEraser => {
-                ShortcutScope::Editor
-            }
+            ToolRegion | ToolRectangle | ToolEllipse | ToolLine | ToolArrow | ToolFreehand
+            | ToolText | ToolStep | ToolHighlight | ToolSpotlight | ToolAnnotationEraser
+            | ToolSmartEraser => ShortcutScope::Editor,
             _ => ShortcutScope::Global,
         }
     }
@@ -191,10 +193,13 @@ impl ShortcutAction {
     /// Whether a real handler exists today. See the module docs: an
     /// unavailable action is never registered or dispatched, only persisted.
     pub fn is_available_now(&self) -> bool {
-        matches!(
-            self,
-            ShortcutAction::ShowHistory | ShortcutAction::ShowSettings | ShortcutAction::UploadFile
-        )
+        self.scope() == ShortcutScope::Editor
+            || matches!(
+                self,
+                ShortcutAction::ShowHistory
+                    | ShortcutAction::ShowSettings
+                    | ShortcutAction::UploadFile
+            )
     }
 
     pub fn label(&self) -> &'static str {
@@ -220,6 +225,7 @@ impl ShortcutAction {
             CloseAllPins => "Close all pins",
             ScreenColorPicker => "Screen color picker",
             Ruler => "Ruler",
+            ToolRegion => "Tool: Region selection",
             ToolRectangle => "Tool: Rectangle",
             ToolEllipse => "Tool: Ellipse",
             ToolLine => "Tool: Line",
@@ -252,6 +258,37 @@ pub struct ShortcutBinding {
 }
 
 impl ShortcutBinding {
+    pub fn default_for(action: ShortcutAction) -> Self {
+        use ShortcutAction::*;
+        let vk = match action {
+            ToolRegion => 0x09,
+            ToolRectangle => 0x52,
+            ToolEllipse => 0x45,
+            ToolLine => 0x4C,
+            ToolArrow => 0x41,
+            ToolFreehand => 0x46,
+            ToolText => 0x54,
+            ToolStep => 0x4E,
+            ToolHighlight => 0x48,
+            ToolSpotlight => 0x53,
+            ToolAnnotationEraser => 0x58,
+            ToolSmartEraser => 0x57,
+            _ => return Self::unassigned(action),
+        };
+        Self {
+            action,
+            scope: action.scope(),
+            chord: Some(KeyChord {
+                ctrl: false,
+                alt: false,
+                shift: false,
+                win: false,
+                key: KeyCode(vk),
+            }),
+            enabled: true,
+            destination: DestinationSelection::Inherit,
+        }
+    }
     pub fn unassigned(action: ShortcutAction) -> Self {
         ShortcutBinding {
             action,
@@ -263,14 +300,26 @@ impl ShortcutBinding {
     }
 }
 
-/// Validated, versioned settings for every known action. Missing actions
-/// (older settings file, or a newly added action) default to unassigned via
-/// [`ShortcutSettings::effective`], never to a silently-active binding.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Explicit saved assignments win over defaults, including disabled/cleared
+/// assignments. New settings contain the approved editor defaults. Missing
+/// pre-existing actions in an older persisted list remain unassigned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShortcutSettings {
     #[serde(default)]
     pub bindings: Vec<ShortcutBinding>,
+}
+
+impl Default for ShortcutSettings {
+    fn default() -> Self {
+        Self {
+            bindings: ShortcutAction::all()
+                .iter()
+                .copied()
+                .map(ShortcutBinding::default_for)
+                .collect(),
+        }
+    }
 }
 
 impl ShortcutSettings {
@@ -289,6 +338,20 @@ impl ShortcutSettings {
                     "shortcut scope does not match its action",
                 ));
             }
+            if binding.scope == ShortcutScope::Editor
+                && binding.enabled
+                && let Some(chord) = binding.chord
+                && (matches!(chord.key.vk(), 0x0D | 0x1B)
+                    || (chord.ctrl
+                        && !chord.alt
+                        && !chord.shift
+                        && !chord.win
+                        && matches!(chord.key.vk(), 0x5A | 0x59)))
+            {
+                return Err(AppError::InvalidInput(
+                    "editor shortcut conflicts with text commit, cancel or undo/redo",
+                ));
+            }
             if let Some(chord) = binding.chord
                 && binding.enabled
                 && !seen_chords.entry(binding.scope).or_default().insert(chord)
@@ -305,17 +368,42 @@ impl ShortcutSettings {
         self.bindings.iter().find(|b| b.action == action)
     }
 
-    /// One binding per known action, defaulting any action absent from the
-    /// persisted list to unassigned/disabled.
+    /// One binding per action. Only the newly introduced Region action migrates
+    /// to its default when absent. A pre-existing use of Tab keeps precedence;
+    /// Region is visibly unassigned in Settings instead of stealing that chord.
     pub fn effective(&self) -> Vec<ShortcutBinding> {
         ShortcutAction::all()
             .iter()
             .map(|&action| {
-                self.get(action)
-                    .cloned()
-                    .unwrap_or_else(|| ShortcutBinding::unassigned(action))
+                self.get(action).cloned().unwrap_or_else(|| {
+                    if action == ShortcutAction::ToolRegion {
+                        let default = ShortcutBinding::default_for(action);
+                        if !self.bindings.iter().any(|b| {
+                            b.enabled
+                                && b.scope == ShortcutScope::Editor
+                                && b.chord == default.chord
+                        }) {
+                            return default;
+                        }
+                    }
+                    ShortcutBinding::unassigned(action)
+                })
             })
             .collect()
+    }
+    pub fn editor_action_for(
+        &self,
+        chord: KeyChord,
+        focus: ShortcutFocus,
+        repeat: bool,
+    ) -> Option<ShortcutAction> {
+        if focus != ShortcutFocus::Normal || repeat {
+            return None;
+        }
+        self.effective()
+            .into_iter()
+            .find(|b| b.enabled && b.scope == ShortcutScope::Editor && b.chord == Some(chord))
+            .map(|b| b.action)
     }
 }
 
@@ -464,6 +552,7 @@ impl ShortcutManager {
             None => ShortcutStatus::Unassigned,
             Some(b) if b.chord.is_none() => ShortcutStatus::Unassigned,
             Some(b) if !b.enabled => ShortcutStatus::Disabled,
+            Some(b) if b.scope == ShortcutScope::Editor => ShortcutStatus::Active,
             Some(_) if self.live.contains_key(&action) => ShortcutStatus::Active,
             Some(_) => ShortcutStatus::Unavailable,
         }
@@ -557,17 +646,20 @@ impl ShortcutManager {
     }
 
     /// A candidate equal to the current bindings except the named actions
-    /// (or every action, if `None`) reset to unassigned/disabled. Feeds
+    /// (or every action, if `None`) restored to its defaults. Feeds
     /// straight into `apply`, so a reset is exactly as transactional as any
     /// other edit.
     pub fn reset_candidate(&self, actions: Option<&[ShortcutAction]>) -> Vec<ShortcutBinding> {
-        self.bindings
-            .iter()
-            .map(|b| match actions {
-                Some(subset) if !subset.contains(&b.action) => b.clone(),
-                _ => ShortcutBinding::unassigned(b.action),
-            })
-            .collect()
+        ShortcutSettings {
+            bindings: self.bindings.clone(),
+        }
+        .effective()
+        .into_iter()
+        .map(|b| match actions {
+            Some(subset) if !subset.contains(&b.action) => b,
+            _ => ShortcutBinding::default_for(b.action),
+        })
+        .collect()
     }
 }
 
@@ -922,6 +1014,57 @@ mod tests {
             ShortcutStatus::Unassigned
         );
         assert!(fake.taken.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn editor_defaults_reset_without_native_registrations() {
+        let (mut manager, fake) = manager_with(ShortcutSettings::default().effective());
+        assert!(fake.taken.lock().unwrap().is_empty());
+        let mut cleared = manager.bindings().to_vec();
+        *cleared
+            .iter_mut()
+            .find(|b| b.action == ShortcutAction::ToolRegion)
+            .unwrap() = ShortcutBinding::unassigned(ShortcutAction::ToolRegion);
+        manager.apply(cleared, save_ok).unwrap();
+        assert_eq!(
+            manager.status(ShortcutAction::ToolRegion),
+            ShortcutStatus::Unassigned
+        );
+        manager
+            .apply(
+                manager.reset_candidate(Some(&[ShortcutAction::ToolRegion])),
+                save_ok,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.status(ShortcutAction::ToolRegion),
+            ShortcutStatus::Active
+        );
+        assert_eq!(
+            manager
+                .bindings()
+                .iter()
+                .find(|b| b.action == ShortcutAction::ToolRegion)
+                .unwrap()
+                .chord,
+            Some(chord(false, false, 0x09))
+        );
+        assert!(fake.taken.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reserved_editor_keys_cannot_shadow_commit_cancel_or_history() {
+        for reserved in [
+            chord(false, false, 0x0D),
+            chord(false, false, 0x1B),
+            chord(true, false, 0x5A),
+            chord(true, false, 0x59),
+        ] {
+            let settings = ShortcutSettings {
+                bindings: vec![binding(ShortcutAction::ToolArrow, reserved, true)],
+            };
+            assert!(settings.validate().is_err());
+        }
     }
 
     #[test]
