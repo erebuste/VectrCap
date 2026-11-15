@@ -129,6 +129,15 @@ impl SelectionModel {
     pub fn crop(&self) -> Option<PhysicalRect> {
         self.crop
     }
+    /// Restore the editor's authoritative crop after history or a rejected edit.
+    pub fn synchronize_crop(&mut self, crop: Option<PhysicalRect>) -> Result<(), AppError> {
+        if let Some(crop) = crop {
+            self.validate_crop(crop)?;
+        }
+        self.crop = crop;
+        self.gesture = None;
+        Ok(())
+    }
     pub fn permitted_bounds(&self) -> PhysicalRect {
         self.permitted
     }

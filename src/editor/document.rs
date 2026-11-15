@@ -136,6 +136,41 @@ pub enum Annotation {
     },
 }
 impl Annotation {
+    /// Move an object without changing its identity, kind, or Step number.
+    pub fn translated(&self, dx: i32, dy: i32) -> Result<Self, AppError> {
+        let translate = |p: &mut PhysicalPoint| -> Result<(), AppError> {
+            p.x =
+                p.x.checked_add(dx)
+                    .ok_or(AppError::InvalidInput("annotation movement overflows"))?;
+            p.y =
+                p.y.checked_add(dy)
+                    .ok_or(AppError::InvalidInput("annotation movement overflows"))?;
+            Ok(())
+        };
+        let mut moved = self.clone();
+        match &mut moved {
+            Self::Rectangle { bounds, .. }
+            | Self::Ellipse { bounds, .. }
+            | Self::Highlight { bounds, .. }
+            | Self::Spotlight { bounds, .. }
+            | Self::Redaction { bounds, .. } => *bounds = bounds.translated(dx, dy)?,
+            Self::Line { start, end, .. } | Self::Arrow { start, end, .. } => {
+                translate(start)?;
+                translate(end)?;
+            }
+            Self::Step { center, .. } => translate(center)?,
+            Self::Text { position, .. } => translate(position)?,
+            Self::Freehand { points, .. } | Self::SmartEraseStroke { points, .. } => {
+                let mut moved_points = points.to_vec();
+                for point in &mut moved_points {
+                    translate(point)?;
+                }
+                *points = moved_points.into();
+            }
+        }
+        moved.validate()?;
+        Ok(moved)
+    }
     pub fn id(&self) -> Uuid {
         match self {
             Self::Ellipse { id, .. }
