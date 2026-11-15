@@ -875,15 +875,15 @@ fn controller_copy_pin_and_upload_use_real_finish_pixels_in_every_format() {
                 let pin = effects
                     .iter()
                     .find_map(|e| {
-                        if let AppEffect::PinImage(pin) = e {
+                        if let AppEffect::Pin(vectrcap::pin::PinEffect::UpdateViewport(pin)) = e {
                             Some(pin)
                         } else {
                             None
                         }
                     })
                     .unwrap();
-                assert!(Arc::ptr_eq(&pin.pixels, &pixels));
-                assert_eq!(pin.screen_location, Some(PhysicalPoint { x: 0, y: 0 }));
+                assert!(Arc::ptr_eq(pin.image.pixels(), &pixels));
+                assert_eq!(pin.state.position(), PhysicalPoint { x: 0, y: 0 });
             }
             let paths = archive_files(&fx);
             assert_eq!(paths.len(), 1);
@@ -909,6 +909,63 @@ fn controller_copy_pin_and_upload_use_real_finish_pixels_in_every_format() {
             }
         }
     }
+}
+
+#[test]
+fn typed_capture_pin_limit_retains_editor_then_retries_without_duplicate_archive() {
+    use vectrcap::{
+        app::{
+            events::{AppCommand, AppEffect},
+            image_finish::ArchiveDecision,
+        },
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    for _ in 0..16 {
+        let (session, surface) = fx.start(CaptureMode::Region);
+        let finish = confirm_surface(&surface, OverlayAction::Pin, Default::default());
+        assert_no_error(&fx.app.dispatch(AppCommand::FinishCapture {
+            session,
+            finish,
+            save_path: None,
+        }));
+    }
+    assert_eq!(archive_files(&fx).len(), 16);
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Pin, Default::default());
+    assert!(
+        fx.app
+            .dispatch(AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path: None
+            })
+            .iter()
+            .any(|e| matches!(e, AppEffect::Error(_)))
+    );
+    assert_eq!(fx.app.pins().snapshots().len(), 16);
+    assert_eq!(archive_files(&fx).len(), 16);
+    assert!(surface.lock().unwrap().pending_finish);
+    fx.app.dispatch(AppCommand::CloseAllPins);
+    assert_no_error(&fx.app.dispatch(AppCommand::RetryCaptureFinish {
+        session,
+        decision: ArchiveDecision::Retry,
+    }));
+    assert_eq!(fx.app.pins().snapshots().len(), 1);
+    assert_eq!(archive_files(&fx).len(), 17);
+    let effects = fx.app.dispatch(AppCommand::Quit);
+    assert!(fx.app.pins().snapshots().is_empty());
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AppEffect::Pin(vectrcap::pin::PinEffect::CloseViewport(_))
+            ))
+            .count(),
+        1
+    );
 }
 #[test]
 fn controller_archive_failure_then_explicit_continue_retains_editor() {

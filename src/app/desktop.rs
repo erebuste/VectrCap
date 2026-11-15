@@ -29,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 pub struct DesktopView {
     pub capture_acquiring: Option<uuid::Uuid>,
     pub capture_surface: Option<Arc<Mutex<super::controller::CaptureSurface>>>,
-    pub pins: Vec<super::controller::PinImage>,
+    pub pins: Vec<crate::pin::PinSnapshot>,
+    pub pin_source_chooser: bool,
+    pub pin_picker_requests: u64,
     pub settings: Option<Settings>,
     pub window: Option<Window>,
     pub focus_revision: u64,
@@ -69,6 +71,8 @@ impl Default for DesktopView {
             capture_acquiring: None,
             capture_surface: None,
             pins: vec![],
+            pin_source_chooser: false,
+            pin_picker_requests: 0,
             settings: None,
             window: None,
             focus_revision: 0,
@@ -210,6 +214,7 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    pin_loads: tokio::task::JoinSet<(uuid::Uuid, Result<crate::pin::source::LoadedPin, AppError>)>,
     captures: tokio::task::JoinSet<(
         uuid::Uuid,
         Result<crate::capture::request::CaptureSnapshot, AppError>,
@@ -275,8 +280,45 @@ impl Effects {
                     self.state.capture_acquiring = None;
                     self.state.capture_surface = surface;
                 }
-                AppEffect::PinImage(pin) => self.state.pins.push(pin),
-                AppEffect::ClosePin(id) => self.state.pins.retain(|pin| pin.id != id),
+                AppEffect::Pin(effect) => match effect {
+                    crate::pin::PinEffect::UpdateViewport(pin) => {
+                        if let Some(old) = self.state.pins.iter_mut().find(|p| p.id == pin.id) {
+                            *old = pin;
+                        } else {
+                            self.state.pins.push(pin);
+                        }
+                    }
+                    crate::pin::PinEffect::CloseViewport(id) => {
+                        self.state.pins.retain(|pin| pin.id != id)
+                    }
+                    crate::pin::PinEffect::CopyImage(_) => {
+                        return Err(AppError::Persistence("unhandled pin clipboard effect"));
+                    }
+                },
+                AppEffect::PinSourceChooser(visible) => self.state.pin_source_chooser = visible,
+                AppEffect::PickPinFile => self.state.pin_picker_requests += 1,
+                AppEffect::LoadPin {
+                    request,
+                    source,
+                    clipboard,
+                } => {
+                    let busy = !self.pin_loads.is_empty();
+                    self.pin_loads.spawn(async move {
+                        let result = if busy {
+                            Err(AppError::InUse("pin loader is still stopping; try again"))
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    source.load(clipboard.as_ref())
+                                }))
+                                .unwrap_or(Err(AppError::Capture("pin source worker failed")))
+                            })
+                            .await
+                            .unwrap_or(Err(AppError::Capture("pin source worker failed")))
+                        };
+                        (request, result)
+                    });
+                }
                 AppEffect::ShortcutRecorded { request, chord } => {
                     self.state.recorded_shortcut = Some((request, chord))
                 }
@@ -493,6 +535,7 @@ async fn serve(
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
     let mut effects = Effects {
+        pin_loads: tokio::task::JoinSet::new(),
         captures: tokio::task::JoinSet::new(),
         capture_cancel: None,
         local_actions: tokio::task::JoinSet::new(),
@@ -520,6 +563,12 @@ async fn serve(
     let mut driver_consumed = false;
     let outcome = loop {
         let results = tokio::select! {
+            result = effects.pin_loads.join_next(), if !effects.pin_loads.is_empty() => {
+                match result {
+                    Some(Ok((request, result))) => controller.on_event(AppEvent::PinLoaded { request, result }),
+                    _ => vec![AppEffect::Error(AppError::Capture("pin source worker failed"))],
+                }
+            }
             result = effects.captures.join_next(), if !effects.captures.is_empty() => {
                 match result {
                     Some(Ok((session, result))) => controller.on_event(AppEvent::CaptureAcquired { session, result }),
@@ -607,6 +656,7 @@ async fn serve(
         cancel.cancel();
     }
     while effects.captures.join_next().await.is_some() {}
+    while effects.pin_loads.join_next().await.is_some() {}
     while effects.local_actions.join_next().await.is_some() {}
     // A file already accepted into a batch durably becomes a job the moment
     // `on_event` runs, even though nothing reads the published view anymore;

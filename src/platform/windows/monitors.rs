@@ -153,6 +153,60 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorGeometry>, AppError> {
     validate_layout(&state.monitors)?;
     Ok(state.monitors)
 }
+/// Pin placement uses work areas, excluding taskbars and reserved app bars.
+#[allow(unsafe_code)]
+pub fn enumerate_work_areas() -> Result<Vec<PhysicalRect>, AppError> {
+    let _dpi = DpiContext::enter()?;
+    struct Areas {
+        rects: Vec<PhysicalRect>,
+        error: Option<AppError>,
+    }
+    unsafe extern "system" fn collect(handle: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> i32 {
+        let state = unsafe { &mut *(data as *mut Areas) };
+        let result = (|| {
+            if state.rects.len() >= 64 {
+                return Err(AppError::Capture("too many pin work areas"));
+            }
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(handle, &mut info) } == 0 {
+                return Err(AppError::Capture("pin monitor work area is unavailable"));
+            }
+            rect_from_win32(info.rcWork)
+        })();
+        match result {
+            Ok(rect) => {
+                state.rects.push(rect);
+                1
+            }
+            Err(error) => {
+                state.error = Some(error);
+                0
+            }
+        }
+    }
+    let mut state = Areas {
+        rects: vec![],
+        error: None,
+    };
+    if unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &mut state as *mut _ as LPARAM,
+        )
+    } == 0
+        || state.rects.is_empty()
+    {
+        return Err(state
+            .error
+            .unwrap_or(AppError::Capture("pin monitor enumeration failed")));
+    }
+    Ok(state.rects)
+}
 pub fn system_drag_threshold() -> Result<(u32, u32), AppError> {
     system_drag_threshold_at(super::windows::physical_pointer()?)
 }

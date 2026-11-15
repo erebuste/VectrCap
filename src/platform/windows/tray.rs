@@ -41,6 +41,10 @@ impl Tray {
                 return;
             }
             let command = match event.id.as_ref() {
+                "pin" => Some(AppCommand::PinSource(
+                    crate::pin::source::PinSource::Chooser,
+                )),
+                "close-pins" => Some(AppCommand::CloseAllPins),
                 "cancel-capture" => Some(AppCommand::CancelActiveCapture),
                 "capture-region" | "capture-window" | "capture-fullscreen" | "capture-last" => {
                     use crate::capture::request::CaptureMode;
@@ -130,6 +134,15 @@ impl Tray {
             .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("upload-file", "Upload file", true, None))
                 .map_err(|_| error())?;
+            menu.append(&MenuItem::with_id("pin", "Pin to screen…", true, None))
+                .map_err(|_| error())?;
+            menu.append(&MenuItem::with_id(
+                "close-pins",
+                "Close all pins",
+                true,
+                None,
+            ))
+            .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("uploads", "Uploads", true, None))
                 .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("settings", "Settings", true, None))

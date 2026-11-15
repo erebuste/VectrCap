@@ -278,6 +278,74 @@ pub fn spawn_pick_and_upload(client: DesktopClient, gate: PickerGate) {
     spawn_pick_with(client, gate, pick_existing_files);
 }
 
+/// Single-image picker shares the app's native-dialog gate with Upload file.
+pub fn spawn_pick_pin_file(client: DesktopClient, gate: PickerGate) {
+    if client.snapshot().lifecycle != Lifecycle::Running {
+        return;
+    }
+    let Some(guard) = gate.try_acquire() else {
+        client.report_error(AppError::InUse("a file picker is already open"));
+        return;
+    };
+    let report = client.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("vectrcap-pin-picker".into())
+        .spawn(move || {
+            let _guard = guard;
+            let result = pick_pin_file();
+            if client.snapshot().lifecycle != Lifecycle::Running {
+                return;
+            }
+            match result {
+                Ok(Some(path)) => {
+                    if let Err(error) = client.submit(AppCommand::LoadPinFile(path)) {
+                        client.report_error(error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => client.report_error(error),
+            }
+        })
+    {
+        report.report_error(AppError::io("starting pin file picker", &error));
+    }
+}
+fn pick_pin_file() -> Result<Option<PathBuf>, AppError> {
+    use windows::{Win32::UI::Shell::Common::COMDLG_FILTERSPEC, core::w};
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|_| error())?;
+        let _com = Com;
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER).map_err(|_| error())?;
+        dialog
+            .SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)
+            .map_err(|_| error())?;
+        dialog
+            .SetTitle(w!("Pin image (GIF: first frame)"))
+            .map_err(|_| error())?;
+        dialog
+            .SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("Raster images (GIF: first frame)"),
+                pszSpec: w!("*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp"),
+            }])
+            .map_err(|_| error())?;
+        match dialog.Show(None) {
+            Ok(()) => {}
+            Err(e) if e.code().0 == ERROR_CANCELLED => return Ok(None),
+            Err(_) => return Err(error()),
+        }
+        let item = dialog.GetResult().map_err(|_| error())?;
+        let name = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|_| error())?;
+        let text = name.to_string().map_err(|_| error());
+        CoTaskMemFree(Some(name.0.cast()));
+        Ok(Some(PathBuf::from(text?)))
+    }
+}
+
 /// `spawn_pick_and_upload`'s real logic, parameterized over the picker call
 /// itself so lifecycle/gating/bounding can be exercised deterministically in
 /// tests without a real native dialog.

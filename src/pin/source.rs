@@ -13,6 +13,51 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PinSource {
+    Chooser,
+    Screen,
+    Clipboard,
+    File,
+}
+pub fn is_raster_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| {
+            ["png", "jpg", "jpeg", "gif", "bmp", "webp"]
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+pub enum PinLoad {
+    Clipboard,
+    File(std::path::PathBuf),
+    History(Artifact),
+}
+pub struct LoadedPin {
+    pub image: PinnedImage,
+    pub work_areas: Vec<PhysicalRect>,
+    pub pointer: crate::capture::geometry::PhysicalPoint,
+}
+impl PinLoad {
+    pub fn load(
+        self,
+        clipboard: &dyn crate::platform::windows::clipboard::ClipboardWriter,
+    ) -> Result<LoadedPin, AppError> {
+        let image = match self {
+            Self::Clipboard => clipboard.read_image()?,
+            Self::File(path) => load_pin_file(&path)?,
+            Self::History(artifact) => load_pin_history(&artifact)?,
+        };
+        Ok(LoadedPin {
+            image,
+            work_areas: crate::platform::windows::monitors::enumerate_work_areas()?,
+            pointer: crate::platform::windows::windows::physical_pointer()?,
+        })
+    }
+}
+
 pub fn load_pin_file(path: &Path) -> Result<PinnedImage, AppError> {
     let file = open_local_file(path)?;
     let size = file

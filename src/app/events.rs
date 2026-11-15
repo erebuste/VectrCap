@@ -34,6 +34,7 @@ pub enum Lifecycle {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HistoryAction {
+    Pin,
     OpenLocal,
     ShowFolder,
     OpenLink,
@@ -62,7 +63,14 @@ pub enum AppCommand {
     CancelCapture(Uuid),
     CancelActiveCapture,
     ResumeCapture(Uuid),
-    ClosePin(Uuid),
+    PinSource(crate::pin::source::PinSource),
+    DismissPinSourceChooser,
+    LoadPinFile(PathBuf),
+    Pin {
+        id: crate::pin::PinId,
+        input: crate::pin::PinInput,
+    },
+    CloseAllPins,
     SetHistoryPreferences(crate::persistence::settings::HistoryPreferences),
     HistoryAction {
         ids: Vec<Uuid>,
@@ -186,6 +194,10 @@ impl From<QueueAction> for QueueCommand {
     }
 }
 pub enum AppEvent {
+    PinLoaded {
+        request: Uuid,
+        result: Result<crate::pin::source::LoadedPin, AppError>,
+    },
     CaptureAcquired {
         session: Uuid,
         result: Result<crate::capture::request::CaptureSnapshot, AppError>,
@@ -214,8 +226,14 @@ pub enum AppEffect {
     },
     CancelCaptureAcquisition,
     CaptureSurface(Option<std::sync::Arc<std::sync::Mutex<super::controller::CaptureSurface>>>),
-    PinImage(super::controller::PinImage),
-    ClosePin(Uuid),
+    Pin(crate::pin::PinEffect),
+    LoadPin {
+        request: Uuid,
+        source: crate::pin::source::PinLoad,
+        clipboard: std::sync::Arc<dyn crate::platform::windows::clipboard::ClipboardWriter>,
+    },
+    PinSourceChooser(bool),
+    PickPinFile,
     ShortcutRecorded {
         request: Uuid,
         chord: super::shortcuts::KeyChord,

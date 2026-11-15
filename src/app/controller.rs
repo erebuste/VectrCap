@@ -26,7 +26,7 @@ use crate::{
         windows::{clipboard::ClipboardWriter, shell_actions::ShellActions},
     },
 };
-pub use capture::{CaptureSurface, PinImage};
+pub use capture::CaptureSurface;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -157,7 +157,8 @@ struct FileBatch {
 }
 pub struct AppController {
     capture: Option<capture::CaptureWorkflow>,
-    pins: HashSet<Uuid>,
+    pins: crate::pin::PinManager,
+    pin_load: Option<Uuid>,
     batch_jobs: Vec<super::types::JobId>,
     history_query: crate::persistence::history::browser::HistoryQuery,
     manager: DestinationManager,
@@ -208,7 +209,8 @@ impl AppController {
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
             capture: None,
-            pins: HashSet::new(),
+            pins: crate::pin::PinManager::default(),
+            pin_load: None,
             manager,
             history,
             store,
@@ -239,6 +241,42 @@ impl AppController {
     }
     pub fn shortcuts(&self) -> Option<&ShortcutManager> {
         self.shortcuts.as_ref()
+    }
+    pub fn pins(&self) -> &crate::pin::PinManager {
+        &self.pins
+    }
+    fn load_pin(
+        &mut self,
+        source: crate::pin::source::PinLoad,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        if self.pin_load.is_some() {
+            return Err(AppError::InUse("a pin image is still loading"));
+        }
+        if self.pins.snapshots().len() >= crate::pin::manager::MAX_PINS {
+            return Err(AppError::InUse(
+                "at most 16 pin windows may be open; close a pin first",
+            ));
+        }
+        let request = Uuid::new_v4();
+        self.pin_load = Some(request);
+        Ok(vec![
+            AppEffect::PinSourceChooser(false),
+            AppEffect::LoadPin {
+                request,
+                source,
+                clipboard: self.clipboard.clone(),
+            },
+        ])
+    }
+    fn pin_effects(&self, effects: Vec<crate::pin::PinEffect>) -> Result<Vec<AppEffect>, AppError> {
+        let mut output = vec![];
+        for effect in effects {
+            match effect {
+                crate::pin::PinEffect::CopyImage(pixels) => self.clipboard.write_image(&pixels)?,
+                effect => output.push(AppEffect::Pin(effect)),
+            }
+        }
+        Ok(output)
     }
     pub fn history_page(
         &self,
@@ -726,6 +764,19 @@ impl AppController {
             })
             .collect::<Result<Vec<_>, _>>()?;
         match action {
+            HistoryAction::Pin => {
+                if rows.len() != 1 {
+                    return Err(AppError::InvalidInput("select one image to pin"));
+                }
+                if !crate::pin::source::is_raster_name(&rows[0].name) {
+                    return Err(AppError::InvalidInput(
+                        "only still raster images can be pinned",
+                    ));
+                }
+                return self.load_pin(crate::pin::source::PinLoad::History(
+                    rows[0].artifact.clone(),
+                ));
+            }
             HistoryAction::Remove => self.history.remove_history(&ids)?,
             HistoryAction::RetryFailed => {
                 let jobs = self.history.retry_history_jobs(&ids)?;
@@ -817,10 +868,43 @@ impl AppController {
                 }
             }
             AppCommand::ResumeCapture(session) => self.resume_capture(session)?,
-            AppCommand::ClosePin(id) => {
-                self.pins.remove(&id);
-                vec![AppEffect::ClosePin(id)]
+            AppCommand::Pin { id, input } => {
+                let effects = self.pins.handle(id, input)?;
+                self.pin_effects(effects)?
             }
+            AppCommand::CloseAllPins => {
+                self.pin_load = None;
+                self.pins
+                    .close_all()
+                    .into_iter()
+                    .map(AppEffect::Pin)
+                    .collect()
+            }
+            AppCommand::LoadPinFile(path) => {
+                self.load_pin(crate::pin::source::PinLoad::File(path))?
+            }
+            AppCommand::PinSource(source) => {
+                use crate::pin::source::{PinLoad, PinSource};
+                match source {
+                    PinSource::Chooser => vec![AppEffect::PinSourceChooser(true)],
+                    PinSource::Clipboard => self.load_pin(PinLoad::Clipboard)?,
+                    PinSource::File => {
+                        vec![AppEffect::PinSourceChooser(false), AppEffect::PickPinFile]
+                    }
+                    PinSource::Screen => {
+                        let mut effects = self.start_capture(
+                            crate::capture::request::CaptureMode::Region,
+                            DestinationSelection::Inherit,
+                        )?;
+                        if let Some(capture) = &mut self.capture {
+                            capture.intended_pin = true;
+                        }
+                        effects.push(AppEffect::PinSourceChooser(false));
+                        effects
+                    }
+                }
+            }
+            AppCommand::DismissPinSourceChooser => vec![AppEffect::PinSourceChooser(false)],
             AppCommand::SetHistoryPreferences(preferences) => {
                 self.manager.set_history_preferences(preferences)?;
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
@@ -1110,6 +1194,8 @@ impl AppController {
                     vec![]
                 };
                 self.shortcuts = None;
+                self.pin_load = None;
+                capture_effects.extend(self.pins.close_all().into_iter().map(AppEffect::Pin));
                 self.lifecycle = Lifecycle::Draining;
                 // Workflows are deliberately NOT cleared here: a batch file
                 // already accepted (its destination reserved in `workflows`)
@@ -1126,6 +1212,23 @@ impl AppController {
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::PinLoaded { request, result } => {
+                if self.pin_load != Some(request) || self.lifecycle != Lifecycle::Running {
+                    return vec![];
+                }
+                self.pin_load = None;
+                let result = result.and_then(|loaded| {
+                    let mut effects = self
+                        .pins
+                        .update_work_areas(loaded.work_areas, loaded.pointer)?;
+                    let id = self.pins.open(loaded.image, None)?;
+                    effects.push(crate::pin::PinEffect::UpdateViewport(
+                        self.pins.get(id).expect("just opened pin").clone(),
+                    ));
+                    Ok(effects.into_iter().map(AppEffect::Pin).collect())
+                });
+                result.unwrap_or_else(|error| vec![AppEffect::Error(error)])
+            }
             AppEvent::CaptureAcquired { session, result } => self.capture_acquired(session, result),
             AppEvent::WorkerStopped(result) => {
                 self.lifecycle = Lifecycle::Exited;

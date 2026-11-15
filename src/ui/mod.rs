@@ -5,6 +5,7 @@ pub mod destinations;
 pub mod image_export;
 pub mod image_review;
 pub mod magnifier;
+pub mod pin_sources;
 pub mod region_settings;
 pub mod settings;
 pub mod shell;

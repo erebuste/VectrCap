@@ -16,7 +16,7 @@ use std::{
 
 #[derive(Default)]
 pub struct CaptureHost {
-    pin_views: HashMap<uuid::Uuid, Arc<Mutex<super::image_review::ImageViewport>>>,
+    pin_views: HashMap<crate::pin::PinId, Arc<Mutex<super::image_review::ImageViewport>>>,
     capture_builder: Option<(uuid::Uuid, egui::ViewportBuilder)>,
 }
 impl CaptureHost {
@@ -63,6 +63,7 @@ impl CaptureHost {
                             return;
                         }
                         let mut command = None;
+                        if state.intended_pin { ui.label("Pin from screen: select and annotate, then choose Pin. Copy, Save and Upload remain available."); }
                         let mut choose_folder = false;
                         if state.pending_finish && !state.working {
                             egui::Window::new("Finish recovery").show(ui.ctx(), |ui| {
@@ -167,11 +168,14 @@ impl CaptureHost {
                             return;
                         }
                         if ui.ctx().input(|i| i.viewport().close_requested()) {
-                            if let Err(error) = client.submit(AppCommand::ClosePin(pin.id)) {
+                            if let Err(error) = client.submit(AppCommand::Pin {
+                                id: pin.id,
+                                input: crate::pin::PinInput::Close,
+                            }) {
                                 client.report_error(error);
                             }
                         } else if let Ok(mut viewport) = viewport.lock()
-                            && let Err(error) = viewport.show(ui, &pin.pixels)
+                            && let Err(error) = viewport.show(ui, pin.image.pixels())
                         {
                             client.report_error(error);
                         }

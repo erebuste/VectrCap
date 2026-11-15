@@ -10,6 +10,11 @@ use windows_sys::Win32::{
 };
 
 pub trait ClipboardWriter: Send + Sync {
+    fn read_image(&self) -> Result<crate::pin::PinnedImage, AppError> {
+        Err(AppError::InvalidInput(
+            "clipboard does not contain a supported image",
+        ))
+    }
     fn write_text(&self, text: &str) -> Result<(), AppError>;
     fn write_image(&self, _pixels: &image::RgbaImage) -> Result<(), AppError> {
         Err(AppError::Persistence("image clipboard is unavailable"))
@@ -53,6 +58,49 @@ impl Drop for Allocation {
     }
 }
 impl ClipboardWriter for WindowsClipboard {
+    #[allow(unsafe_code)]
+    fn read_image(&self) -> Result<crate::pin::PinnedImage, AppError> {
+        use windows_sys::Win32::System::{DataExchange::GetClipboardData, Memory::GlobalSize};
+        // Keep the clipboard open and global memory locked through validation
+        // and decode. Another app cannot replace the data between the two.
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return Err(error());
+            }
+            let _clipboard = OpenGuard;
+            let mut handle = GetClipboardData(17);
+            if handle.is_null() {
+                handle = GetClipboardData(8);
+            }
+            if handle.is_null() {
+                return Err(AppError::InvalidInput(
+                    "clipboard does not contain an image; text and URLs cannot be pinned",
+                ));
+            }
+            let size = GlobalSize(handle);
+            if !(40..=256_000_000 + 1024 * 1024).contains(&size) {
+                return Err(AppError::InvalidInput(
+                    "clipboard image exceeds the decoded-image budget",
+                ));
+            }
+            let pointer = GlobalLock(handle);
+            if pointer.is_null() {
+                return Err(error());
+            }
+            struct Locked(HANDLE);
+            impl Drop for Locked {
+                fn drop(&mut self) {
+                    unsafe {
+                        GlobalUnlock(self.0);
+                    }
+                }
+            }
+            let _locked = Locked(handle);
+            let header = std::slice::from_raw_parts(pointer.cast::<u8>(), size.min(124));
+            let layout = crate::pin::source::DibLayout::parse(header, size)?;
+            layout.decode(std::slice::from_raw_parts(pointer.cast::<u8>(), size))
+        }
+    }
     #[allow(unsafe_code)]
     fn write_text(&self, text: &str) -> Result<(), AppError> {
         if text.contains('\0') {

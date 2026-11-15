@@ -222,3 +222,182 @@ fn pin_windows_excluded_from_hover_and_capture() {
         matches!(m.restore_after_capture().as_slice(), [PinEffect::UpdateViewport(pin)] if pin.visible)
     );
 }
+
+struct NoCredentials;
+impl vectrcap::platform::CredentialStore for NoCredentials {
+    fn read(
+        &self,
+        _: &vectrcap::app::destinations::CredentialKey,
+    ) -> Result<vectrcap::vectr::client::UploadToken, vectrcap::app::error::AppError> {
+        panic!("pins never read credentials")
+    }
+    fn write(
+        &self,
+        _: &vectrcap::app::destinations::CredentialKey,
+        _: &vectrcap::vectr::client::UploadToken,
+    ) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("pins never write credentials")
+    }
+    fn delete(
+        &self,
+        _: &vectrcap::app::destinations::CredentialKey,
+    ) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("pins never delete credentials")
+    }
+}
+struct NoShell;
+impl vectrcap::platform::windows::shell_actions::ShellActions for NoShell {
+    fn open_path(&self, _: &std::path::Path) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("unexpected shell action")
+    }
+    fn reveal_path(&self, _: &std::path::Path) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("unexpected shell action")
+    }
+    fn open_url(&self, _: &str) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("pins never open URLs")
+    }
+}
+#[derive(Default)]
+struct Clipboard(std::sync::Mutex<Vec<image::RgbaImage>>);
+impl vectrcap::platform::windows::clipboard::ClipboardWriter for Clipboard {
+    fn write_text(&self, _: &str) -> Result<(), vectrcap::app::error::AppError> {
+        panic!("image pins never copy text")
+    }
+    fn write_image(&self, image: &image::RgbaImage) -> Result<(), vectrcap::app::error::AppError> {
+        self.0.lock().unwrap().push(image.clone());
+        Ok(())
+    }
+}
+fn controller(
+    clipboard: Arc<Clipboard>,
+) -> (tempfile::TempDir, vectrcap::app::controller::AppController) {
+    use vectrcap::{
+        app::{controller::AppController, destination_manager::FileDestinationRepository},
+        persistence::{artifacts::ArtifactStore, history::History},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let app = AppController::open(
+        Box::new(FileDestinationRepository::open(&dir.path().join("settings.json")).unwrap()),
+        Arc::new(History::open(&dir.path().join("history.db")).unwrap()),
+        Arc::new(NoCredentials),
+        Arc::new(ArtifactStore::new(dir.path().join("spool")).unwrap()),
+        Arc::new(NoShell),
+        clipboard,
+    )
+    .unwrap();
+    (dir, app)
+}
+#[test]
+fn controller_pin_lifecycle_is_typed_bounded_and_rejects_stale_loads() {
+    use vectrcap::{
+        app::events::{AppCommand, AppEffect, AppEvent},
+        pin::{
+            PinInput,
+            source::{LoadedPin, PinSource},
+        },
+    };
+    let clipboard = Arc::new(Clipboard::default());
+    let (_dir, mut app) = controller(clipboard.clone());
+    let image = PinnedImage::new(
+        Arc::new(RgbaImage::from_pixel(20, 10, Rgba([1, 2, 3, 40]))),
+        None,
+    )
+    .unwrap();
+    for _ in 0..16 {
+        let effects = app.dispatch(AppCommand::PinSource(PinSource::Clipboard));
+        let request = effects
+            .iter()
+            .find_map(|e| {
+                if let AppEffect::LoadPin { request, .. } = e {
+                    Some(*request)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            app.dispatch(AppCommand::PinSource(PinSource::Clipboard))
+                .iter()
+                .any(|e| matches!(e, AppEffect::Error(_)))
+        );
+        let effects = app.on_event(AppEvent::PinLoaded {
+            request,
+            result: Ok(LoadedPin {
+                image: image.clone(),
+                work_areas: vec![PhysicalRect::new(-100, -100, 1000, 800).unwrap()],
+                pointer: PhysicalPoint { x: 0, y: 0 },
+            }),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, AppEffect::Pin(PinEffect::UpdateViewport(_))))
+        );
+    }
+    let pins = app.pins().snapshots();
+    let id = pins[0].id;
+    let effects = app.dispatch(AppCommand::Pin {
+        id,
+        input: PinInput::Copy,
+    });
+    assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert_eq!(
+        clipboard.0.lock().unwrap().as_slice(),
+        &[image.pixels().as_ref().clone()]
+    );
+    let effects = app.dispatch(AppCommand::PinSource(PinSource::Clipboard));
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    assert_eq!(app.pins().snapshots().len(), 16);
+    assert_eq!(
+        app.dispatch(AppCommand::CloseAllPins)
+            .iter()
+            .filter(|e| matches!(e, AppEffect::Pin(PinEffect::CloseViewport(_))))
+            .count(),
+        16
+    );
+    let request = app
+        .dispatch(AppCommand::PinSource(PinSource::Clipboard))
+        .iter()
+        .find_map(|e| {
+            if let AppEffect::LoadPin { request, .. } = e {
+                Some(*request)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    app.dispatch(AppCommand::CloseAllPins);
+    assert!(
+        app.on_event(AppEvent::PinLoaded {
+            request,
+            result: Ok(LoadedPin {
+                image,
+                work_areas: vec![PhysicalRect::new(0, 0, 1000, 800).unwrap()],
+                pointer: PhysicalPoint { x: 0, y: 0 }
+            })
+        })
+        .is_empty()
+    );
+    assert!(app.pins().snapshots().is_empty());
+}
+#[test]
+fn clipboard_dib_roundtrip_retains_alpha_and_orientation() {
+    let pixels = RgbaImage::from_fn(3, 2, |x, y| Rgba([x as u8 * 30, y as u8 * 90, 20, 40]));
+    let bytes = vectrcap::platform::windows::clipboard::dibv5_bytes(&pixels).unwrap();
+    assert_eq!(load_pin_dib(&bytes).unwrap().pixels().as_ref(), &pixels);
+}
+
+#[test]
+fn pin_shortcuts_are_available_without_reserved_defaults() {
+    use vectrcap::app::shortcuts::{ShortcutAction, ShortcutBinding};
+    for action in [
+        ShortcutAction::PinSourceChooser,
+        ShortcutAction::PinFromScreen,
+        ShortcutAction::PinFromClipboard,
+        ShortcutAction::PinFromFile,
+        ShortcutAction::CloseAllPins,
+    ] {
+        assert!(action.is_available_now());
+        assert!(ShortcutBinding::default_for(action).chord.is_none());
+    }
+}

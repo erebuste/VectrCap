@@ -203,6 +203,11 @@ impl ShortcutAction {
                     | ShortcutAction::WindowScreenshot
                     | ShortcutAction::FullscreenScreenshot
                     | ShortcutAction::CaptureLastRegion
+                    | ShortcutAction::PinSourceChooser
+                    | ShortcutAction::PinFromScreen
+                    | ShortcutAction::PinFromClipboard
+                    | ShortcutAction::PinFromFile
+                    | ShortcutAction::CloseAllPins
             )
     }
 
@@ -469,6 +474,20 @@ pub enum ShortcutOutcome {
 fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
     use crate::app::events::{AppCommand, Window};
     match action {
+        ShortcutAction::PinSourceChooser
+        | ShortcutAction::PinFromScreen
+        | ShortcutAction::PinFromClipboard
+        | ShortcutAction::PinFromFile => {
+            use crate::pin::source::PinSource;
+            let source = match action {
+                ShortcutAction::PinFromScreen => PinSource::Screen,
+                ShortcutAction::PinFromClipboard => PinSource::Clipboard,
+                ShortcutAction::PinFromFile => PinSource::File,
+                _ => PinSource::Chooser,
+            };
+            Some(ShortcutOutcome::Command(AppCommand::PinSource(source)))
+        }
+        ShortcutAction::CloseAllPins => Some(ShortcutOutcome::Command(AppCommand::CloseAllPins)),
         ShortcutAction::RegionScreenshot
         | ShortcutAction::WindowScreenshot
         | ShortcutAction::FullscreenScreenshot

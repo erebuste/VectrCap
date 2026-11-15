@@ -16,6 +16,7 @@ use std::path::PathBuf;
 /// UI state shared with exactly one deferred viewport. The controller validates
 /// against this same document; snapshots never duplicate frozen image buffers.
 pub struct CaptureSurface {
+    pub intended_pin: bool,
     pub session: Uuid,
     pub overlay: CaptureOverlay,
     pub archive_failed: bool,
@@ -24,13 +25,8 @@ pub struct CaptureSurface {
     pub dialog_open: bool,
     pub working: bool,
 }
-#[derive(Clone)]
-pub struct PinImage {
-    pub id: Uuid,
-    pub pixels: Arc<image::RgbaImage>,
-    pub screen_location: Option<crate::capture::geometry::PhysicalPoint>,
-}
 pub(super) struct CaptureWorkflow {
+    pub(super) intended_pin: bool,
     pub(super) id: Uuid,
     pub(super) surface: Option<Arc<Mutex<CaptureSurface>>>,
     mode: CaptureMode,
@@ -52,6 +48,7 @@ impl AppController {
         let request = self.settings().capture_request(mode)?;
         let id = Uuid::new_v4();
         self.capture = Some(CaptureWorkflow {
+            intended_pin: false,
             id,
             surface: None,
             mode,
@@ -107,6 +104,7 @@ impl AppController {
                     });
             let overlay = CaptureOverlay::from_snapshot(snapshot, pointer, (4, 4))?;
             Ok(Arc::new(Mutex::new(CaptureSurface {
+                intended_pin: capture.intended_pin,
                 session,
                 overlay,
                 archive_failed: false,
@@ -281,9 +279,14 @@ impl AppController {
             LastRegion::new(crop, &capture.monitors)?;
         }
         let action = pending.finish().action;
-        if action == OverlayAction::Pin && self.pins.len() >= 32 {
-            return Err(AppError::InUse("close a pin before creating another"));
-        }
+        let pin_image = if action == OverlayAction::Pin {
+            let image =
+                crate::pin::PinnedImage::new(pending.finish().prepared.pixels().clone(), None)?;
+            self.pins.check_capacity(&image)?;
+            Some(image)
+        } else {
+            None
+        };
         if action == OverlayAction::Upload && !self.workflows.contains_key(&capture.id) {
             let snapshot = resolve_destination(
                 capture.selection,
@@ -327,12 +330,27 @@ impl AppController {
                 .clipboard
                 .write_image(pending.finish().prepared.pixels())?,
             OverlayAction::Pin => {
-                self.pins.insert(capture.id);
-                effects.push(AppEffect::PinImage(PinImage {
-                    id: capture.id,
-                    pixels: pending.finish().prepared.pixels().clone(),
-                    screen_location: pending.finish().screen_location,
-                }));
+                // Capture snapshots carry verified monitor geometry. Native source
+                // entry points supply actual work areas; capture-origin placement
+                // remains the selected physical location whenever reachable.
+                if self.pins.snapshots().is_empty() {
+                    self.pins.update_work_areas(
+                        capture.monitors.iter().map(|m| m.bounds()).collect(),
+                        pending.finish().screen_location.unwrap_or(
+                            crate::capture::geometry::PhysicalPoint {
+                                x: crop.left(),
+                                y: crop.top(),
+                            },
+                        ),
+                    )?;
+                }
+                let id = self.pins.open(
+                    pin_image.expect("pin image validated before persistence"),
+                    pending.finish().screen_location,
+                )?;
+                effects.push(AppEffect::Pin(crate::pin::PinEffect::UpdateViewport(
+                    self.pins.get(id).expect("just opened pin").clone(),
+                )));
             }
             OverlayAction::Save => {}
             _ => return Err(AppError::InvalidInput("choose an image finish action")),

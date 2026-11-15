@@ -568,6 +568,11 @@ fn item_actions(
         .is_some_and(|j| matches!(j.status, JobStatus::Completed(_)));
     let offered = [
         (
+            "Pin",
+            HistoryAction::Pin,
+            r.local_available && crate::pin::source::is_raster_name(&r.name),
+        ),
+        (
             "Open file",
             HistoryAction::OpenLocal,
             r.local_available && AppController::viewer_extension(&r.artifact).is_some(),
