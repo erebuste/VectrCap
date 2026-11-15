@@ -951,6 +951,102 @@ fn controller_archive_failure_then_explicit_continue_retains_editor() {
     );
 }
 #[test]
+fn resume_capture_clears_stale_archive_failure_state() {
+    use vectrcap::{
+        app::events::{AppCommand, AppEffect},
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    std::fs::write(fx.storage.policy.archive_root.as_ref().unwrap(), b"blocked").unwrap();
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Copy, Default::default());
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    });
+    assert!(matches!(effects.as_slice(), [AppEffect::Error(_)]));
+    assert!(surface.lock().unwrap().archive_failed);
+    assert!(surface.lock().unwrap().pending_finish);
+
+    let effects = fx.app.dispatch(AppCommand::ResumeCapture(session));
+    assert_no_error(&effects);
+    assert!(!surface.lock().unwrap().archive_failed);
+    assert!(!surface.lock().unwrap().pending_finish);
+
+    // The stale staged artifact from the failed finish must not leak into
+    // the next one: the artifact store must be empty of unadmitted spool
+    // entries before a fresh finish is confirmed.
+    assert_eq!(
+        std::fs::read_dir(fx.storage.artifacts.root())
+            .unwrap()
+            .count(),
+        0
+    );
+}
+#[test]
+fn new_finish_is_accepted_even_when_discarding_the_stale_one_fails() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use vectrcap::{
+        app::events::{AppCommand, AppEffect},
+        capture::request::CaptureMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    let mut fx = ControllerFixture::new();
+    fx.clipboard
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let finish = confirm_surface(&surface, OverlayAction::Copy, Default::default());
+    assert!(matches!(
+        fx.app
+            .dispatch(AppCommand::FinishCapture {
+                session,
+                finish,
+                save_path: None,
+            })
+            .as_slice(),
+        [AppEffect::Error(_)]
+    ));
+    let path = std::fs::read_dir(fx.storage.artifacts.root())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Deny delete sharing on the stale staged artifact so discarding it, as
+    // part of accepting a new/different finish below, fails.
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+
+    let save_path = fx.storage._dir.path().join("new-finish.png");
+    // The document/options are unchanged from the first confirm, so the
+    // already-prepared output is reused directly (no fresh prepare/wake
+    // cycle runs) -- only the action differs, which is what makes `!same`.
+    let finish = surface
+        .lock()
+        .unwrap()
+        .overlay
+        .confirm_finish(OverlayAction::Save)
+        .unwrap();
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: Some(save_path.clone()),
+    });
+    // The failed discard of the stale locked artifact must be reported...
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+    // ...but it must not have swallowed this new, different finish action:
+    // the Save still ran and produced the chosen file.
+    assert!(save_path.exists());
+
+    drop(guard);
+}
+#[test]
 fn cancelled_failed_and_stale_sessions_never_update_last_region() {
     use vectrcap::{
         app::{

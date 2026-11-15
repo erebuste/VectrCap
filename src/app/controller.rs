@@ -816,19 +816,7 @@ impl AppController {
                     vec![]
                 }
             }
-            AppCommand::ResumeCapture(session) => {
-                if let Some(capture) = &self.capture
-                    && capture.id == session
-                    && let Some(surface) = &capture.surface
-                {
-                    let mut surface = surface
-                        .lock()
-                        .map_err(|_| AppError::Capture("capture surface unavailable"))?;
-                    surface.working = false;
-                    surface.overlay.finish_failed(AppError::Cancelled);
-                }
-                vec![]
-            }
+            AppCommand::ResumeCapture(session) => self.resume_capture(session)?,
             AppCommand::ClosePin(id) => {
                 self.pins.remove(&id);
                 vec![AppEffect::ClosePin(id)]

@@ -155,6 +155,31 @@ impl AppController {
         ]);
         effects
     }
+    /// Returns to editing after a failed/pending finish without ending the
+    /// capture session. A stale staged artifact must not survive a resume,
+    /// so it is discarded (best-effort) the same way `cancel_capture` does.
+    pub(super) fn resume_capture(&mut self, session: Uuid) -> Result<Vec<AppEffect>, AppError> {
+        let mut effects = vec![];
+        if let Some(capture) = self.capture.as_mut()
+            && capture.id == session
+        {
+            if let Some(mut pending) = capture.pending.take()
+                && let Err(error) = pending.discard_unadmitted(&self.artifacts)
+            {
+                effects.push(AppEffect::Error(error));
+            }
+            if let Some(surface) = &capture.surface {
+                let mut surface = surface
+                    .lock()
+                    .map_err(|_| AppError::Capture("capture surface unavailable"))?;
+                surface.working = false;
+                surface.archive_failed = false;
+                surface.pending_finish = false;
+                surface.overlay.finish_failed(AppError::Cancelled);
+            }
+        }
+        Ok(effects)
+    }
     pub(super) fn finish_capture(
         &mut self,
         session: Uuid,
@@ -215,6 +240,7 @@ impl AppController {
         let mut surface = surface
             .lock()
             .map_err(|_| AppError::Capture("capture surface unavailable"))?;
+        let mut discard_error = None;
         if let Some(finish) = finish {
             surface.overlay.validate_finish(&finish)?;
             let same = capture.pending.as_ref().is_some_and(|previous| {
@@ -225,8 +251,13 @@ impl AppController {
                     )
             });
             if !same {
-                if let Some(previous) = &mut capture.pending {
-                    previous.discard_unadmitted(&self.artifacts)?;
+                // A locked orphan spool file can be recovered later; it must
+                // not drop the user's new finish/edit, which is the actual
+                // intent that just happened.
+                if let Some(previous) = &mut capture.pending
+                    && let Err(error) = previous.discard_unadmitted(&self.artifacts)
+                {
+                    discard_error = Some(error);
                 }
                 capture.pending = Some(ImageFinishTransaction::new(finish)?);
             }
@@ -272,6 +303,9 @@ impl AppController {
             decision,
         )?;
         let mut effects = vec![];
+        if let Some(error) = discard_error {
+            effects.push(AppEffect::Error(error));
+        }
         match action {
             OverlayAction::Upload => {
                 let artifact = pending
