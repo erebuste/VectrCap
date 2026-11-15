@@ -151,7 +151,11 @@ pub fn acquire_screenshot(
     }
     let result = CaptureService::new(source, NativeCountdown::new(hide_app_chrome), cancel)
         .snapshot(request);
-    pins.restore()?;
+    // A restore failure must not discard an already-successful (or already-failed)
+    // capture result; it is logged the same way PinCaptureGuard's Drop impl does.
+    if let Err(error) = pins.restore() {
+        eprintln!("restoring reference windows after capture failed: {error}");
+    }
     result
 }
 

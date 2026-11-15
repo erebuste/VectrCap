@@ -322,8 +322,14 @@ impl NativeCapture {
             c.stop()
                 .map_err(|_| AppError::Capture("native capture shutdown failed"))
         });
-        let restore = self.pins.take().map_or(Ok(()), |pins| pins.restore());
-        result.and(restore)
+        // A restore failure must not discard an already-settled stop result (success
+        // or failure); it is logged the same way PinCaptureGuard's Drop impl does.
+        if let Some(pins) = self.pins.take()
+            && let Err(error) = pins.restore()
+        {
+            eprintln!("restoring reference windows after capture failed: {error}");
+        }
+        result
     }
 }
 impl Drop for NativeCapture {
