@@ -237,6 +237,7 @@ fn draw_review(
     } else {
         "GIF recording review"
     });
+    ui.label(&recording.task_target);
     if let Some(metadata) = &recording.metadata {
         ui.label(metadata_label(metadata));
     }
@@ -282,6 +283,12 @@ fn draw_review(
                 .clicked()
             {
                 commands.push(AppCommand::Recording(RecordingInput::Upload));
+            }
+            if ui
+                .add_enabled(!recording.uploaded, egui::Button::new("Run selected tasks"))
+                .clicked()
+            {
+                commands.push(AppCommand::RunRecordingTasks);
             }
             if ui.button("Save").clicked() {
                 commands.push(AppCommand::Recording(RecordingInput::Save));

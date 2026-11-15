@@ -31,7 +31,7 @@ pub(super) struct ScrollingWorkflow {
     target: Option<ScrollingTarget>,
     selection_ready: bool,
     update: Option<ScrollUpdate>,
-    selection_destination: DestinationSelection,
+    context: crate::workflow::runner::WorkflowContext,
 }
 impl AppController {
     pub fn scrolling_view(&self) -> Option<ScrollingView> {
@@ -58,6 +58,16 @@ impl AppController {
         }
         self.manager.ensure_not_corrupted()?;
         let id = Uuid::new_v4();
+        let mut context = self.task_context(
+            ArtifactKind::Screenshot,
+            Some(super::super::shortcuts::ShortcutAction::ToggleScrollingCapture),
+            selection,
+        );
+        context.id = id;
+        if let Some(d) = &context.destination {
+            self.workflows.insert(id, d.clone());
+            self.update_active()?;
+        }
         self.scrolling = Some(ScrollingWorkflow {
             id,
             selection: None,
@@ -68,7 +78,7 @@ impl AppController {
             target: None,
             selection_ready: false,
             update: None,
-            selection_destination: selection,
+            context,
         });
         self.window = None;
         let mut effects: Vec<_> = self
@@ -190,10 +200,14 @@ impl AppController {
         }
     }
     pub(super) fn cancel_scrolling(&mut self) -> Vec<AppEffect> {
-        if self.scrolling.take().is_none() {
+        let Some(workflow) = self.scrolling.take() else {
             return vec![];
-        }
+        };
+        self.workflows.remove(&workflow.id);
         let mut effects = vec![AppEffect::CancelScrolling];
+        if let Err(e) = self.update_active() {
+            effects.push(AppEffect::Error(e));
+        }
         effects.extend(
             self.pins
                 .restore_after_capture()
@@ -219,9 +233,15 @@ impl AppController {
                     .into_iter()
                     .map(AppEffect::Pin),
             );
-            match self.open_scrolling_review(w.id, review, w.monitors, w.selection_destination) {
+            match self.open_scrolling_review(w.id, review, w.monitors, w.context) {
                 Ok(out) => effects.extend(out),
-                Err(e) => effects.push(AppEffect::Error(e)),
+                Err(e) => {
+                    effects.push(AppEffect::Error(e));
+                    self.workflows.remove(&w.id);
+                    if let Err(error) = self.update_active() {
+                        effects.push(AppEffect::Error(error));
+                    }
+                }
             }
         } else if event.update.state == ScrollState::Cancelled {
             effects.extend(self.cancel_scrolling());

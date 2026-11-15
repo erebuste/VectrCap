@@ -68,6 +68,7 @@ impl CaptureHost {
                         let mut command = None;
                         if state.intended_pin { ui.label("Pin from screen: select and annotate, then choose Pin. Copy, Save and Upload remain available."); }
                         let mut choose_folder = false;
+                        ui.label(&state.task_target);
                         if state.pending_finish && !state.working {
                             egui::Window::new("Finish recovery").show(ui.ctx(), |ui| {
                                 ui.label("The editor and prepared output are retained.");

@@ -310,6 +310,8 @@ pub struct StartupPreference {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
+    pub tasks: crate::workflow::profile::TaskProfiles,
+    #[serde(default)]
     pub region: crate::capture::preferences::RegionCapturePreferences,
     #[serde(default)]
     pub screenshot: crate::capture::request::ScreenshotPreferences,
@@ -345,6 +347,7 @@ fn notifications_default_enabled() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            tasks: Default::default(),
             region: crate::capture::preferences::RegionCapturePreferences::default(),
             screenshot: crate::capture::request::ScreenshotPreferences::default(),
             last_region: None,
@@ -379,6 +382,7 @@ impl Settings {
             return Err(AppError::InvalidInput("unsupported settings version"));
         }
         self.destinations.validate()?;
+        self.tasks.validate(self)?;
         self.archive.validate()?;
         self.filename.validate()?;
         self.recording.validate()?;

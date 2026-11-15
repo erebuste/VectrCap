@@ -21,6 +21,10 @@ pub struct Tray {
     choices: Choices,
     checks: Vec<(DestinationId, CheckMenuItem)>,
     revision: Option<u64>,
+    task_settings: Option<(
+        crate::workflow::profile::TaskProfiles,
+        crate::persistence::settings::ArchivePolicy,
+    )>,
 }
 fn error() -> AppError {
     AppError::Persistence("native tray unavailable")
@@ -36,6 +40,46 @@ impl Tray {
         let map = choices.clone();
         let hotkey_client = client.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            use crate::workflow::profile::{CaptureTask, UploadTask};
+            let key = event.id.as_ref();
+            if key.starts_with("capture-task-") || key.starts_with("upload-task-") {
+                if let Some(s) = client.snapshot().settings {
+                    let mut tasks = s.tasks.clone();
+                    let mut archive = s.archive.clone();
+                    if let Some(task) = key
+                        .strip_prefix("capture-task-")
+                        .and_then(|i| i.parse::<usize>().ok())
+                        .and_then(|i| CaptureTask::ALL.get(i))
+                        .copied()
+                    {
+                        if task == CaptureTask::SaveFinal {
+                            let enabled = !tasks.save_final(&archive);
+                            tasks.set_save_final(&mut archive, enabled);
+                        } else if task == CaptureTask::BeforeUploadReview {
+                            tasks.global.before_upload_review = !tasks.global.before_upload_review;
+                            tasks.global.capture.remove(&task);
+                        } else if !tasks.global.capture.remove(&task) {
+                            tasks.global.capture.insert(task);
+                        }
+                    } else if let Some(task) = key
+                        .strip_prefix("upload-task-")
+                        .and_then(|i| i.parse::<usize>().ok())
+                        .and_then(|i| UploadTask::ALL.get(i))
+                        .copied()
+                        && !tasks.global.after_upload.remove(&task)
+                    {
+                        tasks.global.after_upload.insert(task);
+                    }
+                    if let Err(e) = client.submit(AppCommand::SetTaskProfiles {
+                        tasks,
+                        archive,
+                        revision: s.revision,
+                    }) {
+                        client.report_error(e);
+                    }
+                }
+                return;
+            }
             if event.id.as_ref() == "upload-file" {
                 super::file_dialog::spawn_pick_and_upload(client.clone(), picker_gate.clone());
                 return;
@@ -121,9 +165,17 @@ impl Tray {
             choices,
             checks: vec![],
             revision: None,
+            task_settings: None,
         };
         tray.update(&Destinations::default(), 0)?;
         Ok(tray)
+    }
+    pub fn update_settings(
+        &mut self,
+        settings: &crate::persistence::settings::Settings,
+    ) -> Result<(), AppError> {
+        self.task_settings = Some((settings.tasks.clone(), settings.archive.clone()));
+        self.update(&settings.destinations, settings.revision)
     }
     pub fn update(&mut self, destinations: &Destinations, revision: u64) -> Result<(), AppError> {
         if self.revision != Some(revision) {
@@ -172,6 +224,42 @@ impl Tray {
                 .map_err(|_| error())?;
             menu.append(&MenuItem::with_id("history", "History", true, None))
                 .map_err(|_| error())?;
+            if let Some((tasks, archive)) = &self.task_settings {
+                use crate::workflow::profile::{CaptureTask, UploadTask};
+                let capture = Submenu::new("After capture tasks", true);
+                for (i, t) in CaptureTask::ALL.into_iter().enumerate() {
+                    let checked = match t {
+                        CaptureTask::SaveFinal => tasks.save_final(archive),
+                        CaptureTask::BeforeUploadReview => {
+                            tasks.global.before_upload_review || tasks.global.capture.contains(&t)
+                        }
+                        _ => tasks.global.capture.contains(&t),
+                    };
+                    capture
+                        .append(&CheckMenuItem::with_id(
+                            format!("capture-task-{i}"),
+                            t.label(),
+                            true,
+                            checked,
+                            None,
+                        ))
+                        .map_err(|_| error())?;
+                }
+                menu.append(&capture).map_err(|_| error())?;
+                let uploaded = Submenu::new("After upload tasks", true);
+                for (i, t) in UploadTask::ALL.into_iter().enumerate() {
+                    uploaded
+                        .append(&CheckMenuItem::with_id(
+                            format!("upload-task-{i}"),
+                            t.label(),
+                            true,
+                            tasks.global.after_upload.contains(&t),
+                            None,
+                        ))
+                        .map_err(|_| error())?;
+                }
+                menu.append(&uploaded).map_err(|_| error())?;
+            }
             let submenu = Submenu::new("Destination", !destinations.is_empty());
             let mut choices = HashMap::new();
             let mut checks = vec![];

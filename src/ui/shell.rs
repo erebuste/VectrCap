@@ -122,7 +122,7 @@ impl eframe::App for Shell {
         }
         self.pane.reconcile(&self.view, ctx);
         if let Some(settings) = &self.view.settings {
-            if let Err(error) = self.tray.update(&settings.destinations, settings.revision) {
+            if let Err(error) = self.tray.update_settings(settings) {
                 self.client.report_error(error);
             }
             if self.current_window != self.view.window {
@@ -239,6 +239,12 @@ impl eframe::App for Shell {
                         commands.push(AppCommand::Show(Window::BatchSummary));
                     }
                     if ui
+                        .selectable_label(self.view.window == Some(Window::Tasks), "Task results")
+                        .clicked()
+                    {
+                        commands.push(AppCommand::Show(Window::Tasks));
+                    }
+                    if ui
                         .selectable_label(self.view.window == Some(Window::History), "History")
                         .clicked()
                     {
@@ -274,6 +280,14 @@ impl eframe::App for Shell {
                                     self.view.notifications_enabled,
                                     &self.view.shortcut_statuses,
                                     self.view.recorded_shortcut,
+                                ))
+                            }
+                            (Some(Window::Tasks), Some(_)) => {
+                                commands.extend(super::task_results::draw(
+                                    ui,
+                                    &self.view.task_workflows,
+                                    &self.client,
+                                    &self.picker_gate,
                                 ))
                             }
                             (Some(Window::History), Some(_)) => {

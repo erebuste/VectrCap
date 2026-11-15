@@ -84,6 +84,25 @@ impl RecordingReview {
     pub fn archive_path(&self) -> Option<&Path> {
         self.archive.as_ref().map(|a| a.path.as_path())
     }
+    pub(crate) fn archive_skipped(&self) -> bool {
+        self.continued
+    }
+    /// The task runner delegates the save to ArchiveStore. Reuse that ownership
+    /// record so a later explicit Save protects it instead of saving twice.
+    pub(crate) fn accept_task_archive(&mut self, entry: ArchiveEntry) -> Result<(), AppError> {
+        let a = self
+            .artifact
+            .as_ref()
+            .ok_or(AppError::InUse("recording source is unavailable"))?;
+        if a.id != entry.artifact_id || a.size != entry.size || a.sha256 != entry.sha256 {
+            return Err(AppError::InUse(
+                "task archive does not belong to this recording",
+            ));
+        }
+        self.archive = Some(entry);
+        self.archive_failed = false;
+        Ok(())
+    }
     pub fn artifact(&self) -> Option<&Artifact> {
         self.artifact.as_ref()
     }

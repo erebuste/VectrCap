@@ -17,3 +17,5 @@ pub mod recording;
 pub mod scrolling;
 pub mod ui;
 pub mod vectr;
+
+pub mod workflow;

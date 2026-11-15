@@ -331,6 +331,24 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_task_profiles(
+        &mut self,
+        tasks: crate::workflow::profile::TaskProfiles,
+        archive: crate::persistence::settings::ArchivePolicy,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        let mut candidate = self.settings.clone();
+        candidate.tasks = tasks;
+        candidate.archive = archive;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     pub fn set_archive_policy(
         &mut self,
         policy: crate::persistence::settings::ArchivePolicy,

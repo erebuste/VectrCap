@@ -354,6 +354,9 @@ impl History {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         migrate(&mut conn)?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS task_workflows (id TEXT PRIMARY KEY NOT NULL, state TEXT NOT NULL CHECK(length(state)<=1048576)) STRICT;
+            CREATE TABLE IF NOT EXISTS task_artifact_refs (workflow_id TEXT PRIMARY KEY NOT NULL REFERENCES task_workflows(id) ON DELETE CASCADE, artifact_id TEXT NOT NULL) STRICT;
+            CREATE INDEX IF NOT EXISTS task_refs_artifact ON task_artifact_refs(artifact_id);")?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS history_browse_order ON history_items(created_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS history_favorites_order ON history_items(favorite,created_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS jobs_history_latest ON jobs(artifact_id,acceptance_ordinal DESC);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS recording_metadata (artifact_id TEXT PRIMARY KEY NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE, metadata TEXT NOT NULL) STRICT;")?;
         Ok(History {
@@ -420,6 +423,24 @@ impl History {
         artifact: &Artifact,
         destination: &DestinationSnapshot,
     ) -> Result<UploadJob, AppError> {
+        self.create_job_inner(artifact, destination, JobId::new_random(), None)
+    }
+    fn create_job_inner(
+        &self,
+        artifact: &Artifact,
+        destination: &DestinationSnapshot,
+        id: JobId,
+        workflow: Option<&crate::workflow::runner::TaskRunner>,
+    ) -> Result<UploadJob, AppError> {
+        if let Some(existing) = self.job(id)? {
+            if existing.artifact != *artifact || existing.destination != *destination {
+                return Err(AppError::Persistence("task upload identity mismatch"));
+            }
+            if let Some(workflow) = workflow {
+                self.save_task_workflow(workflow)?;
+            }
+            return Ok(existing);
+        }
         if destination.credential.destination() != destination.id
             || destination.credential.origin() != &destination.origin
         {
@@ -428,7 +449,7 @@ impl History {
             ));
         }
         let job = UploadJob {
-            id: JobId::new_random(),
+            id,
             artifact: artifact.clone(),
             destination: destination.clone(),
             session: None,
@@ -457,6 +478,9 @@ impl History {
                 ordinal,
             ],
         )?;
+        if let Some(workflow) = workflow {
+            persist_task_workflow(&tx, workflow)?;
+        }
         tx.commit()?;
         Ok(job)
     }
@@ -733,18 +757,38 @@ impl History {
 
     /// Destinations referenced by unfinished jobs; their identity is frozen.
     pub fn active_destination_ids(&self) -> Result<HashSet<DestinationId>, AppError> {
-        self.uuid_set(&format!(
-            "SELECT DISTINCT dest_id FROM jobs WHERE {UNFINISHED}"
-        ))
-        .map(|ids| ids.into_iter().map(DestinationId).collect())
+        let mut ids: HashSet<_> = self
+            .uuid_set(&format!(
+                "SELECT DISTINCT dest_id FROM jobs WHERE {UNFINISHED}"
+            ))?
+            .into_iter()
+            .map(DestinationId)
+            .collect();
+        ids.extend(
+            self.task_workflows()?
+                .iter()
+                .filter(|r| !r.complete())
+                .filter_map(|r| r.context().destination.as_ref().map(|d| d.id)),
+        );
+        Ok(ids)
     }
 
     /// Artifacts whose spool copy an unfinished job still needs.
     pub fn artifacts_needing_spool(&self) -> Result<HashSet<ArtifactId>, AppError> {
-        self.uuid_set(&format!(
-            "SELECT DISTINCT artifact_id FROM jobs WHERE {UNFINISHED}"
-        ))
-        .map(|ids| ids.into_iter().map(ArtifactId).collect())
+        let mut ids: HashSet<_> = self
+            .uuid_set(&format!(
+                "SELECT DISTINCT artifact_id FROM jobs WHERE {UNFINISHED}"
+            ))?
+            .into_iter()
+            .map(ArtifactId)
+            .collect();
+        ids.extend(
+            self.task_workflows()?
+                .iter()
+                .filter(|r| !r.complete())
+                .filter_map(|r| r.context().artifact.as_ref().map(|a| a.id)),
+        );
+        Ok(ids)
     }
 
     /// Records ownership of a published archive file (with the identities of
@@ -1022,6 +1066,7 @@ impl History {
         let eligible: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM archive_entries e \
              WHERE e.id = ?1 AND e.removed_ms IS NULL AND e.origin = 'automatic' \
+             AND NOT EXISTS (SELECT 1 FROM task_artifact_refs t WHERE t.artifact_id=e.artifact_id) \
              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
                  AND j.status NOT IN ('completed', 'cancelled')) \
              AND (?2 = 0 OR EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
@@ -1106,6 +1151,7 @@ impl History {
         let eligible: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM archive_entries e \
              WHERE e.id = ?1 AND e.removed_ms IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM task_artifact_refs t WHERE t.artifact_id=e.artifact_id) \
              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.artifact_id = e.artifact_id \
                  AND j.status NOT IN ('completed', 'cancelled')))",
             params![id.0.to_string()],
@@ -1431,6 +1477,115 @@ impl RawJob {
             attempt: u32::try_from(self.attempt).map_err(|_| corrupt())?,
         })
     }
+}
+
+impl History {
+    pub fn save_task_workflow(
+        &self,
+        runner: &crate::workflow::runner::TaskRunner,
+    ) -> Result<(), AppError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        persist_task_workflow(&tx, runner)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn task_workflow(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<crate::workflow::runner::TaskRunner>, AppError> {
+        let state: Option<String> = self
+            .lock()?
+            .query_row(
+                "SELECT state FROM task_workflows WHERE id=?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        state
+            .map(|s| {
+                let runner = decode_task_workflow(&s)?;
+                if runner.context().id != id {
+                    return Err(AppError::Persistence("task workflow identity mismatch"));
+                }
+                Ok(runner)
+            })
+            .transpose()
+    }
+    pub fn task_workflows(&self) -> Result<Vec<crate::workflow::runner::TaskRunner>, AppError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT state FROM task_workflows ORDER BY rowid")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .map(|s| decode_task_workflow(&s?))
+            .collect()
+    }
+}
+
+impl History {
+    /// Job identity is fixed by the workflow, and linkage commits in the same
+    /// transaction as queue admission. Retrying a crash cannot create a second job.
+    pub fn admit_task_upload(
+        &self,
+        runner: &mut crate::workflow::runner::TaskRunner,
+    ) -> Result<UploadJob, AppError> {
+        use crate::workflow::{
+            profile::CaptureTask,
+            steps::{StepOutcome, TaskStep},
+        };
+        if runner.outcome(TaskStep::Capture(CaptureTask::Upload)) != Some(&StepOutcome::Running) {
+            return Err(AppError::InvalidInput("task upload is not ready"));
+        }
+        let a = runner
+            .context()
+            .artifact
+            .clone()
+            .ok_or(AppError::InvalidInput("task has no final artifact"))?;
+        let d = runner
+            .context()
+            .destination
+            .clone()
+            .ok_or(AppError::NeedsSetup("task destination needs setup"))?;
+        let id = JobId(runner.context().id);
+        let mut candidate = runner.clone();
+        candidate.link_job(id);
+        let job = self.create_job_inner(&a, &d, id, Some(&candidate))?;
+        *runner = candidate;
+        Ok(job)
+    }
+}
+
+fn persist_task_workflow(
+    tx: &Transaction<'_>,
+    runner: &crate::workflow::runner::TaskRunner,
+) -> Result<(), AppError> {
+    runner.validate()?;
+    let state = serde_json::to_string(runner)
+        .map_err(|_| AppError::Persistence("encoding task workflow"))?;
+    if state.len() > 1024 * 1024 {
+        return Err(AppError::Persistence("task workflow exceeds capacity"));
+    }
+    let id = runner.context().id.to_string();
+    tx.execute("INSERT INTO task_workflows(id,state) VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET state=excluded.state",params![id,state])?;
+    tx.execute("DELETE FROM task_artifact_refs WHERE workflow_id=?1", [&id])?;
+    if !runner.complete()
+        && let Some(a) = &runner.context().artifact
+    {
+        tx.execute(
+            "INSERT INTO task_artifact_refs(workflow_id,artifact_id) VALUES (?1,?2)",
+            params![id, a.id.0.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn decode_task_workflow(state: &str) -> Result<crate::workflow::runner::TaskRunner, AppError> {
+    if state.len() > 1024 * 1024 {
+        return Err(AppError::Persistence("task workflow exceeds capacity"));
+    }
+    let runner: crate::workflow::runner::TaskRunner =
+        serde_json::from_str(state).map_err(|_| AppError::Persistence("invalid task workflow"))?;
+    runner.validate()?;
+    Ok(runner)
 }
 
 #[cfg(test)]

@@ -136,6 +136,7 @@ impl ExportPreview {
     }
 }
 
+#[derive(Clone)]
 pub struct ImageFinish {
     pub action: super::capture_overlay::OverlayAction,
     pub prepared: PreparedImageExport,
@@ -218,7 +219,11 @@ impl ImageExportPane {
         }
         if !matches!(
             action,
-            OverlayAction::Upload | OverlayAction::Copy | OverlayAction::Save | OverlayAction::Pin
+            OverlayAction::Upload
+                | OverlayAction::Copy
+                | OverlayAction::Save
+                | OverlayAction::Pin
+                | OverlayAction::RunSelectedTasks
         ) {
             return Err(AppError::InvalidInput("choose an image finish action"));
         }
@@ -356,6 +361,7 @@ impl ImageExportPane {
                 (OverlayAction::Copy, "Copy image"),
                 (OverlayAction::Save, "Save..."),
                 (OverlayAction::Pin, "Pin"),
+                (OverlayAction::RunSelectedTasks, "Run selected tasks"),
             ] {
                 if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
                     match self.confirm(document, action) {

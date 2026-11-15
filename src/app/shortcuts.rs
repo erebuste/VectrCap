@@ -101,7 +101,7 @@ pub enum ShortcutScope {
 /// Every action the approved spec names for the hotkeys/shortcuts section.
 /// `is_available_now` is the only thing that gates native registration or
 /// dispatch; scope/identity never change for an action once shipped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ShortcutAction {
     // Global actions with a real handler today.
     ShowHistory,
@@ -689,6 +689,16 @@ impl ShortcutManager {
         }
         let outcome = command_for(event.action)?;
         match outcome {
+            ShortcutOutcome::Command(crate::app::events::AppCommand::PinSource(
+                crate::pin::source::PinSource::Screen,
+            )) => Some(ShortcutOutcome::Command(
+                crate::app::events::AppCommand::PinFromScreenFor(
+                    self.bindings
+                        .iter()
+                        .find(|b| b.action == event.action)?
+                        .destination,
+                ),
+            )),
             ShortcutOutcome::Command(crate::app::events::AppCommand::ToggleScrolling) => Some(
                 ShortcutOutcome::Command(crate::app::events::AppCommand::ToggleScrollingFor(
                     self.bindings
@@ -754,6 +764,24 @@ impl Drop for ShortcutManager {
         for (_, (id, _)) in self.live.drain() {
             self.registrar.unregister(id);
         }
+    }
+}
+
+impl ShortcutAction {
+    pub fn supports_task_profile(self) -> bool {
+        matches!(
+            self,
+            Self::RegionScreenshot
+                | Self::WindowScreenshot
+                | Self::FullscreenScreenshot
+                | Self::CaptureLastRegion
+                | Self::ToggleScrollingCapture
+                | Self::ToggleGifRecording
+                | Self::ToggleMp4Recording
+                | Self::UploadFile
+                | Self::UploadFromClipboard
+                | Self::PinFromScreen
+        )
     }
 }
 
@@ -1030,6 +1058,28 @@ mod tests {
         );
         assert!(
             matches!(outcome, Some(ShortcutOutcome::OpenFilePicker(DestinationSelection::Specific(id))) if id == destination)
+        );
+    }
+
+    #[test]
+    fn pin_from_screen_shortcut_preserves_its_destination() {
+        let id = crate::app::destinations::DestinationId::new_random();
+        let mut b = binding(
+            ShortcutAction::PinFromScreen,
+            chord(true, false, 0x50),
+            true,
+        );
+        b.destination = DestinationSelection::Specific(id);
+        let (manager, _) = manager_with(vec![b]);
+        let outcome = manager.handle(
+            ShortcutEvent {
+                action: ShortcutAction::PinFromScreen,
+                repeat: false,
+            },
+            ShortcutFocus::Normal,
+        );
+        assert!(
+            matches!(outcome,Some(ShortcutOutcome::Command(crate::app::events::AppCommand::PinFromScreenFor(DestinationSelection::Specific(actual)))) if actual==id)
         );
     }
 

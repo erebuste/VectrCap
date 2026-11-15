@@ -3,6 +3,7 @@
 mod capture;
 mod recording;
 mod scrolling;
+mod task_chains;
 use super::{
     destination_manager::{
         DestinationEdit, DestinationManager, DestinationReferences, DestinationRepository,
@@ -144,6 +145,7 @@ pub struct BatchSummaryRow {
 /// last upload settlement, so every file's completion can be grouped into a
 /// single notice instead of one toast per file.
 struct FileBatch {
+    task_context: crate::workflow::runner::WorkflowContext,
     /// Paths not yet staged (succeeded or failed). The destination snapshot
     /// in `workflows` is released once this reaches zero, independent of
     /// whether any created jobs have finished uploading yet.
@@ -160,6 +162,11 @@ struct FileBatch {
     completions: Vec<Option<JobCompletion>>,
 }
 pub struct AppController {
+    task_runners: HashMap<Uuid, crate::workflow::runner::TaskRunner>,
+    task_images: HashMap<Uuid, crate::ui::image_export::ImageFinish>,
+    task_batches: HashMap<Uuid, (Uuid, usize)>,
+    accepted_task_contexts: HashMap<Uuid, crate::workflow::runner::WorkflowContext>,
+
     capture: Option<capture::CaptureWorkflow>,
     scrolling: Option<scrolling::ScrollingWorkflow>,
     recording: Option<recording::RecordingWorkflow>,
@@ -207,6 +214,7 @@ impl AppController {
             history.clone(),
             references.clone(),
         )?;
+        let recovered = history.task_workflows()?;
         let window = manager
             .settings()
             .destinations
@@ -215,6 +223,10 @@ impl AppController {
         let mut notifications = NotificationCenter::new();
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
+            task_runners: recovered.into_iter().map(|r| (r.context().id, r)).collect(),
+            task_images: HashMap::new(),
+            task_batches: HashMap::new(),
+            accepted_task_contexts: HashMap::new(),
             capture: None,
             scrolling: None,
             recording: None,
@@ -512,17 +524,24 @@ impl AppController {
             ));
         }
         self.manager.ensure_not_corrupted()?;
-        let snapshot = resolve_destination(
-            DestinationSelection::Inherit,
+        let task_context = self.task_context(
+            ArtifactKind::File,
+            Some(super::shortcuts::ShortcutAction::UploadFile),
             selection,
-            &self.settings().destinations,
-        )?;
+        );
+        let snapshot = task_context
+            .destination
+            .clone()
+            .ok_or(AppError::NeedsSetup(
+                "selected file upload destination needs setup",
+            ))?;
         self.store.read(&snapshot.credential)?;
         let batch = Uuid::new_v4();
         self.workflows.insert(batch, snapshot);
         self.batches.insert(
             batch,
             FileBatch {
+                task_context,
                 staging_remaining: paths.len(),
                 staging_done: vec![false; paths.len()],
                 jobs_remaining: 0,
@@ -537,30 +556,55 @@ impl AppController {
     }
     /// Creates the durable job for one successfully staged batch file,
     /// reusing the batch's single pre-resolved destination snapshot. The
-    /// artifact arrives already verified by the staging task that produced
-    /// it (off this thread); re-hashing it again here would re-block the
-    /// controller on exactly the large-file cost the staging handoff exists
-    /// to avoid, so this only does cheap, in-memory checks.
+    /// artifact arrives verified by the staging worker. A configured review
+    /// can delay admission, so the shared upload effect revalidates immutable
+    /// source integrity at the final admission boundary.
     fn accept_batch_artifact(
         &mut self,
         batch: Uuid,
         index: usize,
         artifact: &Artifact,
     ) -> Result<Vec<AppEffect>, AppError> {
-        let snapshot = self
-            .workflows
-            .get(&batch)
-            .ok_or(AppError::InvalidInput("unknown accepted workflow"))?;
         self.manager.ensure_not_corrupted()?;
-        let job = self.history.create_job(artifact, snapshot)?;
-        self.job_batch.insert(job.id, (batch, index));
+        let mut context = self
+            .batches
+            .get(&batch)
+            .ok_or(AppError::InvalidInput("unknown accepted batch"))?
+            .task_context
+            .clone();
+        context.id = Uuid::new_v4();
+        context.batch_id = Some(batch);
+        context.kind = artifact.kind;
+        context.intent = crate::workflow::runner::TaskIntent::Direct(
+            crate::workflow::profile::CaptureTask::Upload,
+        );
+        let id = context.id;
+        let mut runner = crate::workflow::runner::TaskRunner::new(context);
+        runner.accept_finalized(Arc::new(artifact.clone()), None);
+        self.task_batches.insert(id, (batch, index));
         if let Some(state) = self.batches.get_mut(&batch) {
             state.jobs_remaining += 1;
         }
-        Ok(vec![
-            AppEffect::JobAccepted(job.id),
-            AppEffect::Queue(crate::vectr::queue::QueueCommand::Admit(job.id)),
-        ])
+        match self.launch_tasks(runner, None) {
+            Ok(mut effects) => {
+                if self
+                    .task_runners
+                    .get(&id)
+                    .is_some_and(|r| r.context().upload_job.is_none())
+                {
+                    self.window = Some(Window::Tasks);
+                    effects.push(AppEffect::Window(self.window));
+                }
+                Ok(effects)
+            }
+            Err(e) => {
+                self.task_batches.remove(&id);
+                if let Some(state) = self.batches.get_mut(&batch) {
+                    state.jobs_remaining = state.jobs_remaining.saturating_sub(1);
+                }
+                Err(e)
+            }
+        }
     }
     /// One path from an accepted batch finished staging, successfully or not.
     fn file_staged(
@@ -627,7 +671,12 @@ impl AppController {
         effects
     }
     fn rollback_staged(&self, artifact: &Artifact) -> Result<(), AppError> {
-        if !self.history.artifact_is_recorded(artifact.id)? {
+        if !self.history.artifact_is_recorded(artifact.id)?
+            && !self
+                .history
+                .artifacts_needing_spool()?
+                .contains(&artifact.id)
+        {
             self.artifacts.discard_staged(artifact)?;
         }
         Ok(())
@@ -767,7 +816,17 @@ impl AppController {
             .0
             .lock()
             .map_err(|_| AppError::Persistence("workflow references unavailable"))?
-            .active = self.workflows.values().map(|s| s.id).collect();
+            .active = self
+            .workflows
+            .values()
+            .map(|s| s.id)
+            .chain(
+                self.task_runners
+                    .values()
+                    .filter(|r| !r.complete())
+                    .filter_map(|r| r.context().destination.as_ref().map(|d| d.id)),
+            )
+            .collect();
         Ok(())
     }
     fn history_action(
@@ -872,6 +931,29 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::PinFromScreenFor(selection) => {
+                let mut effects = self.start_capture_profile(
+                    crate::capture::request::CaptureMode::Region,
+                    selection,
+                    Some(super::shortcuts::ShortcutAction::PinFromScreen),
+                )?;
+                if let Some(capture) = &mut self.capture {
+                    capture.intended_pin = true;
+                }
+                effects.push(AppEffect::PinSourceChooser(false));
+                effects
+            }
+            AppCommand::SetTaskProfiles {
+                tasks,
+                archive,
+                revision,
+            } => {
+                self.manager.ensure_revision(revision)?;
+                self.manager.set_task_profiles(tasks, archive)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
+            AppCommand::Task { id, command } => self.task_command(id, command)?,
+            AppCommand::RunRecordingTasks => self.run_recording_tasks()?,
             AppCommand::ToggleScrolling => self.toggle_scrolling(DestinationSelection::Inherit)?,
             AppCommand::ToggleScrollingFor(selection) => self.toggle_scrolling(selection)?,
             AppCommand::ScrollingSelection { session, rect } => {
@@ -1015,15 +1097,7 @@ impl AppController {
                         vec![AppEffect::PinSourceChooser(false), AppEffect::PickPinFile]
                     }
                     PinSource::Screen => {
-                        let mut effects = self.start_capture(
-                            crate::capture::request::CaptureMode::Region,
-                            DestinationSelection::Inherit,
-                        )?;
-                        if let Some(capture) = &mut self.capture {
-                            capture.intended_pin = true;
-                        }
-                        effects.push(AppEffect::PinSourceChooser(false));
-                        effects
+                        self.apply(AppCommand::PinFromScreenFor(DestinationSelection::Inherit))?
                     }
                 }
             }
@@ -1105,33 +1179,44 @@ impl AppController {
                     ));
                 }
                 self.manager.ensure_not_corrupted()?;
-                let snapshot = resolve_destination(
-                    selection,
-                    DestinationSelection::Inherit,
-                    &self.settings().destinations,
-                )?;
+                let mut context = self.task_context(ArtifactKind::File, None, selection);
+                context.id = id;
+                let snapshot = context.destination.clone().ok_or(AppError::NeedsSetup(
+                    "selected workflow destination needs setup",
+                ))?;
                 self.store.read(&snapshot.credential)?;
+                self.accepted_task_contexts.insert(id, context);
                 self.workflows.insert(id, snapshot);
                 self.update_active()?;
                 vec![AppEffect::WorkflowAccepted(id)]
             }
             AppCommand::AcceptWorkflow { id, artifact } => {
-                let snapshot = self
-                    .workflows
-                    .get(&id)
-                    .ok_or(AppError::InvalidInput("unknown accepted workflow"))?;
                 self.manager.ensure_not_corrupted()?;
                 self.artifacts.verify(&artifact)?;
-                // Reference stays live until the durable job owns it.
-                let job = self.history.create_job(&artifact, snapshot)?;
+                if !self.workflows.contains_key(&id) {
+                    return Err(AppError::InvalidInput("unknown accepted workflow"));
+                }
+                let mut context = self
+                    .accepted_task_contexts
+                    .get(&id)
+                    .cloned()
+                    .ok_or(AppError::InvalidInput("workflow profile is missing"))?;
+                context.kind = artifact.kind;
+                context.intent = crate::workflow::runner::TaskIntent::Direct(
+                    crate::workflow::profile::CaptureTask::Upload,
+                );
+                let mut runner = crate::workflow::runner::TaskRunner::new(context);
+                runner.accept_finalized(Arc::new(artifact), None);
+                let mut effects = self.launch_tasks(runner, None)?;
+                self.accepted_task_contexts.remove(&id);
                 self.workflows.remove(&id);
-                self.update_active()?;
-                vec![
-                    AppEffect::JobAccepted(job.id),
-                    AppEffect::Queue(crate::vectr::queue::QueueCommand::Admit(job.id)),
-                ]
+                if let Err(e) = self.update_active() {
+                    effects.push(AppEffect::Error(e));
+                }
+                effects
             }
             AppCommand::ReleaseWorkflow(id) => {
+                self.accepted_task_contexts.remove(&id);
                 self.workflows.remove(&id);
                 self.update_active()?;
                 self.manager.cleanup()?;
@@ -1414,6 +1499,7 @@ impl AppController {
             }
             AppEvent::Queue(crate::vectr::queue::QueueEffect::Changed(id)) => {
                 let mut effects = vec![];
+                effects.extend(self.task_upload_changed(id));
                 if let Ok(Some(job)) = self.history.job(id) {
                     if matches!(job.status, JobStatus::Completed(_))
                         && self.settings().archive.storage_mode
@@ -1475,7 +1561,10 @@ impl AppController {
                 effects.push(AppEffect::RefreshQueue);
                 effects
             }
-            AppEvent::Queue(crate::vectr::queue::QueueEffect::Restarted { previous, .. }) => {
+            AppEvent::Queue(crate::vectr::queue::QueueEffect::Restarted {
+                previous,
+                replacement,
+            }) => {
                 // An explicit restart (never automatic) retires the OLD job
                 // as cancelled and admits a brand-new replacement job that
                 // is not part of any batch; if `previous` was a batch
@@ -1483,6 +1572,7 @@ impl AppController {
                 // stuck (`job_batch` has no entry for the replacement, so a
                 // later `Changed` for it is just an ordinary standalone job).
                 let mut effects = vec![];
+                effects.extend(self.task_upload_replaced(previous, replacement));
                 self.resolve_batch_slot(previous, CompletionStatus::Cancelled, &mut effects);
                 effects.push(AppEffect::RefreshQueue);
                 effects

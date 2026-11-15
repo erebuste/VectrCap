@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
+    Tasks,
     Settings,
     Uploads,
     BatchSummary,
@@ -47,6 +48,18 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    PinFromScreenFor(DestinationSelection),
+    SetTaskProfiles {
+        tasks: crate::workflow::profile::TaskProfiles,
+        archive: ArchivePolicy,
+        revision: u64,
+    },
+    Task {
+        id: Uuid,
+        command: crate::workflow::runner::TaskCommand,
+    },
+    RunRecordingTasks,
+
     ToggleScrolling,
     ToggleScrollingFor(DestinationSelection),
     ScrollingSelection {

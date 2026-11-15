@@ -16,6 +16,7 @@ use std::path::PathBuf;
 /// UI state shared with exactly one deferred viewport. The controller validates
 /// against this same document; snapshots never duplicate frozen image buffers.
 pub struct CaptureSurface {
+    pub task_target: String,
     pub intended_pin: bool,
     pub scrolling_review: Option<crate::ui::scrolling_review::ScrollReviewStatus>,
     pub review_viewport: crate::ui::image_review::ImageViewport,
@@ -32,7 +33,7 @@ pub(super) struct CaptureWorkflow {
     pub(super) id: Uuid,
     pub(super) surface: Option<Arc<Mutex<CaptureSurface>>>,
     mode: CaptureMode,
-    selection: DestinationSelection,
+    context: crate::workflow::runner::WorkflowContext,
     monitors: Vec<MonitorGeometry>,
     pending: Option<ImageFinishTransaction>,
     save_path: Option<PathBuf>,
@@ -42,6 +43,14 @@ impl AppController {
         &mut self,
         mode: CaptureMode,
         selection: DestinationSelection,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        self.start_capture_profile(mode, selection, None)
+    }
+    pub(super) fn start_capture_profile(
+        &mut self,
+        mode: CaptureMode,
+        selection: DestinationSelection,
+        action: Option<super::super::shortcuts::ShortcutAction>,
     ) -> Result<Vec<AppEffect>, AppError> {
         if self.scrolling.is_some()
             || self.capture.is_some()
@@ -55,12 +64,26 @@ impl AppController {
         self.manager.ensure_not_corrupted()?;
         let request = self.settings().capture_request(mode)?;
         let id = Uuid::new_v4();
+        let action = action.unwrap_or(match mode {
+            CaptureMode::Region => super::super::shortcuts::ShortcutAction::RegionScreenshot,
+            CaptureMode::Window => super::super::shortcuts::ShortcutAction::WindowScreenshot,
+            CaptureMode::Fullscreen => {
+                super::super::shortcuts::ShortcutAction::FullscreenScreenshot
+            }
+            CaptureMode::LastRegion => super::super::shortcuts::ShortcutAction::CaptureLastRegion,
+        });
+        let mut context = self.task_context(ArtifactKind::Screenshot, Some(action), selection);
+        context.id = id;
+        if let Some(d) = &context.destination {
+            self.workflows.insert(id, d.clone());
+            self.update_active()?;
+        }
         self.capture = Some(CaptureWorkflow {
             intended_pin: false,
             id,
             surface: None,
             mode,
-            selection,
+            context,
             monitors: vec![],
             pending: None,
             save_path: None,
@@ -120,6 +143,10 @@ impl AppController {
                     });
             let overlay = CaptureOverlay::from_snapshot(snapshot, pointer, (4, 4))?;
             Ok(Arc::new(Mutex::new(CaptureSurface {
+                task_target: capture.context.destination.as_ref().map_or_else(
+                    || "Upload destination needs setup".into(),
+                    |d| format!("Upload target: {} ({})", d.label, d.origin.as_str()),
+                ),
                 intended_pin: capture.intended_pin,
                 scrolling_review: None,
                 review_viewport: Default::default(),
@@ -139,6 +166,8 @@ impl AppController {
                 vec![AppEffect::CaptureSurface(Some(surface))]
             }
             Err(error) => {
+                self.workflows.remove(&session);
+                let reference_error = self.update_active().err();
                 self.capture = None;
                 self.window = Some(Window::Settings);
                 vec![
@@ -146,6 +175,9 @@ impl AppController {
                     AppEffect::Window(self.window),
                     AppEffect::Error(error),
                 ]
+                .into_iter()
+                .chain(reference_error.map(AppEffect::Error))
+                .collect()
             }
         };
         effects.splice(0..0, pin_effects.into_iter().map(AppEffect::Pin));
@@ -164,13 +196,27 @@ impl AppController {
                     .map(AppEffect::Pin),
             );
         }
-        if let Some(pending) = &mut capture.pending
+        let can_discard = if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
+            r.handle(crate::workflow::runner::TaskInput::Cancel);
+            match self.history.save_task_workflow(r) {
+                Ok(()) => true,
+                Err(e) => {
+                    effects.push(AppEffect::Error(e));
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if can_discard
+            && let Some(pending) = &mut capture.pending
             && let Err(error) = pending.discard_unadmitted(&self.artifacts)
         {
             // A locked orphan can be recovered later. It must not trap a
             // cancelled editor or replay an external finish action.
             effects.push(AppEffect::Error(error));
         }
+        self.task_images.remove(&capture.context.id);
         self.capture = None;
         self.workflows.remove(&session);
         if let Err(error) = self.update_active() {
@@ -190,6 +236,12 @@ impl AppController {
         if let Some(capture) = self.capture.as_mut()
             && capture.id == session
         {
+            if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
+                r.handle(crate::workflow::runner::TaskInput::Cancel);
+                self.history.save_task_workflow(r)?;
+            }
+            self.task_images.remove(&capture.context.id);
+            capture.context.id = Uuid::new_v4();
             if let Some(mut pending) = capture.pending.take()
                 && let Err(error) = pending.discard_unadmitted(&self.artifacts)
             {
@@ -276,6 +328,7 @@ impl AppController {
                 "accept the partial scrolling result before output",
             ));
         }
+        let retrying = finish.is_none();
         let mut discard_error = None;
         if let Some(finish) = finish {
             surface.overlay.validate_finish(&finish)?;
@@ -287,6 +340,13 @@ impl AppController {
                     )
             });
             if !same {
+                if let Some(r) = self.task_runners.get_mut(&capture.context.id) {
+                    r.handle(crate::workflow::runner::TaskInput::Cancel);
+                    // This checkpoint gates retirement of the old source.
+                    self.history.save_task_workflow(r)?;
+                    self.task_images.remove(&capture.context.id);
+                    capture.context.id = Uuid::new_v4();
+                }
                 // A locked orphan spool file can be recovered later; it must
                 // not drop the user's new finish/edit, which is the actual
                 // intent that just happened.
@@ -317,6 +377,17 @@ impl AppController {
             LastRegion::new(crop, &capture.monitors)?;
         }
         let action = pending.finish().action;
+        if action == OverlayAction::RunSelectedTasks && self.pins.snapshots().is_empty() {
+            self.pins.update_work_areas(
+                capture.monitors.iter().map(|m| m.bounds()).collect(),
+                pending.finish().screen_location.unwrap_or(
+                    crate::capture::geometry::PhysicalPoint {
+                        x: crop.left(),
+                        y: crop.top(),
+                    },
+                ),
+            )?;
+        }
         let pin_image = if action == OverlayAction::Pin {
             let image =
                 crate::pin::PinnedImage::new(pending.finish().prepared.pixels().clone(), None)?;
@@ -339,62 +410,140 @@ impl AppController {
             None
         };
         if action == OverlayAction::Upload && !self.workflows.contains_key(&capture.id) {
-            let snapshot = resolve_destination(
-                capture.selection,
-                DestinationSelection::Inherit,
-                &self.settings().destinations,
-            )?;
+            if capture.context.destination.is_none() {
+                let mut resolver =
+                    crate::workflow::runner::TaskRunner::new(capture.context.clone());
+                resolver.repair_destination(&self.settings().destinations)?;
+                capture.context = resolver.context().clone();
+            }
+            let snapshot = capture
+                .context
+                .destination
+                .clone()
+                .ok_or(AppError::NeedsSetup(
+                    "the snapshotted destination needs setup",
+                ))?;
             self.store.read(&snapshot.credential)?;
             self.workflows.insert(capture.id, snapshot);
             self.update_active()?;
         }
-        pending.persist(
-            &self.artifacts,
-            self.history.clone(),
-            &self.settings().archive,
-            &self.settings().filename,
-            capture.save_path.as_deref(),
-            decision,
-        )?;
+        if action != OverlayAction::RunSelectedTasks {
+            if retrying {
+                capture.context.effective.archive.archive_root =
+                    self.settings().archive.archive_root.clone();
+            }
+            pending.persist(
+                &self.artifacts,
+                self.history.clone(),
+                &capture.context.effective.archive,
+                &self.settings().filename,
+                capture.save_path.as_deref(),
+                decision,
+            )?;
+        }
+        // Save already published a durable file. Other actions share the one
+        // staged authoritative export, including configured multi-action chains.
+        let task_artifact = pending.task_artifact(&self.artifacts, &self.settings().filename)?;
         let mut effects = vec![];
+        let mut primary_task_error = None;
         if let Some(error) = discard_error {
             effects.push(AppEffect::Error(error));
         }
-        match action {
-            OverlayAction::Upload => {
-                let artifact = pending
-                    .artifact()
-                    .ok_or(AppError::Persistence("upload source was not staged"))?;
-                self.artifacts.verify(artifact)?;
-                let job = self.history.create_job(
-                    artifact,
-                    self.workflows
-                        .get(&capture.id)
-                        .ok_or(AppError::Persistence("upload destination unavailable"))?,
-                )?;
-                effects.extend([
-                    AppEffect::JobAccepted(job.id),
-                    AppEffect::Queue(crate::vectr::queue::QueueCommand::Admit(job.id)),
-                ]);
+        let _ = pin_image; // preflight above runs before any save or upload
+        let intent = match action {
+            OverlayAction::Upload => crate::workflow::runner::TaskIntent::Direct(
+                crate::workflow::profile::CaptureTask::Upload,
+            ),
+            OverlayAction::Copy => crate::workflow::runner::TaskIntent::Direct(
+                crate::workflow::profile::CaptureTask::CopyImage,
+            ),
+            OverlayAction::Pin => crate::workflow::runner::TaskIntent::Direct(
+                crate::workflow::profile::CaptureTask::Pin,
+            ),
+            OverlayAction::Save => crate::workflow::runner::TaskIntent::Direct(
+                crate::workflow::profile::CaptureTask::SaveAs,
+            ),
+            OverlayAction::RunSelectedTasks => {
+                crate::workflow::runner::TaskIntent::RunSelectedTasks
             }
-            OverlayAction::Copy => self
-                .clipboard
-                .write_image(pending.finish().prepared.pixels())?,
-            OverlayAction::Pin => {
-                let id = self.pins.open(
-                    pin_image.expect("pin image validated before persistence"),
-                    pending.finish().screen_location,
-                )?;
-                effects.push(AppEffect::Pin(crate::pin::PinEffect::UpdateViewport(
-                    self.pins.get(id).expect("just opened pin").clone(),
-                )));
-            }
-            OverlayAction::Save => {}
             _ => return Err(AppError::InvalidInput("choose an image finish action")),
+        };
+        if self.task_runners.contains_key(&capture.context.id) {
+            let step = self.task_runners[&capture.context.id]
+                .states()
+                .iter()
+                .find(|s| {
+                    matches!(
+                        s.outcome,
+                        crate::workflow::steps::StepOutcome::Failed(_)
+                            | crate::workflow::steps::StepOutcome::NeedsUserAction(_)
+                    )
+                })
+                .map(|s| s.step);
+            if let Some(step) = step {
+                let out = self.drive_tasks(
+                    capture.context.id,
+                    crate::workflow::runner::TaskInput::Retry(step),
+                );
+                primary_task_error = out.iter().find_map(|effect| match effect {
+                    AppEffect::Error(e) => Some(e.clone()),
+                    _ => None,
+                });
+                effects.extend(out);
+            }
+        } else {
+            let mut context = capture.context.clone();
+            context.intent = intent;
+            if pending.archive_skipped() {
+                context.effective.archive.storage_mode =
+                    crate::persistence::settings::StorageMode::NeverAutomatic;
+            }
+            let mut runner = crate::workflow::runner::TaskRunner::new(context);
+            runner.accept_finalized(
+                Arc::new(task_artifact),
+                pending
+                    .saved_path()
+                    .map(PathBuf::from)
+                    .or_else(|| pending.archive().map(|a| a.path.clone())),
+            );
+            match self.launch_tasks(runner, Some(pending.finish().clone())) {
+                Ok(out) => {
+                    primary_task_error = out.iter().find_map(|effect| match effect {
+                        AppEffect::Error(e) => Some(e.clone()),
+                        _ => None,
+                    });
+                    effects.extend(out);
+                }
+                Err(e) if action == OverlayAction::Save => effects.push(AppEffect::Error(e)),
+                Err(e) => return Err(e),
+            }
+        }
+
+        if action != OverlayAction::RunSelectedTasks
+            && let Some(primary_task_error) = primary_task_error
+            && self.task_runners.get(&capture.context.id).is_some_and(|r| {
+                r.context().upload_job.is_none()
+                    && r.states().iter().any(|s| {
+                        matches!(
+                            s.outcome,
+                            crate::workflow::steps::StepOutcome::Failed(_)
+                                | crate::workflow::steps::StepOutcome::NeedsUserAction(_)
+                        )
+                    })
+            })
+        {
+            return Err(primary_task_error);
+        }
+        if action == OverlayAction::RunSelectedTasks {
+            self.window = Some(Window::Tasks);
+            effects.push(AppEffect::Window(self.window));
         }
         // Once an external effect succeeds it must never be replayed because
         // best-effort cleanup/settings bookkeeping failed afterwards.
-        if action != OverlayAction::Upload
+        if self
+            .task_runners
+            .get(&capture.context.id)
+            .is_some_and(|r| r.complete() && r.context().upload_job.is_none())
             && let Err(error) = pending.discard_unadmitted(&self.artifacts)
         {
             effects.push(AppEffect::Error(error));
@@ -422,11 +571,15 @@ impl AppController {
         id: Uuid,
         review: crate::scrolling::session::ScrollReview,
         monitors: Vec<MonitorGeometry>,
-        selection: DestinationSelection,
+        context: crate::workflow::runner::WorkflowContext,
     ) -> Result<Vec<AppEffect>, AppError> {
         let (overlay, status) =
             crate::ui::scrolling_review::ScrollingReview::new(review)?.into_parts();
         let surface = Arc::new(Mutex::new(CaptureSurface {
+            task_target: context.destination.as_ref().map_or_else(
+                || "Upload destination needs setup".into(),
+                |d| format!("Upload target: {} ({})", d.label, d.origin.as_str()),
+            ),
             intended_pin: false,
             scrolling_review: Some(status),
             review_viewport: Default::default(),
@@ -443,7 +596,7 @@ impl AppController {
             id,
             surface: Some(surface.clone()),
             mode: CaptureMode::Fullscreen,
-            selection,
+            context,
             monitors,
             pending: None,
             save_path: None,

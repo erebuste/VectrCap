@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct DesktopView {
+    pub task_workflows: Vec<crate::workflow::runner::TaskRunner>,
     pub scrolling: Option<super::controller::ScrollingView>,
     pub recording: Option<super::controller::RecordingView>,
     pub audio_test_stop: u64,
@@ -73,6 +74,7 @@ pub struct DesktopView {
 impl Default for DesktopView {
     fn default() -> Self {
         Self {
+            task_workflows: vec![],
             scrolling: None,
             recording: None,
             audio_test_stop: 0,
@@ -733,9 +735,9 @@ async fn serve(
             ..Default::default()
         },
     };
-    effects
-        .apply(controller.startup_effects(), &history)
-        .await?;
+    let mut startup = controller.startup_effects();
+    startup.extend(controller.recover_tasks());
+    effects.apply(startup, &history).await?;
     let mut driver = tokio::spawn(queue.serve(uploader, queue_rx, effect_tx));
     effects.publish(&view, wake.as_ref());
     let mut effect_open = true;
@@ -831,6 +833,7 @@ async fn serve(
             effects.state.audio_meter = m.status.lock().ok().map(|s| s.clone());
         }
         effects.state.scrolling = controller.scrolling_view();
+        effects.state.task_workflows = controller.task_views();
         effects.state.recording = controller.recording_view();
         effects.state.accepted_workflows = controller.active_workflow_count();
         effects.state.batch_summary = match controller.batch_summary() {

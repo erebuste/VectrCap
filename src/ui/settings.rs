@@ -88,7 +88,7 @@ impl SettingsPane {
         )],
         recorded_shortcut: Option<(Uuid, crate::app::shortcuts::KeyChord)>,
     ) -> Vec<AppCommand> {
-        let mut commands = vec![];
+        let mut commands = super::task_settings::draw(ui, settings);
         let mut recording_open = false;
         ui.collapsing("Recording", |ui| {
             recording_open = true;
@@ -195,7 +195,7 @@ impl SettingsPane {
                                 }
                             }
                         }
-                        if binding.action == crate::app::shortcuts::ShortcutAction::UploadFile {
+                        if binding.action.supports_task_profile() {
                             use crate::app::destinations::DestinationSelection;
                             let label = match binding.destination {
                                 DestinationSelection::Inherit => "Default destination".to_owned(),

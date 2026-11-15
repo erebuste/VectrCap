@@ -682,6 +682,111 @@ mod controller_tests {
         assert!(c.recording_view().is_none());
     }
     #[test]
+    fn selected_recording_upload_honors_explicit_archive_skip() {
+        use vectrcap::workflow::profile::CaptureTask;
+        let root = tempfile::tempdir().unwrap();
+        let (mut c, _) = app(root.path());
+        let mut tasks = c.settings().tasks.clone();
+        tasks.global.capture.insert(CaptureTask::Upload);
+        c.dispatch(AppCommand::SetTaskProfiles {
+            tasks,
+            archive: c.settings().archive.clone(),
+            revision: c.settings().revision,
+        });
+        let path = c.settings().archive.resolved_root().unwrap();
+        std::fs::write(path, b"blocked").unwrap();
+        let id = start(&mut c);
+        c.dispatch(AppCommand::Recording(RecordingInput::Stop));
+        c.on_event(AppEvent::RecordingWorker {
+            session: id,
+            input: RecordingInput::Finalized(Ok(encoded(root.path()))),
+        });
+        assert!(c.recording_view().unwrap().archive_failed);
+        let effects = c.dispatch(AppCommand::RetryRecordingArchive {
+            continue_without: true,
+        });
+        assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        let effects = c.dispatch(AppCommand::RunRecordingTasks);
+        assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, AppEffect::JobAccepted(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_recording_save_as_can_finish_without_upload() {
+        use vectrcap::workflow::{profile::CaptureTask, runner::TaskCommand};
+        let root = tempfile::tempdir().unwrap();
+        let (mut c, _) = app(root.path());
+        let mut tasks = c.settings().tasks.clone();
+        tasks.global.capture.insert(CaptureTask::SaveAs);
+        let mut archive = c.settings().archive.clone();
+        archive.storage_mode = vectrcap::persistence::settings::StorageMode::NeverAutomatic;
+        c.dispatch(AppCommand::SetTaskProfiles {
+            tasks,
+            archive,
+            revision: c.settings().revision,
+        });
+        let id = start(&mut c);
+        c.dispatch(AppCommand::Recording(RecordingInput::Stop));
+        c.on_event(AppEvent::RecordingWorker {
+            session: id,
+            input: RecordingInput::Finalized(Ok(encoded(root.path()))),
+        });
+        c.dispatch(AppCommand::RunRecordingTasks);
+        let task = c.task_views().into_iter().find(|r| !r.complete()).unwrap();
+        let path = root.path().join("manual.gif");
+        let effects = c.dispatch(AppCommand::Task {
+            id: task.context().id,
+            command: TaskCommand::SaveAs(path.clone()),
+        });
+        assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        assert!(path.exists());
+        let effects = c.dispatch(AppCommand::CloseRecordingReview);
+        assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        assert!(c.recording_view().is_none());
+        assert!(path.exists());
+    }
+    #[test]
+    fn selected_recording_archive_is_reused_by_explicit_save() {
+        use vectrcap::workflow::profile::CaptureTask;
+        let root = tempfile::tempdir().unwrap();
+        let (mut c, h) = app(root.path());
+        let mut tasks = c.settings().tasks.clone();
+        tasks.global.capture.insert(CaptureTask::Upload);
+        let mut archive = c.settings().archive.clone();
+        archive.storage_mode = vectrcap::persistence::settings::StorageMode::PendingOrFailed;
+        c.dispatch(AppCommand::SetTaskProfiles {
+            tasks,
+            archive,
+            revision: c.settings().revision,
+        });
+        let id = start(&mut c);
+        c.dispatch(AppCommand::Recording(RecordingInput::Stop));
+        c.on_event(AppEvent::RecordingWorker {
+            session: id,
+            input: RecordingInput::Finalized(Ok(encoded(root.path()))),
+        });
+        assert!(c.recording_view().unwrap().archive_path.is_none());
+        let effects = c.dispatch(AppCommand::RunRecordingTasks);
+        assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        let original = c
+            .recording_view()
+            .unwrap()
+            .archive_path
+            .expect("selected tasks archive must belong to the recording review");
+        let effects = c.dispatch(AppCommand::Recording(RecordingInput::Save));
+        assert!(!effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+        assert_eq!(c.recording_view().unwrap().archive_path, Some(original));
+        let item = h.browse(&Default::default()).unwrap().records.remove(0);
+        assert!(item.local_available);
+    }
+
+    #[test]
     fn saved_review_can_close_without_deleting_archive() {
         let root = tempfile::tempdir().unwrap();
         let (mut c, _) = app(root.path());

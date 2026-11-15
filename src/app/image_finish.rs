@@ -74,7 +74,11 @@ impl ImageFinishTransaction {
     pub fn new(finish: ImageFinish) -> Result<Self, AppError> {
         if !matches!(
             finish.action,
-            OverlayAction::Upload | OverlayAction::Copy | OverlayAction::Save | OverlayAction::Pin
+            OverlayAction::Upload
+                | OverlayAction::Copy
+                | OverlayAction::Save
+                | OverlayAction::Pin
+                | OverlayAction::RunSelectedTasks
         ) {
             return Err(AppError::InvalidInput("choose an image finish action"));
         }
@@ -89,6 +93,44 @@ impl ImageFinishTransaction {
             archive_required: None,
         })
     }
+    pub fn task_artifact(
+        &mut self,
+        artifacts: &ArtifactStore,
+        filename: &FilenamePreset,
+    ) -> Result<Artifact, AppError> {
+        if let Some(path) = &self.saved_path {
+            use sha2::{Digest, Sha256};
+            return Ok(Artifact {
+                id: crate::app::types::ArtifactId::new_random(),
+                path: path.clone(),
+                display_name: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or(AppError::InvalidInput("saved output name is invalid"))?
+                    .to_owned(),
+                kind: crate::app::types::ArtifactKind::Screenshot,
+                size: self.finish.prepared.encoded_size() as u64,
+                sha256: Sha256::digest(self.finish.prepared.bytes()).into(),
+            });
+        }
+        self.stage_for_tasks(artifacts, filename)?;
+        Ok(self.artifact.as_ref().expect("staged export").clone())
+    }
+    pub fn stage_for_tasks(
+        &mut self,
+        artifacts: &ArtifactStore,
+        filename: &FilenamePreset,
+    ) -> Result<(), AppError> {
+        if self.artifact.is_none() {
+            let name = filename.render(
+                self.captured_at,
+                &random_suffix(),
+                self.finish.prepared.format().output_format(),
+            )?;
+            self.artifact = Some(artifacts.stage_image(&self.finish.prepared, name)?);
+        }
+        Ok(())
+    }
     pub fn finish(&self) -> &ImageFinish {
         &self.finish
     }
@@ -97,6 +139,9 @@ impl ImageFinishTransaction {
     }
     pub fn archive(&self) -> Option<&ArchiveEntry> {
         self.archive.as_ref()
+    }
+    pub fn archive_skipped(&self) -> bool {
+        self.continued
     }
     pub fn archive_failed(&self) -> bool {
         self.archive_failed
@@ -190,7 +235,7 @@ impl ImageFinishTransaction {
 
 /// Save exactly the selected path, atomically and without overwrite. The parent
 /// is bound by handle; publication and rollback operate on the created object.
-fn save_image_as(
+pub(crate) fn save_image_as(
     prepared: &crate::editor::export::PreparedImageExport,
     path: &Path,
 ) -> Result<(), AppError> {
@@ -213,18 +258,50 @@ fn save_image_as(
             "Save extension must match the selected image format",
         ));
     }
+    save_to_path(path, prepared.encoded_size() as u64, |file| {
+        (&*file).write_all(prepared.bytes()).map(|_| ())
+    })
+}
+pub(crate) fn save_artifact_as(artifact: &Artifact, path: &Path) -> Result<(), AppError> {
+    if !path.is_absolute() {
+        return Err(AppError::InvalidInput(
+            "Save requires an absolute destination",
+        ));
+    }
+    validate_file_name(
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(AppError::InvalidInput("Save name must be Unicode"))?,
+    )?;
+    if path.extension() != Path::new(&artifact.display_name).extension() {
+        return Err(AppError::InvalidInput(
+            "Save extension must match the finalized file",
+        ));
+    }
+    let mut source = crate::persistence::history::browser::verified_local(artifact, u64::MAX)?;
+    save_to_path(path, artifact.size, |file| {
+        std::io::copy(&mut source, &mut &*file).map(|_| ())
+    })
+}
+fn save_to_path(
+    path: &Path,
+    size: u64,
+    write: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), AppError> {
+    const STAGE: &str = "saving finalized output";
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(AppError::InvalidInput("Save name must be Unicode"))?;
     let parent = path
         .parent()
         .ok_or(AppError::InvalidInput("Save parent is missing"))?;
-    const STAGE: &str = "saving the finalized image";
     let root = winfs::open_root(parent).map_err(|e| AppError::io(STAGE, &e))?;
-    crate::persistence::ensure_free_space(parent, prepared.encoded_size() as u64)?;
+    crate::persistence::ensure_free_space(parent, size)?;
     let partial = format!(".vectrcap-partial-{}", uuid::Uuid::new_v4().simple());
     let file = winfs::create_child_file(&root, &partial).map_err(|e| AppError::io(STAGE, &e))?;
     let result = (|| {
-        (&file)
-            .write_all(prepared.bytes())
-            .map_err(|e| AppError::io(STAGE, &e))?;
+        write(&file).map_err(|e| AppError::io(STAGE, &e))?;
         file.sync_all().map_err(|e| AppError::io(STAGE, &e))?;
         winfs::rename_in_place(&file, name).map_err(|e| AppError::io(STAGE, &e))
     })();

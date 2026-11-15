@@ -22,6 +22,7 @@ pub struct RecordingSelection {
 }
 #[derive(Clone)]
 pub struct RecordingView {
+    pub task_target: String,
     pub id: Uuid,
     pub mp4: bool,
     pub state: RecordingState,
@@ -49,12 +50,13 @@ pub(super) struct RecordingWorkflow {
     selection_ready: bool,
     monitors: Vec<MonitorGeometry>,
     review: Option<RecordingReview>,
-    destination: Result<DestinationSnapshot, AppError>,
+    context: crate::workflow::runner::WorkflowContext,
     quit_pending: bool,
 }
 impl AppController {
     pub fn recording_view(&self) -> Option<RecordingView> {
         self.recording.as_ref().map(|workflow| RecordingView {
+            task_target:workflow.context.destination.as_ref().map_or_else(||"Upload destination needs setup".into(),|d|format!("Upload target: {} ({})",d.label,d.origin.as_str())),
             id: workflow.id,
             mp4: workflow.mp4,
             state: workflow.session.state(),
@@ -72,7 +74,7 @@ impl AppController {
             }),
             metadata: workflow.review.as_ref().map(|review| review.metadata().clone()),
             playback_path: workflow.review.as_ref().map(|review| review.source_path().to_owned()),
-            archive_path: workflow.review.as_ref().and_then(|review| review.archive_path().map(PathBuf::from)),
+            archive_path: workflow.review.as_ref().and_then(|review| review.archive_path().map(PathBuf::from)).or_else(||self.task_runners.get(&workflow.id).and_then(|r|r.context().durable_path.clone())),
             archive_failed: workflow.review.as_ref().is_some_and(|review| review.archive_failed()),
             uploaded: workflow.review.as_ref().is_some_and(|review| review.admitted()),
         })
@@ -95,12 +97,21 @@ impl AppController {
         let id = Uuid::new_v4();
         let mut session = RecordingSession::default();
         session.handle(RecordingInput::Select);
-        let destination = resolve_destination(
+        let mut context = self.task_context(
+            if mp4 {
+                ArtifactKind::Mp4
+            } else {
+                ArtifactKind::Gif
+            },
+            Some(if mp4 {
+                super::super::shortcuts::ShortcutAction::ToggleMp4Recording
+            } else {
+                super::super::shortcuts::ShortcutAction::ToggleGifRecording
+            }),
             selection,
-            DestinationSelection::Inherit,
-            &self.settings().destinations,
         );
-        if let Ok(snapshot) = &destination {
+        context.id = id;
+        if let Some(snapshot) = &context.destination {
             self.workflows.insert(id, snapshot.clone());
             self.update_active()?;
         }
@@ -114,7 +125,7 @@ impl AppController {
             selection_ready: false,
             monitors: vec![],
             review: None,
-            destination,
+            context,
             quit_pending: false,
         });
         let mut effects: Vec<_> = self
@@ -302,7 +313,7 @@ impl AppController {
                             if let Err(e) = review.persist(
                                 &self.artifacts,
                                 self.history.clone(),
-                                &self.settings().archive,
+                                &w.context.effective.archive,
                                 &self.settings().filename,
                                 false,
                                 false,
@@ -321,7 +332,7 @@ impl AppController {
                             r.persist(
                                 &self.artifacts,
                                 self.history.clone(),
-                                &self.settings().archive,
+                                &w.context.effective.archive,
                                 &self.settings().filename,
                                 false,
                                 true,
@@ -334,8 +345,6 @@ impl AppController {
                         }
                     }
                     RecordingEffect::Upload => {
-                        let snapshot = w.destination.clone()?;
-                        self.store.read(&snapshot.credential)?;
                         let r = w
                             .review
                             .as_mut()
@@ -346,26 +355,45 @@ impl AppController {
                         r.persist(
                             &self.artifacts,
                             self.history.clone(),
-                            &self.settings().archive,
+                            &w.context.effective.archive,
                             &self.settings().filename,
                             true,
                             false,
                         )?;
-                        if r.history_record_failed() {
-                            out.push(AppEffect::Error(AppError::Persistence(
-                                "recording saved, but its History entry could not be recorded",
-                            )));
-                        }
                         let artifact = r
                             .artifact()
                             .cloned()
-                            .ok_or(AppError::InvalidInput("recording staging failed"))?;
-                        self.workflows.insert(w.id, snapshot);
-                        self.update_active()?;
-                        out.extend(self.apply(AppCommand::AcceptWorkflow { id: w.id, artifact })?);
-                        r.mark_admitted();
+                            .ok_or(AppError::Persistence("recording staging failed"))?;
+                        let mut context = w.context.clone();
+                        context.intent = crate::workflow::runner::TaskIntent::Direct(
+                            crate::workflow::profile::CaptureTask::Upload,
+                        );
+                        if r.archive_skipped() {
+                            context.effective.archive.storage_mode =
+                                crate::persistence::settings::StorageMode::NeverAutomatic;
+                        }
+                        let mut runner = crate::workflow::runner::TaskRunner::new(context);
+                        runner.accept_finalized(
+                            Arc::new(artifact),
+                            r.archive_path().map(PathBuf::from),
+                        );
+                        out.extend(self.launch_tasks(runner, None)?);
+                        if self
+                            .task_runners
+                            .get(&w.id)
+                            .is_some_and(|r| r.context().upload_job.is_some())
+                        {
+                            r.mark_admitted();
+                        }
                     }
                     RecordingEffect::Discard => {
+                        if let Some(job) = self
+                            .task_runners
+                            .get(&w.id)
+                            .and_then(|r| r.context().upload_job)
+                        {
+                            out.extend(self.task_upload_changed(job));
+                        }
                         if let Some(r) = &mut w.review {
                             r.discard(&self.artifacts, &self.history)?;
                         }
@@ -418,6 +446,7 @@ impl AppController {
         let Some(mut w) = self.recording.take() else {
             return Ok(vec![]);
         };
+        w.context.effective.archive.archive_root = self.settings().archive.archive_root.clone();
         let result = (|| {
             if let Some(r) = &mut w.review {
                 if continue_without {
@@ -426,7 +455,7 @@ impl AppController {
                 r.persist(
                     &self.artifacts,
                     self.history.clone(),
-                    &self.settings().archive,
+                    &w.context.effective.archive,
                     &self.settings().filename,
                     false,
                     false,
@@ -447,6 +476,10 @@ impl AppController {
         if w.review
             .as_ref()
             .is_some_and(|r| r.archive_path().is_none() && !r.admitted())
+            && !self
+                .task_runners
+                .get(&w.id)
+                .is_some_and(|r| r.context().durable_path.is_some())
         {
             return Err(AppError::InUse(
                 "save, upload, or discard the finalized recording first",
@@ -466,6 +499,10 @@ impl AppController {
             if let Some(r) = &w.review
                 && r.archive_path().is_none()
                 && !r.admitted()
+                && !self
+                    .task_runners
+                    .get(&w.id)
+                    .is_some_and(|r| r.context().durable_path.is_some())
             {
                 return Err(AppError::InUse(
                     "save or discard the finalized recording before quitting",
@@ -478,5 +515,68 @@ impl AppController {
             self.recording = None;
         }
         Ok(vec![])
+    }
+}
+
+impl AppController {
+    pub(super) fn run_recording_tasks(&mut self) -> Result<Vec<AppEffect>, AppError> {
+        let w = self
+            .recording
+            .as_ref()
+            .ok_or(AppError::InUse("no recording review is open"))?;
+        if w.session.state() != RecordingState::Review {
+            return Err(AppError::InUse("finish recording review first"));
+        }
+        if self.task_runners.contains_key(&w.id) {
+            self.window = Some(Window::Tasks);
+            return Ok(vec![AppEffect::Window(self.window)]);
+        }
+        let review = w
+            .review
+            .as_ref()
+            .ok_or(AppError::InUse("recording is not finalized"))?;
+        let a = review
+            .artifact()
+            .cloned()
+            .ok_or(AppError::InUse("retry recording persistence first"))?;
+        let mut context = w.context.clone();
+        context.intent = crate::workflow::runner::TaskIntent::RunSelectedTasks;
+        if review.archive_skipped() {
+            context.effective.archive.storage_mode =
+                crate::persistence::settings::StorageMode::NeverAutomatic;
+        }
+        let mut runner = crate::workflow::runner::TaskRunner::new(context);
+        runner.accept_finalized(Arc::new(a), review.archive_path().map(PathBuf::from));
+        let mut out = self.launch_tasks(runner, None)?;
+        self.window = Some(Window::Tasks);
+        out.push(AppEffect::Window(self.window));
+        Ok(out)
+    }
+}
+
+impl AppController {
+    pub(super) fn mark_recording_task_admitted(&mut self, id: Uuid) {
+        if let Some(w) = self.recording.as_mut().filter(|w| w.id == id)
+            && let Some(review) = &mut w.review
+        {
+            review.mark_admitted();
+        }
+    }
+}
+
+impl AppController {
+    pub(super) fn recording_task_archive_saved(
+        &mut self,
+        id: Uuid,
+        entry: crate::persistence::archive::ArchiveEntry,
+    ) -> Result<(), AppError> {
+        if let Some(w) = self.recording.as_mut().filter(|w| w.id == id)
+            && let Some(review) = &mut w.review
+        {
+            // This association gates subsequent manual-origin protection and
+            // discard decisions; a mismatch must stop dependent upload work.
+            review.accept_task_archive(entry)?;
+        }
+        Ok(())
     }
 }

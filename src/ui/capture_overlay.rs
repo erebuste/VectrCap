@@ -132,6 +132,7 @@ impl OverlayTransform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayAction {
     Continue,
+    RunSelectedTasks,
     Upload,
     Copy,
     Save,

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -5,7 +6,7 @@ use uuid::Uuid;
 
 use crate::app::error::AppError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobId(pub Uuid);
 
 impl JobId {
@@ -14,7 +15,7 @@ impl JobId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtifactId(pub Uuid);
 
 impl ArtifactId {
@@ -23,7 +24,7 @@ impl ArtifactId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArtifactKind {
     Screenshot,
     Gif,
@@ -34,7 +35,7 @@ pub enum ArtifactKind {
 
 /// An immutable app-managed copy of bytes to upload. `path` is a generated
 /// spool path; `display_name` is the name shown to the user and sent upstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: ArtifactId,
     pub path: PathBuf,
@@ -48,7 +49,8 @@ const MAX_RECEIPT_URL_BYTES: usize = 2048;
 const MAX_RECEIPT_NAME_SCALARS: usize = 255;
 
 /// A confirmed Vectr result. Debug output redacts the sharing URL.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ReceiptRepr", into = "ReceiptRepr")]
 pub struct UploadReceipt {
     url: String,
     name: String,
@@ -107,5 +109,26 @@ impl fmt::Debug for UploadReceipt {
             // A malicious server can echo credentials/links in its name field.
             .field("name", &"<redacted>")
             .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptRepr {
+    url: String,
+    name: String,
+}
+impl TryFrom<ReceiptRepr> for UploadReceipt {
+    type Error = AppError;
+    fn try_from(r: ReceiptRepr) -> Result<Self, AppError> {
+        Self::new(&r.url, &r.name)
+    }
+}
+impl From<UploadReceipt> for ReceiptRepr {
+    fn from(r: UploadReceipt) -> Self {
+        Self {
+            url: r.url,
+            name: r.name,
+        }
     }
 }

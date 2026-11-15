@@ -469,6 +469,36 @@ pub fn spawn_pick_archive_folder(
     }
 }
 
+pub fn spawn_task_save(client: DesktopClient, gate: PickerGate, id: uuid::Uuid, name: String) {
+    let Some(guard) = gate.try_acquire() else {
+        client.report_error(AppError::InUse("a file picker is already open"));
+        return;
+    };
+    let report = client.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("vectrcap-task-save".into())
+        .spawn(move || {
+            let _guard = guard;
+            let extension = std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("png");
+            let result = pick_image_save(extension).and_then(|path| match path {
+                Some(path) => client.submit(AppCommand::Task {
+                    id,
+                    command: crate::workflow::runner::TaskCommand::SaveAs(path),
+                }),
+                None => Ok(()),
+            });
+            if let Err(e) = result {
+                client.report_error(e);
+            }
+        })
+    {
+        report.report_error(AppError::io("starting task Save as picker", &e));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

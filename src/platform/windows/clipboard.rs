@@ -15,6 +15,9 @@ pub trait ClipboardWriter: Send + Sync {
             "clipboard does not contain a supported image",
         ))
     }
+    fn write_file(&self, _path: &std::path::Path) -> Result<(), AppError> {
+        Err(AppError::Persistence("file clipboard is unavailable"))
+    }
     fn write_text(&self, text: &str) -> Result<(), AppError>;
     fn write_image(&self, _pixels: &image::RgbaImage) -> Result<(), AppError> {
         Err(AppError::Persistence("image clipboard is unavailable"))
@@ -58,6 +61,10 @@ impl Drop for Allocation {
     }
 }
 impl ClipboardWriter for WindowsClipboard {
+    fn write_file(&self, path: &std::path::Path) -> Result<(), AppError> {
+        set_clipboard(15, &file_drop_bytes(path)?)
+    }
+
     #[allow(unsafe_code)]
     fn read_image(&self) -> Result<crate::pin::PinnedImage, AppError> {
         use windows_sys::Win32::System::{
@@ -269,4 +276,21 @@ mod validation_tests {
             Err(AppError::InvalidInput(_))
         ));
     }
+}
+
+/// DROPFILES with a UTF-16, double-NUL-terminated list containing one durable
+/// file. This is data for the shell clipboard format, never command text.
+pub fn file_drop_bytes(path: &std::path::Path) -> Result<Vec<u8>, AppError> {
+    use std::os::windows::ffi::OsStrExt;
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if !path.is_absolute() || units.contains(&0) || units.len() > 32767 {
+        return Err(AppError::InvalidInput("clipboard file path is invalid"));
+    }
+    let mut bytes = vec![0; 20];
+    bytes[..4].copy_from_slice(&20u32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+    for u in units.into_iter().chain([0, 0]) {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    Ok(bytes)
 }

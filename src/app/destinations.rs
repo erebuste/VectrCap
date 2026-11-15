@@ -350,7 +350,8 @@ fn ensure_inactive(id: DestinationId, active: &HashSet<DestinationId>) -> Result
 
 /// Immutable copy of a destination taken when work is accepted. It never
 /// contains a token; `credential` only names which entry to read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DestinationSnapshot {
     pub id: DestinationId,
     pub label: String,

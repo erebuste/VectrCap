@@ -50,6 +50,7 @@ impl ShellActions for FakeShell {
 struct FakeClipboard {
     written: Mutex<Vec<String>>,
     fail: Mutex<bool>,
+    fail_checkpoint_after_copy: Mutex<Option<PathBuf>>,
 }
 impl ClipboardWriter for FakeClipboard {
     fn write_text(&self, text: &str) -> Result<(), AppError> {
@@ -57,6 +58,9 @@ impl ClipboardWriter for FakeClipboard {
             return Err(AppError::Persistence("fake clipboard failure"));
         }
         self.written.lock().unwrap().push(text.to_string());
+        if let Some(path) = self.fail_checkpoint_after_copy.lock().unwrap().take() {
+            rusqlite::Connection::open(path).unwrap().execute_batch("CREATE TRIGGER fail_task_update BEFORE UPDATE ON task_workflows BEGIN SELECT RAISE(ABORT,'synthetic checkpoint failure'); END;").unwrap();
+        }
         Ok(())
     }
 }
@@ -116,7 +120,7 @@ fn open(
     let store = Arc::new(Store::with_backend(Memory::default()));
     let shell = Arc::new(FakeShell::default());
     let clipboard = Arc::new(FakeClipboard::default());
-    let app = AppController::open(
+    let mut app = AppController::open(
         Box::new(FileDestinationRepository::open(&root.join("settings.json")).unwrap()),
         history.clone(),
         store,
@@ -125,6 +129,15 @@ fn open(
         clipboard.clone(),
     )
     .unwrap();
+    let mut tasks = app.settings().tasks.clone();
+    tasks.global.after_upload.clear();
+    let mut archive = app.settings().archive.clone();
+    archive.storage_mode = vectrcap::persistence::settings::StorageMode::NeverAutomatic;
+    app.dispatch(AppCommand::SetTaskProfiles {
+        tasks,
+        archive,
+        revision: app.settings().revision,
+    });
     (app, history, artifacts, shell, clipboard)
 }
 
@@ -1545,4 +1558,100 @@ fn restarting_an_interrupted_batch_member_resolves_its_slot_without_stranding_it
             (job_ids[1], CompletionStatus::Cancelled),
         ]
     );
+}
+
+#[test]
+fn configured_default_copy_runs_once_after_confirmed_receipt_and_can_retry_without_upload() {
+    use vectrcap::workflow::{profile::UploadTask, runner::TaskCommand, steps::TaskStep};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, clipboard) = open(dir.path());
+    seed(&mut app);
+    let mut tasks = app.settings().tasks.clone();
+    tasks.global.after_upload.insert(UploadTask::CopyUrl);
+    app.dispatch(AppCommand::SetTaskProfiles {
+        tasks,
+        archive: app.settings().archive.clone(),
+        revision: app.settings().revision,
+    });
+    *clipboard.fail.lock().unwrap() = true;
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/auto", "auto.png").unwrap();
+    let job = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "auto.png",
+        ArtifactKind::Screenshot,
+        Ok(receipt),
+    );
+    assert!(clipboard.written.lock().unwrap().is_empty());
+    assert!(matches!(
+        history.job(job).unwrap().unwrap().status,
+        vectrcap::persistence::history::JobStatus::Completed(_)
+    ));
+    *clipboard.fail.lock().unwrap() = false;
+    let r = app
+        .task_views()
+        .into_iter()
+        .find(|r| r.context().upload_job == Some(job))
+        .unwrap();
+    let effects = app.dispatch(AppCommand::Task {
+        id: r.context().id,
+        command: TaskCommand::Retry(TaskStep::AfterUpload(UploadTask::CopyUrl)),
+    });
+    assert!(!effects.iter().any(|e| matches!(e, AppEffect::Queue(_))));
+    app.on_event(AppEvent::Queue(QueueEffect::Changed(job)));
+    assert_eq!(
+        *clipboard.written.lock().unwrap(),
+        vec!["https://links.example/auto"]
+    );
+}
+
+#[test]
+fn failed_checkpoint_after_copy_preserves_success_and_never_replays_it() {
+    use vectrcap::workflow::{
+        profile::UploadTask,
+        runner::TaskInput,
+        steps::{StepOutcome, TaskStep},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _shell, clipboard) = open(dir.path());
+    seed(&mut app);
+    let mut tasks = app.settings().tasks.clone();
+    tasks.global.after_upload.insert(UploadTask::CopyUrl);
+    app.dispatch(AppCommand::SetTaskProfiles {
+        tasks,
+        archive: app.settings().archive.clone(),
+        revision: app.settings().revision,
+    });
+    *clipboard.fail_checkpoint_after_copy.lock().unwrap() = Some(dir.path().join("history.db"));
+    let receipt =
+        vectrcap::app::types::UploadReceipt::new("https://links.example/checkpoint", "auto.png")
+            .unwrap();
+    let job = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "auto.png",
+        ArtifactKind::Screenshot,
+        Ok(receipt),
+    );
+    let r = app
+        .task_views()
+        .into_iter()
+        .find(|r| r.context().upload_job == Some(job))
+        .unwrap();
+    assert_eq!(
+        r.outcome(TaskStep::AfterUpload(UploadTask::CopyUrl)),
+        Some(&StepOutcome::Succeeded)
+    );
+    assert!(r.context().receipt.is_some());
+    app.on_event(AppEvent::Queue(QueueEffect::Changed(job)));
+    assert_eq!(clipboard.written.lock().unwrap().len(), 1);
+    let mut disk = history.task_workflow(r.context().id).unwrap().unwrap();
+    assert!(disk.handle(TaskInput::Resume).is_empty());
+    assert!(matches!(
+        disk.outcome(TaskStep::AfterUpload(UploadTask::CopyUrl)),
+        Some(StepOutcome::NeedsUserAction(_))
+    ));
 }
