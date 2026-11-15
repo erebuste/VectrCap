@@ -9,6 +9,7 @@ compile_error!("VectrCap targets Windows only");
 
 pub mod app;
 pub mod capture;
+pub mod editor;
 pub mod persistence;
 pub mod platform;
 pub mod recording;

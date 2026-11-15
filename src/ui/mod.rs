@@ -1,3 +1,4 @@
+pub mod capture_overlay;
 pub mod destinations;
 pub mod settings;
 pub mod shell;
