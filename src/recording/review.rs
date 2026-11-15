@@ -47,6 +47,7 @@ pub struct RecordingReview {
     created: chrono::DateTime<chrono::Local>,
     continued: bool,
     archive_failed: bool,
+    history_record_failed: bool,
     admitted: bool,
     metadata: RecordingMetadata,
 }
@@ -72,6 +73,7 @@ impl RecordingReview {
             created: chrono::Local::now(),
             continued: false,
             archive_failed: false,
+            history_record_failed: false,
             admitted: false,
             metadata,
         }
@@ -90,6 +92,11 @@ impl RecordingReview {
     }
     pub fn archive_failed(&self) -> bool {
         self.archive_failed
+    }
+    /// True if the archive file is saved but its History/metadata row is not
+    /// (so it may not surface in History browsing or recording-metadata lookups).
+    pub fn history_record_failed(&self) -> bool {
+        self.history_record_failed
     }
     pub fn admitted(&self) -> bool {
         self.admitted
@@ -156,22 +163,27 @@ impl RecordingReview {
                 }
             }
         }
-        // The archive copy (if any) is already on disk by this point; a bookkeeping
-        // failure here must not be reported as a total failure that triggers Discard
-        // against a file that was, in fact, saved successfully.
+        // protect_manual_archive flips the archive row's origin to Manual, which is
+        // what excludes it from automatic age-based cleanup and upload reconciliation
+        // (see ARCHIVE_PAGE_SQL's origin='automatic' filter). A failure here must keep
+        // propagating: swallowing it would report "saved" for a file whose row is
+        // still 'automatic' and so remains eligible for deletion by a later cleanup
+        // pass, despite the user's explicit Save never actually having protected it.
         if manual && let Some(entry) = &mut self.archive {
-            match history.protect_manual_archive(entry.id) {
-                Ok(()) => entry.origin = crate::persistence::archive::ArchiveOrigin::Manual,
-                Err(error) => {
-                    eprintln!("protecting manual archive after successful save failed: {error}")
-                }
-            }
+            history.protect_manual_archive(entry.id)?;
+            entry.origin = crate::persistence::archive::ArchiveOrigin::Manual;
         }
-        if let Err(error) =
-            history.record_recording(a, &self.metadata, self.created.timestamp_millis())
-        {
-            eprintln!("recording history bookkeeping after successful save failed: {error}");
-        }
+        // record_recording only writes the History/metadata row, not the archive
+        // origin; a failure here does not expose the file to cleanup, so it does not
+        // need to block an already-successful (and already-protected, if applicable)
+        // save. It is still surfaced via history_record_failed rather than silently
+        // dropped, so the caller does not present the save as fully successful.
+        self.history_record_failed = history
+            .record_recording(a, &self.metadata, self.created.timestamp_millis())
+            .inspect_err(|error| {
+                eprintln!("recording history bookkeeping after successful save failed: {error}")
+            })
+            .is_err();
         Ok(())
     }
     pub fn discard(

@@ -308,6 +308,10 @@ impl AppController {
                                 false,
                             ) {
                                 out.push(AppEffect::Error(e));
+                            } else if review.history_record_failed() {
+                                out.push(AppEffect::Error(AppError::Persistence(
+                                    "recording saved, but its History entry could not be recorded",
+                                )));
                             }
                             w.review = Some(review);
                         }
@@ -322,6 +326,11 @@ impl AppController {
                                 false,
                                 true,
                             )?;
+                            if r.history_record_failed() {
+                                out.push(AppEffect::Error(AppError::Persistence(
+                                    "recording saved, but its History entry could not be recorded",
+                                )));
+                            }
                         }
                     }
                     RecordingEffect::Upload => {
@@ -342,6 +351,11 @@ impl AppController {
                             true,
                             false,
                         )?;
+                        if r.history_record_failed() {
+                            out.push(AppEffect::Error(AppError::Persistence(
+                                "recording saved, but its History entry could not be recorded",
+                            )));
+                        }
                         let artifact = r
                             .artifact()
                             .cloned()
