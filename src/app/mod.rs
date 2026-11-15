@@ -6,6 +6,7 @@ pub mod destination_manager;
 pub mod destinations;
 pub mod error;
 pub mod events;
+pub mod image_finish;
 pub mod notifications;
 pub mod types;
 

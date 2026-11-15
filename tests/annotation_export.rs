@@ -251,3 +251,274 @@ fn toolbar_pixels_are_absent() {
             .all(|p| *p != Rgba([255, 0, 255, 255]))
     );
 }
+
+// These fixtures pass through the real finish pane confirmation boundary before
+// storage, rather than constructing an independently encoded export in the test.
+fn image_finish(
+    doc: &EditorDocument,
+    action: vectrcap::ui::capture_overlay::OverlayAction,
+    options: vectrcap::editor::export::ImageExportOptions,
+) -> vectrcap::ui::image_export::ImageFinish {
+    let mut pane = vectrcap::ui::image_export::ImageExportPane::default();
+    *pane.options_mut() = options;
+    let (tx, rx) = std::sync::mpsc::channel();
+    pane.update(doc, move || {
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+    pane.update(doc, || {});
+    pane.confirm(doc, action).unwrap()
+}
+struct FinishFixture {
+    _dir: tempfile::TempDir,
+    artifacts: vectrcap::persistence::artifacts::ArtifactStore,
+    history: Arc<vectrcap::persistence::history::History>,
+    policy: vectrcap::persistence::settings::ArchivePolicy,
+}
+impl FinishFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        Self {
+            artifacts: vectrcap::persistence::artifacts::ArtifactStore::new(
+                dir.path().join("spool"),
+            )
+            .unwrap(),
+            history: Arc::new(
+                vectrcap::persistence::history::History::open(&dir.path().join("history.db"))
+                    .unwrap(),
+            ),
+            policy: vectrcap::persistence::settings::ArchivePolicy {
+                archive_root: Some(dir.path().join("archive")),
+                ..Default::default()
+            },
+            _dir: dir,
+        }
+    }
+    fn persist(
+        &self,
+        transaction: &mut vectrcap::app::image_finish::ImageFinishTransaction,
+        decision: vectrcap::app::image_finish::ArchiveDecision,
+    ) -> Result<(), vectrcap::app::error::AppError> {
+        transaction.persist(
+            &self.artifacts,
+            self.history.clone(),
+            &self.policy,
+            &Default::default(),
+            None,
+            decision,
+        )
+    }
+}
+fn selected_redacted_document() -> EditorDocument {
+    let mut d = document();
+    d.apply(EditorCommand::Crop(Some(rect(0, 0, 20, 20))))
+        .unwrap();
+    d.apply(EditorCommand::Insert(redaction())).unwrap();
+    d
+}
+#[test]
+fn copy_image_also_archives_by_default() {
+    use vectrcap::{app::image_finish::ImageFinishTransaction, ui::capture_overlay::OverlayAction};
+    let fx = FinishFixture::new();
+    let finish = image_finish(
+        &selected_redacted_document(),
+        OverlayAction::Copy,
+        Default::default(),
+    );
+    assert_eq!(finish.prepared.extension(), "png");
+    let expected = finish.prepared.encoded().clone();
+    let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+    fx.persist(&mut transaction, Default::default()).unwrap();
+    let path = transaction.archive().unwrap().path.clone();
+    assert_eq!(std::fs::read(&path).unwrap(), &*expected);
+    assert_eq!(
+        std::fs::read(&transaction.artifact().unwrap().path).unwrap(),
+        &*expected
+    );
+    transaction.discard_unadmitted(&fx.artifacts).unwrap();
+    assert_eq!(std::fs::read_dir(fx.artifacts.root()).unwrap().count(), 0);
+    assert!(path.exists());
+}
+#[test]
+fn pin_action_emits_only_flattened_pixels() {
+    use vectrcap::{app::image_finish::ImageFinishTransaction, ui::capture_overlay::OverlayAction};
+    let fx = FinishFixture::new();
+    let doc = selected_redacted_document();
+    let finish = image_finish(&doc, OverlayAction::Pin, Default::default());
+    let decoded = image::load_from_memory(finish.prepared.bytes())
+        .unwrap()
+        .to_rgba8();
+    let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+    fx.persist(&mut transaction, Default::default()).unwrap();
+    assert_eq!(transaction.finish().prepared.pixels().as_ref(), &decoded);
+    assert_eq!(decoded.get_pixel(0, 0).0, [7, 8, 9, 255]);
+    assert_eq!(
+        transaction.finish().screen_location,
+        Some(PhysicalPoint { x: 0, y: 0 })
+    );
+    assert_eq!(decoded.dimensions(), (20, 20));
+    assert_ne!(decoded.dimensions(), doc.source().dimensions());
+}
+#[test]
+fn archive_contains_only_final_redacted_pixels() {
+    use vectrcap::{
+        app::image_finish::ImageFinishTransaction,
+        editor::export::{ExportFormat, ImageExportOptions, Resize},
+        ui::capture_overlay::OverlayAction,
+    };
+    for format in [
+        ExportFormat::Png,
+        ExportFormat::Jpeg,
+        ExportFormat::WebpLossy,
+        ExportFormat::WebpLossless,
+    ] {
+        let fx = FinishFixture::new();
+        let doc = selected_redacted_document();
+        let finish = image_finish(
+            &doc,
+            OverlayAction::Upload,
+            ImageExportOptions::new(format, 90, Resize::Percent(50)).unwrap(),
+        );
+        let pixels = finish.prepared.pixels().clone();
+        let bytes = finish.prepared.encoded().clone();
+        let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+        fx.persist(&mut transaction, Default::default()).unwrap();
+        let artifact = transaction.artifact().unwrap();
+        assert_eq!(artifact.path.extension().unwrap(), "spool");
+        assert_eq!(
+            std::path::Path::new(&artifact.display_name)
+                .extension()
+                .unwrap(),
+            format.extension()
+        );
+        let archived = std::fs::read(&transaction.archive().unwrap().path).unwrap();
+        assert_eq!(archived, &*bytes);
+        assert_eq!(
+            image::load_from_memory(&archived).unwrap().to_rgba8(),
+            *pixels
+        );
+        assert_eq!(pixels.dimensions(), (10, 10));
+        let p = pixels.get_pixel(1, 1).0;
+        for (value, expected) in p.into_iter().zip([7u8, 8, 9, 255]) {
+            assert!(value.abs_diff(expected) <= if format.is_lossy() { 12 } else { 0 });
+        }
+    }
+}
+#[test]
+fn archive_failure_requires_explicit_continue() {
+    use vectrcap::{
+        app::image_finish::{ArchiveDecision, ImageFinishTransaction},
+        ui::capture_overlay::OverlayAction,
+    };
+    let fx = FinishFixture::new();
+    std::fs::write(fx.policy.archive_root.as_ref().unwrap(), b"blocked").unwrap();
+    let finish = image_finish(
+        &selected_redacted_document(),
+        OverlayAction::Copy,
+        Default::default(),
+    );
+    let expected = finish.prepared.encoded().clone();
+    let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+    assert!(
+        fx.persist(&mut transaction, ArchiveDecision::ContinueWithoutLocalCopy)
+            .is_err()
+    );
+    assert!(transaction.artifact().is_none());
+    assert!(
+        fx.persist(&mut transaction, ArchiveDecision::Retry)
+            .is_err()
+    );
+    assert!(transaction.archive_failed());
+    let staged = transaction.artifact().unwrap().id;
+    assert!(
+        fx.persist(&mut transaction, ArchiveDecision::Retry)
+            .is_err()
+    );
+    assert_eq!(transaction.artifact().unwrap().id, staged);
+    assert_eq!(transaction.finish().prepared.bytes(), &*expected);
+    fx.persist(&mut transaction, ArchiveDecision::ContinueWithoutLocalCopy)
+        .unwrap();
+    assert!(transaction.archive().is_none());
+    transaction.discard_unadmitted(&fx.artifacts).unwrap();
+    assert_eq!(std::fs::read_dir(fx.artifacts.root()).unwrap().count(), 0);
+}
+#[test]
+fn explicit_save_uses_selected_path_without_overwrite_in_every_mode() {
+    use vectrcap::{
+        app::image_finish::ImageFinishTransaction, persistence::settings::StorageMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    for mode in [
+        StorageMode::AlwaysSave,
+        StorageMode::PendingOrFailed,
+        StorageMode::NeverAutomatic,
+    ] {
+        let mut fx = FinishFixture::new();
+        fx.policy.storage_mode = mode;
+        let finish = image_finish(
+            &selected_redacted_document(),
+            OverlayAction::Save,
+            Default::default(),
+        );
+        let expected = finish.prepared.encoded().clone();
+        let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+        let path = fx._dir.path().join("chosen.png");
+        std::fs::write(&path, b"existing user file").unwrap();
+        assert!(
+            transaction
+                .persist(
+                    &fx.artifacts,
+                    fx.history.clone(),
+                    &fx.policy,
+                    &Default::default(),
+                    Some(&path),
+                    Default::default()
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing user file");
+        assert!(transaction.saved_path().is_none());
+        let path = fx._dir.path().join("other.png");
+        transaction
+            .persist(
+                &fx.artifacts,
+                fx.history.clone(),
+                &fx.policy,
+                &Default::default(),
+                Some(&path),
+                Default::default(),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), &*expected);
+        assert!(transaction.artifact().is_none());
+        assert!(!fx.policy.archive_root.unwrap().exists());
+    }
+}
+#[test]
+fn nonautomatic_copy_pin_do_not_persist_and_upload_keeps_spool() {
+    use vectrcap::{
+        app::image_finish::ImageFinishTransaction, persistence::settings::StorageMode,
+        ui::capture_overlay::OverlayAction,
+    };
+    for mode in [StorageMode::PendingOrFailed, StorageMode::NeverAutomatic] {
+        for action in [
+            OverlayAction::Copy,
+            OverlayAction::Pin,
+            OverlayAction::Upload,
+        ] {
+            let mut fx = FinishFixture::new();
+            fx.policy.storage_mode = mode;
+            let finish = image_finish(&selected_redacted_document(), action, Default::default());
+            let mut transaction = ImageFinishTransaction::new(finish).unwrap();
+            fx.persist(&mut transaction, Default::default()).unwrap();
+            assert_eq!(
+                transaction.artifact().is_some(),
+                action == OverlayAction::Upload
+            );
+            assert_eq!(
+                transaction.archive().is_some(),
+                action == OverlayAction::Upload && mode == StorageMode::PendingOrFailed
+            );
+        }
+    }
+}

@@ -40,6 +40,68 @@ pub struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    /// Stages only the immutable, encoded result of the annotation pipeline.
+    /// Source/preview pixels cannot cross this boundary.
+    pub fn stage_image(
+        &self,
+        prepared: &crate::editor::export::PreparedImageExport,
+        display_name: String,
+    ) -> Result<Artifact, AppError> {
+        use std::io::Write;
+        crate::persistence::filename::validate_file_name(&display_name)?;
+        if std::path::Path::new(&display_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            != Some(prepared.extension())
+        {
+            return Err(AppError::InvalidInput(
+                "image name must match its encoded format",
+            ));
+        }
+        let _guard = self
+            .staging
+            .lock()
+            .map_err(|_| AppError::Persistence("staging lock poisoned"))?;
+        let size = prepared.encoded_size() as u64;
+        ensure_free_space(&self.root, size)?;
+        const STAGE: &str = "staging the finalized image";
+        let mut tmp = tempfile::Builder::new()
+            .prefix(PARTIAL_PREFIX)
+            .tempfile_in(&self.root)
+            .map_err(|e| AppError::io(STAGE, &e))?;
+        let (size, sha256) = copy_hashing(&mut prepared.bytes(), tmp.as_file_mut(), size)
+            .map_err(|e| AppError::io(STAGE, &e))?;
+        tmp.flush().map_err(|e| AppError::io(STAGE, &e))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| AppError::io(STAGE, &e))?;
+        let id = ArtifactId::new_random();
+        let path = self.spool_path(id);
+        let file = tmp
+            .persist_noclobber(&path)
+            .map_err(|e| AppError::io(STAGE, &e.error))?;
+        let mut permissions = file
+            .metadata()
+            .map_err(|e| AppError::io(STAGE, &e))?
+            .permissions();
+        permissions.set_readonly(true);
+        if let Err(error) = file.set_permissions(permissions) {
+            drop(file);
+            if let Ok(file) = winfs::open_owned_by_path(&path) {
+                let _ = winfs::delete_by_handle(&file);
+            }
+            return Err(AppError::io(STAGE, &error));
+        }
+        Ok(Artifact {
+            id,
+            path,
+            display_name,
+            kind: ArtifactKind::Screenshot,
+            size,
+            sha256,
+        })
+    }
+
     pub fn new(root: PathBuf) -> Result<Self, AppError> {
         if !root.is_absolute() {
             return Err(AppError::InvalidInput(
