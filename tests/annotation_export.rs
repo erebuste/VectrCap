@@ -25,6 +25,96 @@ fn document() -> EditorDocument {
     )
     .unwrap()
 }
+
+#[test]
+fn image_local_annotations_export_at_correct_offsets() {
+    let mut doc = EditorDocument::from_image(Arc::new(RgbaImage::from_pixel(
+        80,
+        400,
+        Rgba([200, 150, 100, 255]),
+    )))
+    .unwrap();
+    doc.apply(EditorCommand::Insert(
+        Annotation::spotlight(rect(8, 290, 25, 40), 0.6).unwrap(),
+    ))
+    .unwrap();
+    doc.apply(EditorCommand::Insert(
+        Annotation::highlight(rect(10, 302, 10, 10), [255, 255, 0], 0.35).unwrap(),
+    ))
+    .unwrap();
+    doc.apply(EditorCommand::Insert(
+        Annotation::redaction(rect(15, 310, 7, 9), [4, 5, 6]).unwrap(),
+    ))
+    .unwrap();
+    doc.apply(EditorCommand::Crop(Some(rect(10, 300, 30, 40))))
+        .unwrap();
+    assert_eq!(doc.screen_location(), None);
+    let full = vectrcap::editor::render::render_preview(&doc).unwrap();
+    let exported = render_export(&doc).unwrap();
+    assert_eq!(exported.dimensions(), (30, 40));
+    assert_eq!(exported.get_pixel(5, 10).0, [4, 5, 6, 255]);
+    for y in 0..40 {
+        for x in 0..30 {
+            assert_eq!(full.get_pixel(x + 10, y + 300), exported.get_pixel(x, y));
+        }
+    }
+    assert_eq!(full.get_pixel(0, 0).0, [80, 60, 40, 255]);
+    assert_eq!(full.get_pixel(9, 299).0, [200, 150, 100, 255]);
+}
+
+#[test]
+fn long_image_review_uses_bounded_tiles() {
+    use eframe::egui::{Context, Pos2, Rect as UiRect, Vec2};
+    use vectrcap::ui::image_review::TiledImage;
+    let source = Arc::new(RgbaImage::from_pixel(37, 200_000, Rgba([20, 40, 60, 255])));
+    let mut tiled = TiledImage::new(source).unwrap();
+    let ctx = Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        tiled
+            .paint(
+                ui.painter(),
+                UiRect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 500.0)),
+                (0.0, 0.0),
+                0.0025,
+            )
+            .unwrap();
+    });
+    let sizes: Vec<_> = output
+        .textures_delta
+        .set
+        .iter()
+        .filter(|(id, _)| **id != eframe::egui::TextureId::Managed(0))
+        .flat_map(|(_, deltas)| deltas.iter().map(|d| d.image.size()))
+        .collect();
+    output.textures_delta.clear();
+    assert!(tiled.resident_tile_count() > 0 && tiled.resident_tile_count() <= 16);
+    assert!(!sizes.is_empty());
+    assert!(
+        sizes.iter().all(|s| s.iter().all(|&axis| axis <= 1024)),
+        "oversized tile {sizes:?}"
+    );
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        tiled
+            .paint(
+                ui.painter(),
+                UiRect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 500.0)),
+                (0.0, 199_500.0),
+                1.0,
+            )
+            .unwrap();
+    });
+    let sizes: Vec<_> = output
+        .textures_delta
+        .set
+        .iter()
+        .filter(|(id, _)| **id != eframe::egui::TextureId::Managed(0))
+        .flat_map(|(_, deltas)| deltas.iter().map(|d| d.image.size()))
+        .collect();
+    output.textures_delta.clear();
+    assert!(tiled.resident_tile_count() > 0 && tiled.resident_tile_count() <= 16);
+    assert!(!sizes.is_empty());
+    assert!(sizes.iter().all(|s| s.iter().all(|&axis| axis <= 1024)));
+}
 fn redaction() -> Annotation {
     Annotation::redaction(rect(0, 0, 12, 12), [7, 8, 9]).unwrap()
 }

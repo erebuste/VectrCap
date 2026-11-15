@@ -4,12 +4,23 @@ use crate::{
     capture::geometry::{PhysicalPoint, allocate_rgba},
 };
 use image::RgbaImage;
+/// Full frozen image with committed annotations. Temporary crop dimming and
+/// editor chrome are excluded; every effect/path is shared with export.
+pub fn render_preview(document: &EditorDocument) -> Result<RgbaImage, AppError> {
+    render_bounds(document, document.bounds())
+}
 /// Flatten only source pixels and approved annotation geometry. Chrome is never
 /// an input. Redaction writes straight-alpha RGBA last, without antialiasing.
 pub fn render_export(document: &EditorDocument) -> Result<RgbaImage, AppError> {
     let crop = document.crop().ok_or(AppError::InvalidInput(
         "select an output region before finishing",
     ))?;
+    render_bounds(document, crop)
+}
+fn render_bounds(
+    document: &EditorDocument,
+    crop: crate::capture::geometry::PhysicalRect,
+) -> Result<RgbaImage, AppError> {
     let mut data = allocate_rgba(crop)?;
     for y in 0..crop.height() {
         for x in 0..crop.width() {

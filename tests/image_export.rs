@@ -13,6 +13,135 @@ fn document() -> EditorDocument {
     })))
     .unwrap()
 }
+
+fn drive_finish(pane: &mut vectrcap::ui::image_export::ImageExportPane, doc: &EditorDocument) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        pane.update(doc, || {});
+        if !pane.is_preparing() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "preview worker timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn finish_controls_reuse_preview_for_every_action() {
+    use vectrcap::ui::{capture_overlay::OverlayAction, image_export::ImageExportPane};
+    let mut pane = ImageExportPane::default();
+    let mut doc = document();
+    assert!(pane.confirm(&doc, OverlayAction::Upload).is_err());
+    pane.options_mut().set_format(ExportFormat::Jpeg).unwrap();
+    pane.options_mut().set_resize(Resize::Percent(50)).unwrap();
+    drive_finish(&mut pane, &doc);
+    let prepared = pane.ready(&doc).unwrap().clone();
+    assert_eq!(prepared.dimensions(), (20, 10));
+    for action in [
+        OverlayAction::Upload,
+        OverlayAction::Copy,
+        OverlayAction::Save,
+        OverlayAction::Pin,
+    ] {
+        let finish = pane.confirm(&doc, action).unwrap();
+        assert_eq!(finish.action, action);
+        assert!(Arc::ptr_eq(finish.prepared.encoded(), prepared.encoded()));
+        assert!(Arc::ptr_eq(finish.prepared.pixels(), prepared.pixels()));
+        assert_eq!(finish.screen_location, None);
+    }
+    assert!(pane.confirm(&doc, OverlayAction::Continue).is_err());
+    pane.options_mut().set_quality(35).unwrap();
+    assert!(pane.confirm(&doc, OverlayAction::Copy).is_err());
+    drive_finish(&mut pane, &doc);
+    assert!(pane.confirm(&doc, OverlayAction::Copy).is_ok());
+    doc.apply(EditorCommand::Crop(None)).unwrap();
+    assert!(pane.confirm(&doc, OverlayAction::Pin).is_err());
+}
+
+#[test]
+fn finish_control_error_keeps_previous_output_and_document() {
+    use vectrcap::ui::{capture_overlay::OverlayAction, image_export::ImageExportPane};
+    let doc = document();
+    let mut pane = ImageExportPane::default();
+    drive_finish(&mut pane, &doc);
+    let previous = pane.ready(&doc).unwrap().encoded().clone();
+    pane.options_mut().set_resize(Resize::Width(100)).unwrap();
+    drive_finish(&mut pane, &doc);
+    assert!(pane.error().is_some());
+    assert!(pane.ready(&doc).is_none());
+    assert!(Arc::ptr_eq(&previous, pane.previous().unwrap().encoded()));
+    assert_eq!(doc.revision(), 0);
+    assert!(pane.confirm(&doc, OverlayAction::Save).is_err());
+    pane.options_mut().set_resize(Resize::Original).unwrap();
+    drive_finish(&mut pane, &doc);
+    assert!(pane.ready(&doc).is_some());
+    let ctx = eframe::egui::Context::default();
+    for scale in [1.0, 2.0] {
+        ctx.set_zoom_factor(scale);
+        let mut emitted = None;
+        let mut output = ctx.run_ui(
+            eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(600.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                emitted = pane.draw(ui, &doc);
+            },
+        );
+        output.textures_delta.clear();
+        assert!(
+            emitted.is_none(),
+            "rendering controls cannot finalize a capture"
+        );
+    }
+}
+
+#[test]
+fn replacing_options_at_equal_revision_prepares_the_new_format() {
+    use vectrcap::ui::image_export::ImageExportPane;
+    let doc = document();
+    let mut pane = ImageExportPane::default();
+    drive_finish(&mut pane, &doc);
+    *pane.options_mut() =
+        ImageExportOptions::new(ExportFormat::Jpeg, 35, Resize::Percent(50)).unwrap();
+    drive_finish(&mut pane, &doc);
+    let prepared = pane
+        .ready(&doc)
+        .expect("replacement options must produce a new preview even at revision zero");
+    assert_eq!(prepared.mime(), "image/jpeg");
+    assert_eq!(prepared.dimensions(), (20, 10));
+}
+
+#[test]
+fn review_window_preserves_pixels_and_has_no_implicit_finish() {
+    use vectrcap::{app::error::AppError, ui::image_review::ImageReview};
+    let source = document().source().clone();
+    let mut review = ImageReview::from_image(source.clone()).unwrap();
+    assert!(
+        review
+            .apply(EditorCommand::Crop(Some(
+                PhysicalRect::new(100, 100, 10, 10).unwrap()
+            )))
+            .is_err()
+    );
+    assert_eq!(review.document().revision(), 0);
+    review.finish_failed(AppError::Persistence("archive write failed"));
+    let ctx = eframe::egui::Context::default();
+    let mut event = None;
+    let mut output = ctx.run_ui(Default::default(), |_| {
+        event = review.show(&ctx);
+    });
+    output.textures_delta.clear();
+    assert!(event.is_none());
+    assert!(Arc::ptr_eq(review.document().source(), &source));
+    assert_eq!(review.document().screen_location(), None);
+}
 #[test]
 fn png_original_is_default() {
     let d = document();

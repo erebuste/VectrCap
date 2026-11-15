@@ -1,4 +1,4 @@
-//! Editor tool identities and the shared floating toolbar.
+//! Editor tool identities and saved-action mapping.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnnotationTool {
     #[default]
