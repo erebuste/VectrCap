@@ -309,6 +309,12 @@ pub struct StartupPreference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default)]
+    pub region: crate::capture::preferences::RegionCapturePreferences,
+    #[serde(default)]
+    pub screenshot: crate::capture::request::ScreenshotPreferences,
+    #[serde(default)]
+    pub last_region: Option<crate::capture::last_region::LastRegion>,
     pub version: u32,
     /// Local optimistic-concurrency version, never a secret or export identity.
     #[serde(default)]
@@ -337,6 +343,9 @@ fn notifications_default_enabled() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            region: crate::capture::preferences::RegionCapturePreferences::default(),
+            screenshot: crate::capture::request::ScreenshotPreferences::default(),
+            last_region: None,
             version: SETTINGS_VERSION,
             revision: 0,
             notifications_enabled: true,
@@ -353,6 +362,15 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn capture_request(
+        &self,
+        mode: crate::capture::request::CaptureMode,
+    ) -> Result<crate::capture::request::CaptureRequest, AppError> {
+        self.validate()?;
+        let mut request = self.screenshot.request(mode, self.region.clone())?;
+        request.last_region = self.last_region.clone();
+        Ok(request)
+    }
     pub fn validate(&self) -> Result<(), AppError> {
         if self.version != SETTINGS_VERSION {
             return Err(AppError::InvalidInput("unsupported settings version"));
@@ -361,6 +379,11 @@ impl Settings {
         self.archive.validate()?;
         self.filename.validate()?;
         self.recording.validate()?;
+        self.region.validate()?;
+        self.screenshot.validate()?;
+        if let Some(region) = &self.last_region {
+            region.validate()?;
+        }
         self.shortcuts.validate()?;
         if self.shortcuts.bindings.iter().any(|binding| matches!(binding.destination, crate::app::destinations::DestinationSelection::Specific(id) if self.destinations.get(id).is_none())) {
             return Err(AppError::InvalidInput("shortcut references an unknown destination"));

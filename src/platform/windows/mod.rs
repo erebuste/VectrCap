@@ -8,4 +8,8 @@ pub mod shell_actions;
 pub mod startup;
 pub mod tray;
 
+pub mod capture;
+pub mod monitors;
 pub mod poster;
+#[allow(clippy::module_inception)] // Task 5's specified native window adapter path.
+pub mod windows;
