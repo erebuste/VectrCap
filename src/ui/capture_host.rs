@@ -106,6 +106,7 @@ impl CaptureHost {
                                     save_path: None,
                                 })
                             }
+                            Some(CaptureOverlayEvent::RecordingSelected(_)) => {},
                             None => {}
                         }
                         if command.is_some() || save.is_some() {

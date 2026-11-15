@@ -1,6 +1,7 @@
 //! Single owner for workflow/job acceptance and settings/credential transactions.
 //! There is no await point between reference inspection and durable commit.
 mod capture;
+mod recording;
 use super::{
     destination_manager::{
         DestinationEdit, DestinationManager, DestinationReferences, DestinationRepository,
@@ -27,6 +28,7 @@ use crate::{
     },
 };
 pub use capture::CaptureSurface;
+pub use recording::{RecordingSelection, RecordingView};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -157,6 +159,8 @@ struct FileBatch {
 }
 pub struct AppController {
     capture: Option<capture::CaptureWorkflow>,
+    recording: Option<recording::RecordingWorkflow>,
+    recording_origin: std::time::Instant,
     pins: crate::pin::PinManager,
     pin_load: Option<Uuid>,
     batch_jobs: Vec<super::types::JobId>,
@@ -209,6 +213,8 @@ impl AppController {
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
             capture: None,
+            recording: None,
+            recording_origin: std::time::Instant::now(),
             pins: crate::pin::PinManager::default(),
             pin_load: None,
             manager,
@@ -862,6 +868,70 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::StartAudioTest(options) => {
+                options.validate()?;
+                if self
+                    .recording
+                    .as_ref()
+                    .is_some_and(|w| w.session.acquiring())
+                {
+                    return Err(AppError::InUse(
+                        "audio tests are unavailable during recording",
+                    ));
+                }
+                vec![AppEffect::StartAudioTest(options)]
+            }
+            AppCommand::StopAudioTest => vec![AppEffect::StopAudioTest],
+            AppCommand::RefreshAudioEndpoints => vec![AppEffect::RefreshAudioEndpoints],
+            AppCommand::CloseRecordingReview => self.close_recording_review()?,
+            AppCommand::OpenRecordingPlayer => {
+                if let Some(view) = self.recording_view()
+                    && view.mp4
+                    && let Some(path) = view.playback_path
+                {
+                    self.shell.open_document(&path, "mp4")?;
+                }
+                vec![]
+            }
+            AppCommand::ToggleRecordingFor { mp4, selection } => {
+                self.toggle_recording(mp4, selection)?
+            }
+            AppCommand::ToggleRecording { mp4 } => {
+                self.toggle_recording(mp4, DestinationSelection::Inherit)?
+            }
+            AppCommand::Recording(input) => self.recording_input(input)?,
+            AppCommand::RecordingSelectionClosed(id) => {
+                self.recording_selection_closed(id);
+                vec![]
+            }
+            AppCommand::RecordingSelection { session, rect } => {
+                match self.select_recording(session, rect) {
+                    Ok(e) => e,
+                    Err(error) => {
+                        if let Some(w) = &self.recording
+                            && let Some(surface) = &w.selection
+                            && let Ok(mut s) = surface.lock()
+                        {
+                            s.overlay.finish_failed(error.clone());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            AppCommand::RetryRecordingArchive { continue_without } => {
+                self.retry_recording_archive(continue_without)?
+            }
+            AppCommand::SetRecordingPreferences {
+                preferences,
+                limits,
+                revision,
+            } => {
+                self.manager.ensure_revision(revision)?;
+                self.manager
+                    .set_recording_preferences(preferences, limits)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
+
             AppCommand::StartCapture { mode, selection } => self.start_capture(mode, selection)?,
             AppCommand::FinishCapture {
                 session,
@@ -954,13 +1024,18 @@ impl AppController {
                 let mut effects = vec![AppEffect::Window(self.window)];
                 if window != Window::Settings {
                     effects.push(AppEffect::CancelConnectionTest);
+                    effects.push(AppEffect::StopAudioTest);
                 }
                 effects
             }
             AppCommand::CloseWindow => {
                 self.shortcut_entry_active = None;
                 self.window = None;
-                vec![AppEffect::Window(None), AppEffect::CancelConnectionTest]
+                vec![
+                    AppEffect::Window(None),
+                    AppEffect::CancelConnectionTest,
+                    AppEffect::StopAudioTest,
+                ]
             }
             AppCommand::ApplyDestinations { edit, revision } => {
                 self.manager.apply(edit, revision)?;
@@ -1207,6 +1282,15 @@ impl AppController {
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
             AppCommand::Quit => {
+                if self
+                    .recording
+                    .as_ref()
+                    .is_some_and(|w| w.session.acquiring())
+                {
+                    return self.quit_recording();
+                }
+                self.quit_recording()?;
+
                 let mut capture_effects = if let Some(capture) = &self.capture {
                     self.cancel_capture(capture.id)
                 } else {
@@ -1224,6 +1308,7 @@ impl AppController {
                 // command but `Quit` itself reaches `apply` once Draining
                 // starts (checked in `dispatch`), so nothing new can be
                 // accepted into `workflows` from here on regardless.
+                capture_effects.push(AppEffect::StopAudioTest);
                 capture_effects.push(AppEffect::DrainWorker);
                 capture_effects
             }
@@ -1231,6 +1316,17 @@ impl AppController {
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::RecordingAcquired { session, result } => {
+                self.recording_acquired(session, result)
+            }
+            AppEvent::RecordingWorker { session, input } => {
+                if self.recording.as_ref().is_some_and(|w| w.id == session) {
+                    self.recording_input(input)
+                        .unwrap_or_else(|e| vec![AppEffect::Error(e)])
+                } else {
+                    vec![]
+                }
+            }
             AppEvent::PinWorkAreas { result } => {
                 if self.lifecycle != Lifecycle::Running || self.pins.snapshots().is_empty() {
                     return vec![];

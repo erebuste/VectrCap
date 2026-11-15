@@ -11,6 +11,7 @@ fn record(root: &std::path::Path, width: u32) -> HistoryRecord {
     let store = ArtifactStore::new(root.join("spool")).unwrap();
     let artifact = store.stage_file(&path, ArtifactKind::Screenshot).unwrap();
     HistoryRecord {
+        recording: None,
         id: uuid::Uuid::new_v4(),
         name: "fixture.png".into(),
         kind: "screenshot".into(),

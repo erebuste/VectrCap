@@ -41,7 +41,12 @@ impl AppController {
         mode: CaptureMode,
         selection: DestinationSelection,
     ) -> Result<Vec<AppEffect>, AppError> {
-        if self.capture.is_some() {
+        if self.capture.is_some()
+            || self
+                .recording
+                .as_ref()
+                .is_some_and(|w| w.session.acquiring())
+        {
             return Err(AppError::InUse("a capture session is already active"));
         }
         self.manager.ensure_not_corrupted()?;
@@ -66,6 +71,7 @@ impl AppController {
             .collect();
         effects.extend([
             AppEffect::Window(None),
+            AppEffect::StopAudioTest,
             AppEffect::CancelConnectionTest,
             AppEffect::AcquireCapture {
                 session: id,

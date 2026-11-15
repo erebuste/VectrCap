@@ -14,6 +14,9 @@ use eframe::egui::{self, Ui};
 use uuid::Uuid;
 #[derive(Default)]
 pub struct SettingsPane {
+    recorder: Option<super::recording_settings::RecordingSettingsPane>,
+    audio_endpoints: Vec<super::audio_sources::AudioEndpoint>,
+    audio_meter: Option<Result<f32, AppError>>,
     region: Option<super::region_settings::RegionSettingsPane>,
     draft: Option<ConnectionDraft>,
     saving: Option<Uuid>,
@@ -46,6 +49,7 @@ impl SettingsPane {
     /// runs every frame regardless of which window is active, so switching
     /// tabs mid-save must not cause the eventual save_result to be dropped.
     pub fn clear(&mut self, ctx: &egui::Context) {
+        self.recorder = None;
         self.region = None;
         self.draft = None;
         self.remove = None;
@@ -55,6 +59,8 @@ impl SettingsPane {
         egui::text_edit::TextEditState::default().store(ctx, egui::Id::unique("connection-token"));
     }
     pub fn reconcile(&mut self, view: &DesktopView, ctx: &egui::Context) {
+        self.audio_endpoints = view.audio_endpoints.clone();
+        self.audio_meter = view.audio_meter.clone();
         if let Some((request, result)) = &view.connection
             && let Some(draft) = &mut self.draft
             && let Some(settings) = &view.settings
@@ -83,6 +89,25 @@ impl SettingsPane {
         recorded_shortcut: Option<(Uuid, crate::app::shortcuts::KeyChord)>,
     ) -> Vec<AppCommand> {
         let mut commands = vec![];
+        let mut recording_open = false;
+        ui.collapsing("Recording", |ui| {
+            recording_open = true;
+            let pane = self.recorder.get_or_insert_with(|| {
+                super::recording_settings::RecordingSettingsPane::new(settings)
+            });
+            commands.extend(pane.draw(
+                ui,
+                settings,
+                &self.audio_endpoints,
+                self.audio_meter.as_ref(),
+            ));
+        });
+        if !recording_open
+            && let Some(pane) = &mut self.recorder
+            && let Some(command) = pane.stop_test()
+        {
+            commands.push(command);
+        }
         ui.collapsing("Region capture", |ui| {
             let pane = self
                 .region

@@ -27,6 +27,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct DesktopView {
+    pub recording: Option<super::controller::RecordingView>,
+    pub audio_test_stop: u64,
+    pub audio_meter: Option<Result<f32, AppError>>,
+    pub audio_endpoints: Vec<crate::ui::audio_sources::AudioEndpoint>,
     pub capture_acquiring: Option<uuid::Uuid>,
     pub capture_surface: Option<Arc<Mutex<super::controller::CaptureSurface>>>,
     pub pins: Vec<crate::pin::PinSnapshot>,
@@ -68,6 +72,10 @@ pub struct DesktopView {
 impl Default for DesktopView {
     fn default() -> Self {
         Self {
+            recording: None,
+            audio_test_stop: 0,
+            audio_meter: None,
+            audio_endpoints: vec![],
             capture_acquiring: None,
             capture_surface: None,
             pins: vec![],
@@ -214,6 +222,17 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    recording_selections: tokio::task::JoinSet<(
+        uuid::Uuid,
+        Result<crate::capture::request::CaptureSnapshot, AppError>,
+    )>,
+    recording_cancel: Option<CancellationToken>,
+    recorder: Option<crate::recording::runtime::RecordingRuntime>,
+    recording_events: tokio::sync::mpsc::Sender<crate::recording::runtime::RuntimeMessage>,
+    recording_origin: std::time::Instant,
+    audio_test: Option<crate::ui::audio_sources::MeterService>,
+    audio_endpoints:
+        tokio::task::JoinSet<Result<Vec<crate::ui::audio_sources::AudioEndpoint>, AppError>>,
     pin_areas: tokio::task::JoinSet<Result<crate::pin::source::PinWorkAreas, AppError>>,
     pin_loads: tokio::task::JoinSet<(uuid::Uuid, Result<crate::pin::source::LoadedPin, AppError>)>,
     captures: tokio::task::JoinSet<(
@@ -238,6 +257,78 @@ impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::StartAudioTest(options) => {
+                    if let Some(m) = self.audio_test.take() {
+                        let _ = tokio::task::spawn_blocking(move || m.stop()).await;
+                    }
+                    match crate::ui::audio_sources::MeterService::start(options) {
+                        Ok(m) => self.audio_test = Some(m),
+                        Err(e) => self.state.audio_meter = Some(Err(e)),
+                    }
+                }
+                AppEffect::RefreshAudioEndpoints => {
+                    if self.audio_endpoints.is_empty() {
+                        self.audio_endpoints
+                            .spawn_blocking(crate::recording::audio::wasapi::enumerate_endpoints);
+                    }
+                }
+                AppEffect::StopAudioTest => {
+                    self.state.audio_test_stop = self.state.audio_test_stop.wrapping_add(1);
+                    if let Some(m) = self.audio_test.take() {
+                        let _ = tokio::task::spawn_blocking(move || m.stop()).await;
+                    }
+                    self.state.audio_meter = None;
+                }
+                AppEffect::AcquireRecording { session, request } => {
+                    let cancel = CancellationToken::new();
+                    self.recording_cancel = Some(cancel.clone());
+                    self.recording_selections.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::platform::windows::capture::acquire_screenshot(request, cancel)
+                        })
+                        .await
+                        .unwrap_or(Err(AppError::Capture("recording selection worker failed")));
+                        (session, result)
+                    });
+                }
+                AppEffect::CancelRecordingAcquisition => {
+                    if let Some(c) = self.recording_cancel.take() {
+                        c.cancel();
+                    }
+                }
+                AppEffect::StartRecordingWorker {
+                    session,
+                    options,
+                    sources,
+                } => {
+                    match crate::recording::runtime::RecordingRuntime::start(
+                        session,
+                        options,
+                        sources,
+                        self.recording_events.clone(),
+                        self.recording_origin,
+                    ) {
+                        Ok(r) => self.recorder = Some(r),
+                        Err(e) => {
+                            let _ = self.recording_events.try_send(
+                                crate::recording::runtime::RuntimeMessage {
+                                    session,
+                                    input: crate::recording::session::RecordingInput::Finalized(
+                                        Err(e),
+                                    ),
+                                },
+                            );
+                        }
+                    }
+                }
+                AppEffect::RecordingControl(control) => {
+                    if let Some(r) = &self.recorder
+                        && let Err(e) = r.control(control)
+                    {
+                        self.state.error = Some(e);
+                    }
+                }
+
                 AppEffect::RefreshPinWorkAreas => {
                     if self.pin_areas.is_empty() {
                         self.pin_areas
@@ -541,7 +632,17 @@ async fn serve(
     let uploader = Arc::new(Uploader::new(history.clone(), artifacts.clone(), factory));
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
+    let (recording_events, mut recording_rx) = tokio::sync::mpsc::channel(32);
+    let mut recording_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    recording_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut effects = Effects {
+        recording_selections: tokio::task::JoinSet::new(),
+        recording_cancel: None,
+        recorder: None,
+        recording_events,
+        recording_origin: controller.recording_origin(),
+        audio_test: None,
+        audio_endpoints: tokio::task::JoinSet::new(),
         pin_areas: tokio::task::JoinSet::new(),
         pin_loads: tokio::task::JoinSet::new(),
         captures: tokio::task::JoinSet::new(),
@@ -571,6 +672,13 @@ async fn serve(
     let mut driver_consumed = false;
     let outcome = loop {
         let results = tokio::select! {
+            _=recording_tick.tick(), if controller.recording_view().is_some() || effects.audio_test.is_some() => controller.dispatch(AppCommand::Recording(crate::recording::session::RecordingInput::Tick(controller.recording_origin().elapsed()))),
+            Some(message)=recording_rx.recv()=>{if matches!(message.input,crate::recording::session::RecordingInput::Finalized(_)){effects.recorder=None;}controller.on_event(AppEvent::RecordingWorker{session:message.session,input:message.input})},
+            result=effects.audio_endpoints.join_next(), if !effects.audio_endpoints.is_empty()=>{match result{Some(Ok(Ok(e)))=>effects.state.audio_endpoints=e,Some(Ok(Err(e)))=>effects.state.error=Some(e),_=>effects.state.error=Some(AppError::Capture("audio endpoint query failed"))}vec![]},
+            result=effects.recording_selections.join_next(), if !effects.recording_selections.is_empty()=>{
+                match result{Some(Ok((session,result)))=>controller.on_event(AppEvent::RecordingAcquired{session,result}),_=>controller.dispatch(AppCommand::Recording(crate::recording::session::RecordingInput::Failed(AppError::Capture("recording selection worker failed"))))}
+            }
+
             result = effects.pin_areas.join_next(), if !effects.pin_areas.is_empty() => {
                 controller.on_event(AppEvent::PinWorkAreas { result: result.and_then(Result::ok).unwrap_or(Err(AppError::Capture("pin monitor worker failed"))) })
             }
@@ -638,6 +746,10 @@ async fn serve(
                 }
             }
         };
+        if let Some(m) = &effects.audio_test {
+            effects.state.audio_meter = m.status.lock().ok().map(|s| s.clone());
+        }
+        effects.state.recording = controller.recording_view();
         effects.state.accepted_workflows = controller.active_workflow_count();
         effects.state.batch_summary = match controller.batch_summary() {
             Ok(rows) => rows,
@@ -662,6 +774,16 @@ async fn serve(
     };
     // Even a snapshot/read failure must close and drain, not detach the driver
     // and let runtime teardown abort a request with an unrecorded outcome.
+    if let Some(m) = effects.audio_test.take() {
+        let _ = tokio::task::spawn_blocking(move || m.stop()).await;
+    }
+    if let Some(c) = effects.recording_cancel.take() {
+        c.cancel();
+    }
+    if let Some(r) = effects.recorder.take() {
+        let _ = tokio::task::spawn_blocking(move || r.join()).await;
+    }
+    while effects.recording_selections.join_next().await.is_some() {}
     effects.local_cancel.cancel();
     if let Some(cancel) = effects.capture_cancel.take() {
         cancel.cancel();

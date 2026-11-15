@@ -93,6 +93,34 @@ impl PhysicalAudio {
             frames: 0,
         })
     }
+    pub fn open_resolved(
+        options: &AudioOptions,
+        sources: &[crate::recording::session::ResolvedSource],
+    ) -> Result<Self, AppError> {
+        let expected = open_selected(Some(options), |kind, endpoint| {
+            let source = sources
+                .iter()
+                .find(|s| s.kind == kind)
+                .ok_or(AppError::Capture("audio source snapshot missing"))?;
+            if !matches!(endpoint,crate::recording::options::EndpointSelection::Id(id) if id==&source.id)
+            {
+                return Err(AppError::Capture("audio source snapshot mismatch"));
+            }
+            Ok((
+                kind,
+                AudioSourceHandle::start_resolved(source)?,
+                AlignedSource::new(0),
+            ))
+        })?;
+        if expected.len() != sources.len() {
+            return Err(AppError::Capture("unexpected audio source snapshot"));
+        }
+        Ok(Self {
+            sources: expected,
+            options: options.clone(),
+            frames: 0,
+        })
+    }
     pub fn resume(&mut self) -> Result<(), AppError> {
         for (_, s, b) in &mut self.sources {
             b.clear_at(self.frames);
@@ -117,7 +145,7 @@ impl PhysicalAudio {
                 let mapped = state
                     .lock()
                     .map_err(|_| AppError::Capture("capture state poisoned"))?
-                    .map_qpc(block.qpc);
+                    .map_audio_qpc(block.qpc);
                 if let Some(t) = mapped {
                     let at = (t.as_nanos() * 48000 / 1_000_000_000) as u64;
                     aligned.push(at, &block.stereo)?;

@@ -144,11 +144,14 @@ pub enum OverlayInput {
     Finish(OverlayAction),
 }
 pub enum CaptureOverlayEvent {
+    RecordingSelected(PhysicalRect),
     Finish(super::image_export::ImageFinish),
     Cancel,
 }
 
 pub struct CaptureOverlay {
+    recording_selection: bool,
+    recording_summary: String,
     tool: AnnotationTool,
     last_drawing_tool: AnnotationTool,
     document: EditorDocument,
@@ -177,6 +180,8 @@ pub struct CaptureOverlay {
 impl CaptureOverlay {
     pub fn new(document: EditorDocument) -> Self {
         Self {
+            recording_selection: false,
+            recording_summary: String::new(),
             tool: Default::default(),
             last_drawing_tool: AnnotationTool::Freehand,
             document,
@@ -216,6 +221,13 @@ impl CaptureOverlay {
         overlay.preferences = preferences;
         overlay.pointer = Some(pointer);
         Ok(overlay)
+    }
+    pub fn set_recording_summary(&mut self, summary: String) {
+        self.recording_summary = summary;
+    }
+    pub fn set_recording_selection(&mut self) {
+        self.recording_selection = true;
+        self.tool = AnnotationTool::Region;
     }
     pub fn document(&self) -> &EditorDocument {
         &self.document
@@ -274,6 +286,11 @@ impl CaptureOverlay {
     }
     pub fn set_tool(&mut self, tool: AnnotationTool) -> Result<(), AppError> {
         self.editable()?;
+        if self.recording_selection && tool != AnnotationTool::Region {
+            return Err(AppError::InvalidInput(
+                "recording selection only supports the region tool",
+            ));
+        }
         if self.has_active_edit() {
             return Err(AppError::InUse("complete or cancel the active edit first"));
         }

@@ -38,6 +38,12 @@ impl FrameQueue {
         }
         self.frames.push_back(frame);
     }
+    pub fn pop_before(&mut self, cutoff: Option<Duration>) -> Option<CapturedFrame> {
+        if cutoff.is_some_and(|t| self.frames.front().is_some_and(|f| f.timestamp >= t)) {
+            return None;
+        }
+        self.frames.pop_front()
+    }
     pub fn pop(&mut self) -> Option<CapturedFrame> {
         self.frames.pop_front()
     }
@@ -87,6 +93,9 @@ impl RecordingHandle {
             Err(_) => Err(AppError::InUse("recording control queue is full or closed")),
         }
     }
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
     pub fn finish(mut self) -> Result<EncodedRecording, AppError> {
         self.thread
             .take()
@@ -118,7 +127,7 @@ impl RecordingWorker {
         cancel: CancellationToken,
         events: mpsc::SyncSender<RecordingEvent>,
     ) -> Result<RecordingHandle, AppError> {
-        Self::launch(options, cancel, events, None)
+        Self::launch(options, cancel, events, None, None)
     }
     /// Uses an exact-title, same-process generated window. Synthetic audio never opens devices.
     pub fn start_probe(
@@ -127,13 +136,22 @@ impl RecordingWorker {
         events: mpsc::SyncSender<RecordingEvent>,
         probe: ProbeSettings,
     ) -> Result<RecordingHandle, AppError> {
-        Self::launch(options, cancel, events, Some(probe))
+        Self::launch(options, cancel, events, Some(probe), None)
+    }
+    pub fn start_resolved(
+        options: RecordingOptions,
+        cancel: CancellationToken,
+        events: mpsc::SyncSender<RecordingEvent>,
+        sources: Vec<super::session::ResolvedSource>,
+    ) -> Result<RecordingHandle, AppError> {
+        Self::launch(options, cancel, events, None, Some(sources))
     }
     fn launch(
         options: RecordingOptions,
         cancel: CancellationToken,
         events: mpsc::SyncSender<RecordingEvent>,
         probe: Option<ProbeSettings>,
+        sources: Option<Vec<super::session::ResolvedSource>>,
     ) -> Result<RecordingHandle, AppError> {
         options.validate()?;
         if probe.as_ref().is_some_and(|p| !p.synthetic_audio) && options.audio().is_some() {
@@ -166,7 +184,7 @@ impl RecordingWorker {
                         return Err(e);
                     }
                 };
-                run(options, token, events, rx, probe, encoder)
+                run(options, token, events, rx, probe, sources, encoder)
             })
             .map_err(|e| AppError::io("starting recording owner thread", &e))?;
         let mut handle = RecordingHandle {
@@ -197,6 +215,7 @@ fn run(
     events: mpsc::SyncSender<RecordingEvent>,
     controls: mpsc::Receiver<RecordingControl>,
     probe: Option<ProbeSettings>,
+    sources: Option<Vec<super::session::ResolvedSource>>,
     mut encoder: Box<dyn RecordingEncoder>,
 ) -> Result<EncodedRecording, AppError> {
     let countdown = Instant::now();
@@ -215,13 +234,23 @@ fn run(
     if cancel.is_cancelled() {
         return Err(AppError::Cancelled);
     }
-    // Native audio startup is gated below until the capture/mixer integration is proven.
-    // This is an explicit error, never a silent audio-Off substitution.
-    if options.audio().is_some() && probe.is_none() {
-        return Err(AppError::Capture(
-            "physical audio timeline integration is not yet qualified; choose Off or run an explicit device proof",
-        ));
+    // Open exactly the selected sources. WASAPI binds Default once and verifies
+    // its identity throughout the session; no fallback or source substitution.
+    let mut physical_audio = if probe.is_none() {
+        options
+            .audio()
+            .map(|o| match &sources {
+                Some(s) => audio::timeline::PhysicalAudio::open_resolved(o, s),
+                None => audio::timeline::PhysicalAudio::open(o),
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if let Some(audio) = &mut physical_audio {
+        audio.resume()?;
     }
+    crate::persistence::ensure_free_space(&std::env::temp_dir(), 16 * 1024 * 1024)?;
     let mut capture = if let Some(p) = &probe {
         NativeCapture::generated_window(&p.window_title, options.clone())?
     } else {
@@ -233,9 +262,14 @@ fn run(
     let mut last_video = None;
     let mut interruption = None;
     let limit = Duration::from_secs(u64::from(options.active_limit_seconds()));
-    let end = loop {
+    let mut space_check = Instant::now();
+    let mut end = loop {
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
+        }
+        if space_check.elapsed() >= Duration::from_secs(1) {
+            crate::persistence::ensure_free_space(&std::env::temp_dir(), 16 * 1024 * 1024)?;
+            space_check = Instant::now();
         }
         if let Err(e) = capture.check() {
             interruption = Some(e);
@@ -258,26 +292,50 @@ fn run(
                         .map_err(|_| AppError::Capture("capture state poisoned"))?
                         .pause(qpc_now()?)?
                         .min(limit);
-                    drain_video(&capture, &mut *encoder, &mut last_video, Duration::ZERO)?;
-                    feed_synthetic(&mut *encoder, options.audio(), &mut audio_frames, t)?;
+                    if let Some(audio) = &mut physical_audio {
+                        if let Err(e) = audio.pause() {
+                            interruption = Some(e);
+                            requested_stop = true;
+                        }
+                        if let Err(e) = audio.pump(&capture.state, &mut *encoder, t) {
+                            interruption = Some(e);
+                            requested_stop = true;
+                        }
+                    }
+                    drain_video(
+                        &capture,
+                        &mut *encoder,
+                        &mut last_video,
+                        Duration::ZERO,
+                        Some(physical_audio.as_ref().map_or(t, |a| a.end_time().min(t))),
+                    )?;
+                    if probe.is_some() {
+                        feed_synthetic(&mut *encoder, options.audio(), &mut audio_frames, t)?;
+                    }
                     event(&events, RecordingEvent::Paused(t))?;
                 }
                 RecordingControl::Resume => {
+                    let paused = capture
+                        .state
+                        .lock()
+                        .map_err(|_| AppError::Capture("capture state poisoned"))?
+                        .is_paused();
                     let t = capture
                         .state
                         .lock()
                         .map_err(|_| AppError::Capture("capture state poisoned"))?
                         .resume(qpc_now()?)?;
+                    if paused
+                        && let Some(audio) = &mut physical_audio
+                        && let Err(e) = audio.resume()
+                    {
+                        interruption = Some(e);
+                        requested_stop = true;
+                    }
                     event(&events, RecordingEvent::Resumed(t))?;
                 }
             }
         }
-        drain_video(
-            &capture,
-            &mut *encoder,
-            &mut last_video,
-            probe.as_ref().map_or(Duration::ZERO, |p| p.encoder_delay),
-        )?;
         let (t, has_origin) = {
             let mut state = capture
                 .state
@@ -297,7 +355,25 @@ fn run(
                 "no native frame arrived within five seconds",
             ));
         }
-        feed_synthetic(&mut *encoder, options.audio(), &mut audio_frames, t)?;
+        if let Some(audio) = &mut physical_audio {
+            if let Err(e) = audio.pump(&capture.state, &mut *encoder, t) {
+                interruption = Some(e);
+                requested_stop = true;
+            }
+        } else {
+            feed_synthetic(&mut *encoder, options.audio(), &mut audio_frames, t)?;
+        }
+        drain_video(
+            &capture,
+            &mut *encoder,
+            &mut last_video,
+            probe.as_ref().map_or(Duration::ZERO, |p| p.encoder_delay),
+            Some(
+                physical_audio
+                    .as_ref()
+                    .map_or(limit, |a| a.end_time().min(limit)),
+            ),
+        )?;
         if requested_stop || t >= limit {
             break t;
         }
@@ -308,14 +384,30 @@ fn run(
         .lock()
         .map_err(|_| AppError::Capture("capture state poisoned"))?
         .pause(qpc_now()?)?;
-    capture.stop()?;
-    drain_video(&capture, &mut *encoder, &mut last_video, Duration::ZERO)?;
+    if let Some(audio) = &mut physical_audio {
+        if let Err(e) = audio
+            .pause()
+            .and_then(|()| audio.pump(&capture.state, &mut *encoder, end))
+        {
+            interruption.get_or_insert(e);
+        }
+        end = end.min(audio.end_time());
+    }
+    if let Err(e) = capture.stop() {
+        interruption.get_or_insert(e);
+    }
+    drain_video(
+        &capture,
+        &mut *encoder,
+        &mut last_video,
+        Duration::ZERO,
+        Some(end),
+    )?;
     if cancel.is_cancelled() {
         return Err(AppError::Cancelled);
     }
     if let Some(e) = interruption {
         event(&events, RecordingEvent::Interrupted(e.clone()))?;
-        return Err(e);
     }
     event(&events, RecordingEvent::Finalizing)?;
     encoder.end_at(end)?;
@@ -330,6 +422,7 @@ fn drain_video(
     encoder: &mut dyn RecordingEncoder,
     last: &mut Option<Duration>,
     delay: Duration,
+    cutoff: Option<Duration>,
 ) -> Result<(), AppError> {
     // Drain only the initial bounded batch; a producer cannot keep this loop alive forever.
     for _ in 0..3 {
@@ -338,7 +431,7 @@ fn drain_video(
             .lock()
             .map_err(|_| AppError::Capture("capture state poisoned"))?
             .queue
-            .pop();
+            .pop_before(cutoff);
         let Some(mut frame) = frame else {
             break;
         };

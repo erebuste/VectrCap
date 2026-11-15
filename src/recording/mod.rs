@@ -1,4 +1,4 @@
-//! Native recording proof. No desktop UI action is wired to this module yet.
+//! Native recording, selected-area sessions and finalized-output ownership.
 pub mod audio;
 pub mod clock;
 pub mod frame;
@@ -91,3 +91,8 @@ impl OutputFile {
         })
     }
 }
+
+pub mod preferences;
+pub mod review;
+pub mod runtime;
+pub mod session;

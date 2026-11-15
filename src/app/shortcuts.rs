@@ -118,6 +118,7 @@ pub enum ShortcutAction {
     ToggleMp4Recording,
     StopRecording,
     PauseResumeRecording,
+    CancelRecording,
     UploadFromClipboard,
     PinSourceChooser,
     PinFromScreen,
@@ -157,6 +158,7 @@ impl ShortcutAction {
             ToggleMp4Recording,
             StopRecording,
             PauseResumeRecording,
+            CancelRecording,
             UploadFromClipboard,
             PinSourceChooser,
             PinFromScreen,
@@ -196,7 +198,12 @@ impl ShortcutAction {
         self.scope() == ShortcutScope::Editor
             || matches!(
                 self,
-                ShortcutAction::ShowHistory
+                ShortcutAction::ToggleGifRecording
+                    | ShortcutAction::ToggleMp4Recording
+                    | ShortcutAction::StopRecording
+                    | ShortcutAction::PauseResumeRecording
+                    | ShortcutAction::CancelRecording
+                    | ShortcutAction::ShowHistory
                     | ShortcutAction::ShowSettings
                     | ShortcutAction::UploadFile
                     | ShortcutAction::RegionScreenshot
@@ -226,6 +233,7 @@ impl ShortcutAction {
             ToggleMp4Recording => "Start/stop MP4 recording",
             StopRecording => "Stop current recording",
             PauseResumeRecording => "Pause/resume recording",
+            CancelRecording => "Cancel current recording",
             UploadFromClipboard => "Upload from clipboard",
             PinSourceChooser => "Pin source chooser",
             PinFromScreen => "Pin from screen",
@@ -473,6 +481,9 @@ pub enum ShortcutOutcome {
 
 fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
     use crate::app::events::{AppCommand, Window};
+    if let Some(command) = crate::recording::session::shortcut_command(action) {
+        return Some(ShortcutOutcome::Command(command));
+    }
     match action {
         ShortcutAction::PinSourceChooser
         | ShortcutAction::PinFromScreen
@@ -674,6 +685,18 @@ impl ShortcutManager {
         }
         let outcome = command_for(event.action)?;
         match outcome {
+            ShortcutOutcome::Command(crate::app::events::AppCommand::ToggleRecording { mp4 }) => {
+                Some(ShortcutOutcome::Command(
+                    crate::app::events::AppCommand::ToggleRecordingFor {
+                        mp4,
+                        selection: self
+                            .bindings
+                            .iter()
+                            .find(|b| b.action == event.action)?
+                            .destination,
+                    },
+                ))
+            }
             ShortcutOutcome::Command(crate::app::events::AppCommand::StartCapture {
                 mode, ..
             }) => Some(ShortcutOutcome::Command(

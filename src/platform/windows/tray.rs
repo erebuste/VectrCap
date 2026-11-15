@@ -41,6 +41,17 @@ impl Tray {
                 return;
             }
             let command = match event.id.as_ref() {
+                "record-gif" => Some(AppCommand::ToggleRecording { mp4: false }),
+                "record-mp4" => Some(AppCommand::ToggleRecording { mp4: true }),
+                "record-stop" => Some(AppCommand::Recording(
+                    crate::recording::session::RecordingInput::Stop,
+                )),
+                "record-pause" => Some(AppCommand::Recording(
+                    crate::recording::session::RecordingInput::PauseResume,
+                )),
+                "record-cancel" => Some(AppCommand::Recording(
+                    crate::recording::session::RecordingInput::Cancel,
+                )),
                 "pin" => Some(AppCommand::PinSource(
                     crate::pin::source::PinSource::Chooser,
                 )),
@@ -121,6 +132,16 @@ impl Tray {
                 ("capture-window", "Capture window under pointer"),
                 ("capture-fullscreen", "Capture fullscreen"),
                 ("capture-last", "Capture last region"),
+            ] {
+                menu.append(&MenuItem::with_id(id, label, true, None))
+                    .map_err(|_| error())?;
+            }
+            for (id, label) in [
+                ("record-gif", "Start / stop GIF recording"),
+                ("record-mp4", "Start / stop MP4 recording"),
+                ("record-stop", "Stop current recording"),
+                ("record-pause", "Pause / resume current recording"),
+                ("record-cancel", "Cancel current recording"),
             ] {
                 menu.append(&MenuItem::with_id(id, label, true, None))
                     .map_err(|_| error())?;

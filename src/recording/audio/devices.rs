@@ -25,3 +25,10 @@ pub fn open_selected<T>(
     }
     Ok(out)
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioEndpoint {
+    pub id: String,
+    pub name: String,
+    pub kind: crate::recording::audio::devices::SourceKind,
+}

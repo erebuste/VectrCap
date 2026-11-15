@@ -257,6 +257,25 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_recording_preferences(
+        &mut self,
+        preferences: crate::recording::preferences::RecordingPreferences,
+        limits: crate::persistence::settings::RecordingLimits,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        preferences.validate_limits(limits)?;
+        let mut candidate = self.settings.clone();
+        candidate.recording_options = preferences;
+        candidate.recording = limits;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     pub fn set_region_preferences(
         &mut self,
         preferences: crate::capture::preferences::RegionCapturePreferences,

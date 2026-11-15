@@ -13,3 +13,5 @@ pub mod monitors;
 pub mod poster;
 #[allow(clippy::module_inception)] // Task 5's specified native window adapter path.
 pub mod windows;
+
+pub mod recording_events;

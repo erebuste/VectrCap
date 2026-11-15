@@ -348,7 +348,8 @@ impl ImageReview {
                         super::capture_overlay::CaptureOverlayEvent::Finish(finish) => {
                             ImageReviewEvent::Finish(finish)
                         }
-                        super::capture_overlay::CaptureOverlayEvent::Cancel => {
+                        super::capture_overlay::CaptureOverlayEvent::RecordingSelected(_)
+                        | super::capture_overlay::CaptureOverlayEvent::Cancel => {
                             ImageReviewEvent::Cancel
                         }
                     });

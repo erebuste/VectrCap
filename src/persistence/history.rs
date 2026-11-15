@@ -355,11 +355,65 @@ impl History {
         conn.pragma_update(None, "synchronous", "FULL")?;
         migrate(&mut conn)?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS history_browse_order ON history_items(created_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS history_favorites_order ON history_items(favorite,created_ms DESC,id DESC); CREATE INDEX IF NOT EXISTS jobs_history_latest ON jobs(artifact_id,acceptance_ordinal DESC);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS recording_metadata (artifact_id TEXT PRIMARY KEY NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE, metadata TEXT NOT NULL) STRICT;")?;
         Ok(History {
             conn: Mutex::new(conn),
         })
     }
 
+    pub(crate) fn protect_manual_archive(&self, id: ArchiveEntryId) -> Result<(), AppError> {
+        let count = self.lock()?.execute(
+            "UPDATE archive_entries SET origin='manual' WHERE id=?1 AND removed_ms IS NULL",
+            [id.0.to_string()],
+        )?;
+        if count != 1 {
+            return Err(AppError::Persistence(
+                "saved archive is no longer available",
+            ));
+        }
+        Ok(())
+    }
+    pub fn record_recording(
+        &self,
+        artifact: &Artifact,
+        metadata: &crate::recording::review::RecordingMetadata,
+        created_ms: i64,
+    ) -> Result<(), AppError> {
+        metadata.validate()?;
+        if !matches!(artifact.kind, ArtifactKind::Gif | ArtifactKind::Mp4) {
+            return Err(AppError::InvalidInput(
+                "recording metadata requires a recording",
+            ));
+        }
+        let json = serde_json::to_string(metadata)
+            .map_err(|_| AppError::Persistence("encoding recording metadata"))?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_artifact(&tx, artifact, created_ms, false)?;
+        tx.execute("INSERT INTO recording_metadata(artifact_id,metadata) VALUES (?1,?2) ON CONFLICT(artifact_id) DO UPDATE SET metadata=excluded.metadata", params![artifact.id.0.to_string(),json])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn recording_metadata(
+        &self,
+        id: ArtifactId,
+    ) -> Result<Option<crate::recording::review::RecordingMetadata>, AppError> {
+        let json: Option<String> = self
+            .lock()?
+            .query_row(
+                "SELECT metadata FROM recording_metadata WHERE artifact_id=?1",
+                [id.0.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        json.map(|j| {
+            let m: crate::recording::review::RecordingMetadata = serde_json::from_str(&j)
+                .map_err(|_| AppError::Persistence("invalid recording metadata"))?;
+            m.validate()?;
+            Ok(m)
+        })
+        .transpose()
+    }
     /// Persists the artifact, its history item, and a pending job in one transaction.
     pub fn create_job(
         &self,

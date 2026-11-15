@@ -47,6 +47,32 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    StartAudioTest(crate::recording::options::AudioOptions),
+    StopAudioTest,
+    RefreshAudioEndpoints,
+    OpenRecordingPlayer,
+    CloseRecordingReview,
+    ToggleRecordingFor {
+        mp4: bool,
+        selection: DestinationSelection,
+    },
+    ToggleRecording {
+        mp4: bool,
+    },
+    RecordingSelectionClosed(Uuid),
+    RecordingSelection {
+        session: Uuid,
+        rect: crate::capture::geometry::PhysicalRect,
+    },
+    RetryRecordingArchive {
+        continue_without: bool,
+    },
+    SetRecordingPreferences {
+        preferences: crate::recording::preferences::RecordingPreferences,
+        limits: crate::persistence::settings::RecordingLimits,
+        revision: u64,
+    },
+    Recording(crate::recording::session::RecordingInput),
     StartCapture {
         mode: crate::capture::request::CaptureMode,
         selection: DestinationSelection,
@@ -195,6 +221,14 @@ impl From<QueueAction> for QueueCommand {
     }
 }
 pub enum AppEvent {
+    RecordingAcquired {
+        session: Uuid,
+        result: Result<crate::capture::request::CaptureSnapshot, AppError>,
+    },
+    RecordingWorker {
+        session: Uuid,
+        input: crate::recording::session::RecordingInput,
+    },
     PinWorkAreas {
         result: Result<crate::pin::source::PinWorkAreas, AppError>,
     },
@@ -223,6 +257,20 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    StartAudioTest(crate::recording::options::AudioOptions),
+    RefreshAudioEndpoints,
+    StopAudioTest,
+    AcquireRecording {
+        session: Uuid,
+        request: crate::capture::request::CaptureRequest,
+    },
+    CancelRecordingAcquisition,
+    StartRecordingWorker {
+        session: Uuid,
+        options: crate::recording::options::RecordingOptions,
+        sources: Vec<crate::recording::session::ResolvedSource>,
+    },
+    RecordingControl(crate::recording::worker::RecordingControl),
     RefreshPinWorkAreas,
     ArchiveMaintenance(super::image_finish::ArchiveMaintenance),
     AcquireCapture {

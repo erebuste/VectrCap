@@ -279,7 +279,8 @@ impl CaptureOverlay {
             self.handle(OverlayInput::Enter)?;
             return Ok(true);
         }
-        if let Some(chord) = native_chord(*key, *modifiers)
+        if !self.recording_selection
+            && let Some(chord) = native_chord(*key, *modifiers)
             && self.handle_chord(saved, chord, focus, false)?
         {
             return Ok(true);

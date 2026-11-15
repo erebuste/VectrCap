@@ -58,6 +58,7 @@ pub struct HistoryQuery {
 }
 #[derive(Clone)]
 pub struct HistoryRecord {
+    pub recording: Option<crate::recording::review::RecordingMetadata>,
     pub id: Uuid,
     pub name: String,
     pub kind: String,
@@ -192,7 +193,9 @@ impl History {
             .transpose()?
             .flatten();
         let retryable = job.as_ref().is_some_and(|j| matches!(&j.status,JobStatus::Failed{code} if matches!(code.as_str(),"transient"|"rate_limited"|"retry_exhausted")) && local_available_path(&j.artifact.path));
+        let recording = self.recording_metadata(artifact.id)?;
         Ok(Some(HistoryRecord {
+            recording,
             id,
             name,
             kind,

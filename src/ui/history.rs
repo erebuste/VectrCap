@@ -397,6 +397,9 @@ impl HistoryPane {
     fn inspector(&mut self, ui: &mut Ui, record: &HistoryRecord, commands: &mut Vec<AppCommand>) {
         ui.separator();
         ui.heading(&record.name);
+        if let Some(m) = &record.recording {
+            ui.label(super::recording_review::metadata_label(m));
+        }
         self.picture(ui, record, ui.available_width().min(640.0), 360.0);
         if let Some(date) = chrono::DateTime::from_timestamp_millis(record.created_ms) {
             ui.label(
@@ -665,6 +668,7 @@ mod tests {
             settings: Some(crate::persistence::settings::Settings::default()),
             history_page: HistoryPage {
                 records: vec![HistoryRecord {
+                    recording: None,
                     id,
                     name: artifact.display_name.clone(),
                     kind: "screenshot".into(),

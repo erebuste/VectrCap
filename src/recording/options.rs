@@ -2,8 +2,9 @@ use crate::{
     app::error::AppError,
     capture::geometry::{MonitorGeometry, PhysicalRect},
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputSize {
     Original,
     Fit1280x720,
@@ -24,25 +25,26 @@ impl OutputSize {
         ))
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Quality {
     Small,
     Balanced,
     High,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioMode {
     Off,
     System,
     Microphone,
     Both,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointSelection {
     Default,
     Id(String),
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AudioOptions {
     pub mode: AudioMode,
     pub system: EndpointSelection,
@@ -83,7 +85,8 @@ impl AudioOptions {
         Ok(())
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GifOptions {
     pub fps: u32,
 }
@@ -92,7 +95,8 @@ impl Default for GifOptions {
         Self { fps: 15 }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mp4Options {
     pub fps: u32,
     pub quality: Quality,
@@ -122,12 +126,13 @@ impl Mp4Options {
         })
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FormatOptions {
     Gif(GifOptions),
     Mp4(Mp4Options),
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordingOptions {
     pub monitor_id: String,
     pub rect: PhysicalRect,

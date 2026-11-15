@@ -20,3 +20,9 @@ pub mod batch_summary;
 pub mod history;
 
 pub mod history_previews;
+
+pub mod audio_sources;
+
+pub mod recording_overlay;
+pub mod recording_review;
+pub mod recording_settings;

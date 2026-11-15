@@ -135,6 +135,7 @@ fn main() -> eframe::Result {
             .stage_file(Path::new(&source), ArtifactKind::Mp4)
             .unwrap();
         let row = vectrcap::persistence::history::browser::HistoryRecord {
+            recording: None,
             id: uuid::Uuid::new_v4(),
             name: "poster.mp4".into(),
             kind: "mp4".into(),

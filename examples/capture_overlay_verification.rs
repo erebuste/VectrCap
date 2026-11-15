@@ -74,7 +74,7 @@ impl eframe::App for Probe {
                 );
                 self.overlay.finish_failed(AppError::InUse("verification probe received the prepared output; production output effects are not connected in this probe"));
             }
-            None => {}
+            Some(CaptureOverlayEvent::RecordingSelected(_)) | None => {}
         }
     }
     fn persist_egui_memory(&self) -> bool {

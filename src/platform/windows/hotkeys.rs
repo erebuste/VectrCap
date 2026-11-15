@@ -106,6 +106,16 @@ impl HotkeyBridge {
     ) -> Result<Self, AppError> {
         let client = Box::new(client);
         unsafe {
+            if windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
+                window,
+                windows_sys::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
+            ) == 0
+            {
+                return Err(AppError::Capture(
+                    "session interruption notifications unavailable",
+                ));
+            }
+
             if windows_sys::Win32::UI::Shell::SetWindowSubclass(
                 window,
                 Some(hotkey_message),
@@ -113,6 +123,9 @@ impl HotkeyBridge {
                 (&*client as *const crate::app::desktop::DesktopClient) as usize,
             ) == 0
             {
+                let _ = windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(
+                    window,
+                );
                 return Err(AppError::Persistence("hotkey event subscription failed"));
             }
         }
@@ -148,6 +161,14 @@ unsafe extern "system" fn hotkey_message(
     if message == UNREGISTER_MESSAGE {
         return unsafe { UnregisterHotKey(window, wparam as i32) } as isize;
     }
+    if let Some(reason) = super::recording_events::interruption_for_message(message, wparam) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let client = &*(data as *const crate::app::desktop::DesktopClient);
+            let _ = client.submit(crate::app::events::AppCommand::Recording(
+                crate::recording::session::RecordingInput::Interrupt(reason),
+            ));
+        }));
+    }
     if message == WM_HOTKEY {
         let id = wparam as i32;
         // No panic may cross the native callback boundary; reference lifetime
@@ -163,6 +184,9 @@ unsafe extern "system" fn hotkey_message(
 impl Drop for HotkeyBridge {
     fn drop(&mut self) {
         unsafe {
+            let _ = windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(
+                self.window,
+            );
             let removed = windows_sys::Win32::UI::Shell::RemoveWindowSubclass(
                 self.window,
                 Some(hotkey_message),

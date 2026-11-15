@@ -329,6 +329,8 @@ pub struct Settings {
     pub filename: FilenamePreset,
     pub recording: RecordingLimits,
     #[serde(default)]
+    pub recording_options: crate::recording::preferences::RecordingPreferences,
+    #[serde(default)]
     pub shortcuts: ShortcutSettings,
     #[serde(default)]
     pub appearance: AppearancePreferences,
@@ -354,6 +356,7 @@ impl Default for Settings {
             archive: ArchivePolicy::default(),
             filename: FilenamePreset::default(),
             recording: RecordingLimits::default(),
+            recording_options: Default::default(),
             shortcuts: ShortcutSettings::default(),
             appearance: AppearancePreferences::default(),
             startup: StartupPreference::default(),
@@ -379,6 +382,7 @@ impl Settings {
         self.archive.validate()?;
         self.filename.validate()?;
         self.recording.validate()?;
+        self.recording_options.validate_limits(self.recording)?;
         self.region.validate()?;
         self.screenshot.validate()?;
         if let Some(region) = &self.last_region {

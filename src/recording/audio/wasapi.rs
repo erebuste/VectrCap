@@ -44,6 +44,23 @@ pub struct AudioSourceHandle {
 }
 impl AudioSourceHandle {
     pub fn start(kind: SourceKind, endpoint: EndpointSelection) -> Result<Self, AppError> {
+        let was_default = matches!(endpoint, EndpointSelection::Default);
+        Self::start_bound(kind, endpoint, was_default)
+    }
+    pub fn start_resolved(
+        source: &crate::recording::session::ResolvedSource,
+    ) -> Result<Self, AppError> {
+        Self::start_bound(
+            source.kind,
+            EndpointSelection::Id(source.id.clone()),
+            source.was_default,
+        )
+    }
+    fn start_bound(
+        kind: SourceKind,
+        endpoint: EndpointSelection,
+        was_default: bool,
+    ) -> Result<Self, AppError> {
         let (tx, rx) = mpsc::sync_channel(2);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let buffer = Arc::new(Mutex::new(Buffer::default()));
@@ -51,7 +68,7 @@ impl AudioSourceHandle {
         let thread = thread::Builder::new()
             .name("vectrcap-wasapi".into())
             .spawn(move || {
-                let result = run(kind, endpoint, rx, &shared, ready_tx);
+                let result = run(kind, endpoint, was_default, rx, &shared, ready_tx);
                 if let Err(e) = result
                     && let Ok(mut b) = shared.lock()
                 {
@@ -378,12 +395,15 @@ unsafe fn device_id(d: &IMMDevice) -> Result<String, AppError> {
 fn run(
     kind: SourceKind,
     endpoint: EndpointSelection,
+    was_default: bool,
     rx: mpsc::Receiver<Command>,
     shared: &Arc<Mutex<Buffer>>,
     ready: mpsc::SyncSender<Result<(), AppError>>,
 ) -> Result<(), AppError> {
     let setup = (|| {
-        let c = Client::open(kind, &endpoint)?;
+        let mut c = Client::open(kind, &endpoint)?;
+        c.default = was_default;
+        c.verify_device()?;
         let r = Resampler::new(c.rate)?;
         Ok::<_, AppError>((c, r))
     })();
@@ -456,10 +476,10 @@ fn run(
         if wait == WAIT_FAILED {
             return Err(AppError::Capture("audio event wait failed"));
         }
+        client.verify_device()?;
         if paused {
             continue;
         }
-        client.verify_device()?;
         if wait == WAIT_OBJECT_0 {
             collect(&client, &mut clock, &mut resampler, shared, &mut output_end)?;
         }
@@ -519,4 +539,73 @@ fn collect(
         enqueue(shared, stereo, start, end)?;
     }
     Ok(())
+}
+
+/// Enumerates metadata only. This never activates an audio client or stream.
+#[allow(unsafe_code)]
+pub fn enumerate_endpoints() -> Result<Vec<super::devices::AudioEndpoint>, AppError> {
+    let _runtime = Runtime::new()?;
+    let mut out = vec![];
+    unsafe {
+        let e: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER).map_err(err)?;
+        for (kind, flow) in [
+            (SourceKind::System, eRender),
+            (SourceKind::Microphone, eCapture),
+        ] {
+            let devices = e
+                .EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)
+                .map_err(err)?;
+            let count = devices.GetCount().map_err(err)?;
+            if count > 128 {
+                return Err(AppError::Capture("too many audio endpoints"));
+            }
+            for index in 0..count {
+                let device = devices.Item(index).map_err(err)?;
+                let id = device_id(&device)?;
+                let name = (|| {
+                    let props = device.OpenPropertyStore(STGM_READ).ok()?;
+                    let mut value = props
+                        .GetValue(
+                            &windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
+                        )
+                        .ok()?;
+                    let ptr =
+                        windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc(
+                            &value,
+                        );
+                    let _ = windows::Win32::System::Com::StructuredStorage::PropVariantClear(
+                        &mut value,
+                    );
+                    let ptr = ptr.ok()?;
+                    let text = ptr.to_string().ok();
+                    CoTaskMemFree(Some(ptr.0.cast()));
+                    text
+                })()
+                .unwrap_or_else(|| format!("{kind:?} endpoint {}", index + 1));
+                let name: String = name.chars().filter(|c| !c.is_control()).take(256).collect();
+                out.push(super::devices::AudioEndpoint { id, name, kind });
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(unsafe_code)]
+pub fn resolve_recording_sources(
+    options: Option<&crate::recording::options::AudioOptions>,
+) -> Result<Vec<crate::recording::session::ResolvedSource>, AppError> {
+    // Off/GIF never initialize COM or query an endpoint.
+    crate::recording::session::resolve_sources(options, |kind, selection| {
+        let _runtime = Runtime::new()?;
+        unsafe {
+            let e: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER).map_err(err)?;
+            let device=match selection{EndpointSelection::Default=>e.GetDefaultAudioEndpoint(if kind==SourceKind::System{eRender}else{eCapture},eConsole),EndpointSelection::Id(id)=>e.GetDevice(&HSTRING::from(id))}.map_err(|_|AppError::Capture("selected audio endpoint unavailable; correct sources or explicitly start without audio"))?;
+            if device.GetState().map_err(err)? != DEVICE_STATE_ACTIVE {
+                return Err(AppError::Capture("selected audio endpoint is not active"));
+            }
+            device_id(&device)
+        }
+    })
 }

@@ -89,7 +89,8 @@ fn first_run_opens_setup_close_keeps_tray_alive() {
         app.dispatch(AppCommand::Show(Window::Uploads)).as_slice(),
         [
             AppEffect::Window(Some(Window::Uploads)),
-            AppEffect::CancelConnectionTest
+            AppEffect::CancelConnectionTest,
+            AppEffect::StopAudioTest
         ]
     ));
 }
@@ -98,7 +99,7 @@ fn quit_waits_for_worker_drain_and_rejects_new_work() {
     let (_dir, mut app) = app();
     assert!(matches!(
         app.dispatch(AppCommand::Quit).as_slice(),
-        [AppEffect::DrainWorker]
+        [AppEffect::StopAudioTest, AppEffect::DrainWorker]
     ));
     assert_eq!(app.lifecycle, Lifecycle::Draining);
     assert!(matches!(
