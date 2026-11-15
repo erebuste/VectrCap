@@ -156,11 +156,22 @@ impl RecordingReview {
                 }
             }
         }
+        // The archive copy (if any) is already on disk by this point; a bookkeeping
+        // failure here must not be reported as a total failure that triggers Discard
+        // against a file that was, in fact, saved successfully.
         if manual && let Some(entry) = &mut self.archive {
-            history.protect_manual_archive(entry.id)?;
-            entry.origin = crate::persistence::archive::ArchiveOrigin::Manual;
+            match history.protect_manual_archive(entry.id) {
+                Ok(()) => entry.origin = crate::persistence::archive::ArchiveOrigin::Manual,
+                Err(error) => {
+                    eprintln!("protecting manual archive after successful save failed: {error}")
+                }
+            }
         }
-        history.record_recording(a, &self.metadata, self.created.timestamp_millis())?;
+        if let Err(error) =
+            history.record_recording(a, &self.metadata, self.created.timestamp_millis())
+        {
+            eprintln!("recording history bookkeeping after successful save failed: {error}");
+        }
         Ok(())
     }
     pub fn discard(

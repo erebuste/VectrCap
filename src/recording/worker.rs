@@ -294,21 +294,26 @@ fn run(
                         .min(limit);
                     if let Some(audio) = &mut physical_audio {
                         if let Err(e) = audio.pause() {
-                            interruption = Some(e);
+                            interruption.get_or_insert(e);
                             requested_stop = true;
                         }
                         if let Err(e) = audio.pump(&capture.state, &mut *encoder, t) {
-                            interruption = Some(e);
+                            interruption.get_or_insert(e);
                             requested_stop = true;
                         }
                     }
-                    drain_video(
+                    // A drain failure here must not discard an already-stored interruption
+                    // cause by propagating a different error before it is ever reported.
+                    if let Err(e) = drain_video(
                         &capture,
                         &mut *encoder,
                         &mut last_video,
                         Duration::ZERO,
                         Some(physical_audio.as_ref().map_or(t, |a| a.end_time().min(t))),
-                    )?;
+                    ) {
+                        interruption.get_or_insert(e);
+                        requested_stop = true;
+                    }
                     if probe.is_some() {
                         feed_synthetic(&mut *encoder, options.audio(), &mut audio_frames, t)?;
                     }
@@ -396,13 +401,17 @@ fn run(
     if let Err(e) = capture.stop() {
         interruption.get_or_insert(e);
     }
-    drain_video(
+    // Same reasoning as the Pause arm above: a drain failure here must not discard
+    // an already-stored interruption cause before the Interrupted event is sent.
+    if let Err(e) = drain_video(
         &capture,
         &mut *encoder,
         &mut last_video,
         Duration::ZERO,
         Some(end),
-    )?;
+    ) {
+        interruption.get_or_insert(e);
+    }
     if cancel.is_cancelled() {
         return Err(AppError::Cancelled);
     }
