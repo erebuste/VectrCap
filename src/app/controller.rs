@@ -731,12 +731,24 @@ impl AppController {
             | AppCommand::TestSavedConnection { request, .. } => Some(*request),
             _ => None,
         };
+        let pin_source = matches!(
+            &command,
+            AppCommand::PinSource(_)
+                | AppCommand::LoadPinFile(_)
+                | AppCommand::HistoryAction {
+                    action: HistoryAction::Pin,
+                    ..
+                }
+        );
         self.apply(command)
             .unwrap_or_else(|error| match connection_request {
                 Some(request) => vec![AppEffect::ConnectionTest {
                     request,
                     result: Err(error),
                 }],
+                None if pin_source => {
+                    vec![AppEffect::PinSourceChooser(true), AppEffect::Error(error)]
+                }
                 None => vec![AppEffect::Error(error)],
             })
     }
@@ -879,6 +891,13 @@ impl AppController {
                     .into_iter()
                     .map(AppEffect::Pin)
                     .collect()
+            }
+            AppCommand::RefreshPinWorkAreas => {
+                if self.pins.snapshots().is_empty() {
+                    vec![]
+                } else {
+                    vec![AppEffect::RefreshPinWorkAreas]
+                }
             }
             AppCommand::LoadPinFile(path) => {
                 self.load_pin(crate::pin::source::PinLoad::File(path))?
@@ -1212,6 +1231,15 @@ impl AppController {
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::PinWorkAreas { result } => {
+                if self.lifecycle != Lifecycle::Running || self.pins.snapshots().is_empty() {
+                    return vec![];
+                }
+                result
+                    .and_then(|areas| self.pins.update_work_areas(areas.work_areas, areas.pointer))
+                    .map(|effects| effects.into_iter().map(AppEffect::Pin).collect())
+                    .unwrap_or_else(|error| vec![AppEffect::Error(error)])
+            }
             AppEvent::PinLoaded { request, result } => {
                 if self.pin_load != Some(request) || self.lifecycle != Lifecycle::Running {
                     return vec![];
@@ -1227,7 +1255,9 @@ impl AppController {
                     ));
                     Ok(effects.into_iter().map(AppEffect::Pin).collect())
                 });
-                result.unwrap_or_else(|error| vec![AppEffect::Error(error)])
+                result.unwrap_or_else(|error| {
+                    vec![AppEffect::PinSourceChooser(true), AppEffect::Error(error)]
+                })
             }
             AppEvent::CaptureAcquired { session, result } => self.capture_acquired(session, result),
             AppEvent::WorkerStopped(result) => {

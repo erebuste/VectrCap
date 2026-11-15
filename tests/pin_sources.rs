@@ -401,3 +401,167 @@ fn pin_shortcuts_are_available_without_reserved_defaults() {
         assert!(ShortcutBinding::default_for(action).chord.is_none());
     }
 }
+
+#[test]
+fn native_capture_hiding_is_synchronous_nested_and_rolls_back_failure() {
+    use vectrcap::{
+        app::error::AppError,
+        pin::manager::{PinWindowRegistry, PinWindowSystem},
+    };
+    #[derive(Default)]
+    struct Fake {
+        visible: std::collections::HashMap<usize, bool>,
+        fail_hide: Option<usize>,
+        flushes: usize,
+    }
+    struct Adapter(Arc<std::sync::Mutex<Fake>>);
+    impl PinWindowSystem for Adapter {
+        fn is_owned(&self, _: vectrcap::pin::PinId, handle: usize) -> bool {
+            self.0.lock().unwrap().visible.contains_key(&handle)
+        }
+        fn exclude_from_capture(&mut self, _: usize) -> bool {
+            false
+        }
+        fn is_visible(&self, handle: usize) -> bool {
+            self.0.lock().unwrap().visible[&handle]
+        }
+        fn set_visible(&mut self, handle: usize, visible: bool) -> Result<(), AppError> {
+            let mut s = self.0.lock().unwrap();
+            if !visible && s.fail_hide == Some(handle) {
+                return Err(AppError::Capture("injected hide failure"));
+            }
+            s.visible.insert(handle, visible);
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), AppError> {
+            self.0.lock().unwrap().flushes += 1;
+            Ok(())
+        }
+    }
+    let os = Arc::new(std::sync::Mutex::new(Fake::default()));
+    os.lock().unwrap().visible.insert(1, true);
+    os.lock().unwrap().visible.insert(2, true);
+    let mut m = manager();
+    let image = PinnedImage::new(Arc::new(RgbaImage::new(10, 10)), None).unwrap();
+    let a = m.open(image.clone(), None).unwrap();
+    let b = m.open(image, None).unwrap();
+    let mut registry = PinWindowRegistry::new(Adapter(os.clone()));
+    assert!(!registry.register(a, 1).unwrap()); // unsupported affinity uses hiding
+    registry.register(b, 2).unwrap();
+    registry.suspend_for_capture().unwrap();
+    assert!(os.lock().unwrap().visible.values().all(|v| !*v));
+    assert_eq!(os.lock().unwrap().flushes, 1);
+    registry.suspend_for_capture().unwrap();
+    registry.set_visible(a, true).unwrap();
+    registry.restore_after_capture().unwrap();
+    assert!(os.lock().unwrap().visible.values().all(|v| !*v));
+    registry.restore_after_capture().unwrap();
+    assert!(os.lock().unwrap().visible.values().all(|v| *v));
+    os.lock().unwrap().fail_hide = Some(2);
+    assert!(registry.suspend_for_capture().is_err());
+    assert!(os.lock().unwrap().visible.values().all(|v| *v));
+    assert!(!registry.suspended());
+    registry.unregister(a);
+    registry.unregister(b);
+    assert!(!registry.register(a, 999).is_ok());
+}
+
+#[test]
+fn controller_capture_suspends_and_restores_pins_on_failure_or_cancel() {
+    use vectrcap::{
+        app::{
+            error::AppError,
+            events::{AppCommand, AppEffect, AppEvent},
+        },
+        pin::source::{LoadedPin, PinSource},
+    };
+    let (_dir, mut app) = controller(Arc::new(Clipboard::default()));
+    let request = app
+        .dispatch(AppCommand::PinSource(PinSource::Clipboard))
+        .iter()
+        .find_map(|e| {
+            if let AppEffect::LoadPin { request, .. } = e {
+                Some(*request)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    app.on_event(AppEvent::PinLoaded {
+        request,
+        result: Ok(LoadedPin {
+            image: PinnedImage::new(Arc::new(RgbaImage::new(10, 10)), None).unwrap(),
+            work_areas: vec![PhysicalRect::new(0, 0, 1000, 800).unwrap()],
+            pointer: PhysicalPoint { x: 0, y: 0 },
+        }),
+    });
+    for cancel in [false, true] {
+        let effects = app.dispatch(AppCommand::StartCapture {
+            mode: vectrcap::capture::request::CaptureMode::Region,
+            selection: Default::default(),
+        });
+        let session = effects
+            .iter()
+            .find_map(|e| {
+                if let AppEffect::AcquireCapture { session, .. } = e {
+                    Some(*session)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(!app.pins().snapshots()[0].visible);
+        if cancel {
+            app.dispatch(AppCommand::CancelCapture(session));
+        } else {
+            app.on_event(AppEvent::CaptureAcquired {
+                session,
+                result: Err(AppError::Capture("injected acquisition failure")),
+            });
+        }
+        assert!(app.pins().snapshots()[0].visible);
+    }
+    let remaining = PhysicalRect::new(-2000, -100, 1000, 800).unwrap();
+    app.on_event(AppEvent::PinWorkAreas {
+        result: Ok(vectrcap::pin::source::PinWorkAreas {
+            work_areas: vec![remaining],
+            pointer: PhysicalPoint { x: -1500, y: 100 },
+        }),
+    });
+    assert!(remaining.contains(app.pins().snapshots()[0].state.position()));
+}
+
+#[test]
+fn pin_source_errors_offer_visible_retry_without_destination_setup() {
+    use vectrcap::{
+        app::{
+            error::AppError,
+            events::{AppCommand, AppEffect, AppEvent},
+        },
+        pin::source::PinSource,
+    };
+    let (_dir, mut app) = controller(Arc::new(Clipboard::default()));
+    let request = app
+        .dispatch(AppCommand::PinSource(PinSource::Clipboard))
+        .iter()
+        .find_map(|e| {
+            if let AppEffect::LoadPin { request, .. } = e {
+                Some(*request)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let effects = app.on_event(AppEvent::PinLoaded {
+        request,
+        result: Err(AppError::InvalidInput(
+            "clipboard contains text, not an image",
+        )),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::PinSourceChooser(true)))
+    );
+    assert!(effects.iter().any(|e| matches!(e, AppEffect::Error(_))));
+}

@@ -9,14 +9,11 @@ use crate::{
     ui::capture_overlay::{CaptureOverlayEvent, OverlayAction},
 };
 use eframe::egui;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct CaptureHost {
-    pin_views: HashMap<crate::pin::PinId, Arc<Mutex<super::image_review::ImageViewport>>>,
+    pin_host: super::pin_window::PinHost,
     capture_builder: Option<(uuid::Uuid, egui::ViewportBuilder)>,
 }
 impl CaptureHost {
@@ -143,45 +140,6 @@ impl CaptureHost {
                 );
             }
         }
-        // Task 6 hands off only immutable final pixels and optional placement.
-        // This minimal host keeps that handoff visible; Task 7 owns pin tools.
-        self.pin_views
-            .retain(|id, _| view.pins.iter().any(|p| p.id == *id));
-        if view.capture_acquiring.is_none() && view.capture_surface.is_none() {
-            for pin in &view.pins {
-                let viewport = self.pin_views.entry(pin.id).or_default().clone();
-                let client = client.clone();
-                let pin = pin.clone();
-                ctx.show_viewport_deferred(
-                    egui::ViewportId::from_hash_of(("pin", pin.id)),
-                    egui::ViewportBuilder::default()
-                        .with_title("VectrCap pin")
-                        .with_inner_size([600.0, 450.0])
-                        .with_window_level(egui::WindowLevel::AlwaysOnTop),
-                    move |ui, _| {
-                        let live = client.snapshot();
-                        if !live.pins.iter().any(|p| p.id == pin.id)
-                            || live.capture_acquiring.is_some()
-                            || live.capture_surface.is_some()
-                        {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            return;
-                        }
-                        if ui.ctx().input(|i| i.viewport().close_requested()) {
-                            if let Err(error) = client.submit(AppCommand::Pin {
-                                id: pin.id,
-                                input: crate::pin::PinInput::Close,
-                            }) {
-                                client.report_error(error);
-                            }
-                        } else if let Ok(mut viewport) = viewport.lock()
-                            && let Err(error) = viewport.show(ui, pin.image.pixels())
-                        {
-                            client.report_error(error);
-                        }
-                    },
-                );
-            }
-        }
+        self.pin_host.show(ctx, client, view);
     }
 }

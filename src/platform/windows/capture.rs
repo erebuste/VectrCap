@@ -137,6 +137,7 @@ pub fn acquire_screenshot(
     cancel: CancellationToken,
 ) -> Result<crate::capture::request::CaptureSnapshot, AppError> {
     use crate::capture::request::{CaptureMode, CaptureService};
+    let pins = super::windows::PinCaptureGuard::begin()?;
     let mut source = WindowsCaptureSource::new();
     if request.mode == CaptureMode::Window {
         let pointer = source.pointer()?;
@@ -148,7 +149,10 @@ pub fn acquire_screenshot(
                 .ok_or(AppError::Capture("no eligible window under the pointer"))?,
         );
     }
-    CaptureService::new(source, NativeCountdown::new(hide_app_chrome), cancel).snapshot(request)
+    let result = CaptureService::new(source, NativeCountdown::new(hide_app_chrome), cancel)
+        .snapshot(request);
+    pins.restore()?;
+    result
 }
 
 #[allow(unsafe_code)]

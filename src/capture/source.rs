@@ -215,6 +215,7 @@ impl Handler {
     }
 }
 pub struct NativeCapture {
+    pins: Option<crate::platform::windows::windows::PinCaptureGuard>,
     control: Option<CaptureControl<Handler, AppError>>,
     pub state: SharedCaptureState,
 }
@@ -273,6 +274,7 @@ impl NativeCapture {
         options: RecordingOptions,
         source_rect: PhysicalRect,
     ) -> Result<Self, AppError> {
+        let pins = crate::platform::windows::windows::PinCaptureGuard::begin()?;
         let state = Arc::new(Mutex::new(CaptureState::default()));
         let cursor = if options.cursor {
             CursorCaptureSettings::WithCursor
@@ -297,6 +299,7 @@ impl NativeCapture {
         let control = Handler::start_free_threaded(settings)
             .map_err(|_| AppError::Capture("Windows Graphics Capture could not start"))?;
         Ok(Self {
+            pins: Some(pins),
             control: Some(control),
             state,
         })
@@ -315,11 +318,12 @@ impl NativeCapture {
         Ok(())
     }
     pub fn stop(&mut self) -> Result<(), AppError> {
-        if let Some(c) = self.control.take() {
+        let result = self.control.take().map_or(Ok(()), |c| {
             c.stop()
-                .map_err(|_| AppError::Capture("native capture shutdown failed"))?;
-        }
-        Ok(())
+                .map_err(|_| AppError::Capture("native capture shutdown failed"))
+        });
+        let restore = self.pins.take().map_or(Ok(()), |pins| pins.restore());
+        result.and(restore)
     }
 }
 impl Drop for NativeCapture {

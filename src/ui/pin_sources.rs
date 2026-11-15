@@ -37,6 +37,7 @@ impl PinSources {
             }
             ui.heading("Pin to screen");
             ui.label("Choose a reference image. GIFs show their first frame.");
+            if let Some(error) = &live.error { ui.colored_label(ui.visuals().error_fg_color, error.to_string()); }
             for (label, source) in [("From screen", PinSource::Screen), ("From clipboard image", PinSource::Clipboard), ("From image file…", PinSource::File)] {
                 if ui.button(label).clicked() && let Err(error) = client.submit(AppCommand::PinSource(source)) { client.report_error(error); }
             }

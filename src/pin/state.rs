@@ -17,6 +17,7 @@ impl PinId {
 #[derive(Clone)]
 pub struct PinnedImage {
     pixels: Arc<RgbaImage>,
+    display: Arc<RgbaImage>,
     source_label: Option<String>,
 }
 impl PinnedImage {
@@ -28,13 +29,28 @@ impl PinnedImage {
         {
             return Err(AppError::InvalidInput("pin source label is invalid"));
         }
+        let display = if pixels.width().max(pixels.height()) > 2048 {
+            // Constructors are called by source/export/controller workers,
+            // never by the viewport. Keep GPU uploads bounded independently
+            // of zoom; copying always retains the original Arc below.
+            let longest = u64::from(pixels.width().max(pixels.height()));
+            let width = (u64::from(pixels.width()) * 2048 / longest).max(1) as u32;
+            let height = (u64::from(pixels.height()) * 2048 / longest).max(1) as u32;
+            Arc::new(image::imageops::thumbnail(pixels.as_ref(), width, height))
+        } else {
+            pixels.clone()
+        };
         Ok(Self {
             pixels,
+            display,
             source_label,
         })
     }
     pub fn pixels(&self) -> &Arc<RgbaImage> {
         &self.pixels
+    }
+    pub fn display_pixels(&self) -> &Arc<RgbaImage> {
+        &self.display
     }
     pub fn source_label(&self) -> Option<&str> {
         self.source_label.as_deref()

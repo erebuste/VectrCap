@@ -84,6 +84,9 @@ impl Shell {
     }
 }
 impl eframe::App for Shell {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.focus_requested.swap(false, Ordering::AcqRel) {
             self.submit(AppCommand::Show(Window::Settings));

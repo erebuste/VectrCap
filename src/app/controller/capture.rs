@@ -58,14 +58,21 @@ impl AppController {
             save_path: None,
         });
         self.window = None;
-        Ok(vec![
+        let mut effects: Vec<_> = self
+            .pins
+            .suspend_for_capture()
+            .into_iter()
+            .map(AppEffect::Pin)
+            .collect();
+        effects.extend([
             AppEffect::Window(None),
             AppEffect::CancelConnectionTest,
             AppEffect::AcquireCapture {
                 session: id,
                 request,
             },
-        ])
+        ]);
+        Ok(effects)
     }
     pub(super) fn capture_acquired(
         &mut self,
@@ -114,7 +121,8 @@ impl AppController {
                 working: false,
             })))
         });
-        match result {
+        let pin_effects = self.pins.restore_after_capture();
+        let mut effects = match result {
             Ok(surface) => {
                 capture.surface = Some(surface.clone());
                 vec![AppEffect::CaptureSurface(Some(surface))]
@@ -128,13 +136,23 @@ impl AppController {
                     AppEffect::Error(error),
                 ]
             }
-        }
+        };
+        effects.splice(0..0, pin_effects.into_iter().map(AppEffect::Pin));
+        effects
     }
     pub(super) fn cancel_capture(&mut self, session: Uuid) -> Vec<AppEffect> {
         let Some(capture) = self.capture.as_mut().filter(|c| c.id == session) else {
             return vec![];
         };
         let mut effects = vec![];
+        if capture.surface.is_none() {
+            effects.extend(
+                self.pins
+                    .restore_after_capture()
+                    .into_iter()
+                    .map(AppEffect::Pin),
+            );
+        }
         if let Some(pending) = &mut capture.pending
             && let Err(error) = pending.discard_unadmitted(&self.artifacts)
         {

@@ -71,6 +71,7 @@ pub enum AppCommand {
         input: crate::pin::PinInput,
     },
     CloseAllPins,
+    RefreshPinWorkAreas,
     SetHistoryPreferences(crate::persistence::settings::HistoryPreferences),
     HistoryAction {
         ids: Vec<Uuid>,
@@ -194,6 +195,9 @@ impl From<QueueAction> for QueueCommand {
     }
 }
 pub enum AppEvent {
+    PinWorkAreas {
+        result: Result<crate::pin::source::PinWorkAreas, AppError>,
+    },
     PinLoaded {
         request: Uuid,
         result: Result<crate::pin::source::LoadedPin, AppError>,
@@ -219,6 +223,7 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    RefreshPinWorkAreas,
     ArchiveMaintenance(super::image_finish::ArchiveMaintenance),
     AcquireCapture {
         session: Uuid,

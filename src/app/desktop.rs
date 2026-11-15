@@ -214,6 +214,7 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    pin_areas: tokio::task::JoinSet<Result<crate::pin::source::PinWorkAreas, AppError>>,
     pin_loads: tokio::task::JoinSet<(uuid::Uuid, Result<crate::pin::source::LoadedPin, AppError>)>,
     captures: tokio::task::JoinSet<(
         uuid::Uuid,
@@ -237,6 +238,12 @@ impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::RefreshPinWorkAreas => {
+                    if self.pin_areas.is_empty() {
+                        self.pin_areas
+                            .spawn_blocking(crate::pin::source::query_pin_work_areas);
+                    }
+                }
                 AppEffect::ArchiveMaintenance(task) => {
                     let cancel = self.local_cancel.clone();
                     self.local_actions.spawn_blocking(move || task.run(cancel));
@@ -535,6 +542,7 @@ async fn serve(
     let (queue_tx, queue_rx) = crate::vectr::queue::command_channel();
     let (effect_tx, mut effect_rx) = mpsc::channel(32);
     let mut effects = Effects {
+        pin_areas: tokio::task::JoinSet::new(),
         pin_loads: tokio::task::JoinSet::new(),
         captures: tokio::task::JoinSet::new(),
         capture_cancel: None,
@@ -563,6 +571,9 @@ async fn serve(
     let mut driver_consumed = false;
     let outcome = loop {
         let results = tokio::select! {
+            result = effects.pin_areas.join_next(), if !effects.pin_areas.is_empty() => {
+                controller.on_event(AppEvent::PinWorkAreas { result: result.and_then(Result::ok).unwrap_or(Err(AppError::Capture("pin monitor worker failed"))) })
+            }
             result = effects.pin_loads.join_next(), if !effects.pin_loads.is_empty() => {
                 match result {
                     Some(Ok((request, result))) => controller.on_event(AppEvent::PinLoaded { request, result }),
@@ -657,6 +668,7 @@ async fn serve(
     }
     while effects.captures.join_next().await.is_some() {}
     while effects.pin_loads.join_next().await.is_some() {}
+    while effects.pin_areas.join_next().await.is_some() {}
     while effects.local_actions.join_next().await.is_some() {}
     // A file already accepted into a batch durably becomes a job the moment
     // `on_event` runs, even though nothing reads the published view anymore;

@@ -52,6 +52,11 @@ impl PinManager {
         self.pins.values().cloned().collect()
     }
     pub fn check_capacity(&self, image: &PinnedImage) -> Result<(), AppError> {
+        if image.pixels().width().max(image.pixels().height()) > 32760 {
+            return Err(AppError::InvalidInput(
+                "image is too long for a pin window; save or review it instead",
+            ));
+        }
         if self.pins.len() >= MAX_PINS {
             return Err(AppError::InUse(
                 "at most 16 pin windows may be open; close a pin first",
@@ -98,9 +103,10 @@ impl PinManager {
             }
             return Ok(vec![PinEffect::CloseViewport(id)]);
         }
-        let pin = self
+        let mut pin = self
             .pins
-            .get_mut(&id)
+            .get(&id)
+            .cloned()
             .ok_or(AppError::InvalidInput("pin is no longer open"))?;
         match input {
             PinInput::Move { dx, dy } => {
@@ -137,7 +143,15 @@ impl PinManager {
             PinInput::Copy => return Ok(vec![PinEffect::CopyImage(pin.image.pixels().clone())]),
             PinInput::Close => unreachable!(),
         }
-        Ok(vec![PinEffect::UpdateViewport(pin.clone())])
+        if pin.display_size().0.max(pin.display_size().1) > 32760 {
+            return Err(AppError::InvalidInput(
+                "pin zoom exceeds the native viewport size limit",
+            ));
+        }
+        let area = self.area_for(Some(pin.state.position))?;
+        clamp_to_area(&mut pin, area);
+        self.pins.insert(id, pin.clone());
+        Ok(vec![PinEffect::UpdateViewport(pin)])
     }
     pub fn close_all(&mut self) -> Vec<PinEffect> {
         self.pixels = 0;
@@ -207,6 +221,7 @@ impl PinManager {
 }
 fn clamp_to_area(pin: &mut PinSnapshot, area: PhysicalRect) {
     let (w, h) = pin.display_size();
+    let (w, h) = (w.max(48), h.max(48));
     pin.state.position.x = pin.state.position.x.clamp(
         area.left(),
         (i64::from(area.right()) - i64::from(w.min(area.width()))) as i32,
@@ -215,4 +230,133 @@ fn clamp_to_area(pin: &mut PinSnapshot, area: PhysicalRect) {
         area.top(),
         (i64::from(area.bottom()) - i64::from(h.min(area.height()))) as i32,
     );
+}
+
+/// Injectable native boundary. Implementations must verify process AND window
+/// identity before every operation, because HWND values can be reused.
+pub trait PinWindowSystem {
+    fn is_owned(&self, id: PinId, handle: usize) -> bool;
+    fn exclude_from_capture(&mut self, handle: usize) -> bool;
+    fn is_visible(&self, handle: usize) -> bool;
+    fn set_visible(&mut self, handle: usize, visible: bool) -> Result<(), AppError>;
+    fn flush(&mut self) -> Result<(), AppError>;
+}
+struct NativePin {
+    handle: usize,
+    desired_visible: bool,
+    exclusion_verified: bool,
+}
+pub struct PinWindowRegistry<S> {
+    system: S,
+    windows: HashMap<PinId, NativePin>,
+    depth: u32,
+}
+impl<S: PinWindowSystem> PinWindowRegistry<S> {
+    pub fn new(system: S) -> Self {
+        Self {
+            system,
+            windows: HashMap::new(),
+            depth: 0,
+        }
+    }
+    pub fn suspended(&self) -> bool {
+        self.depth > 0
+    }
+    pub fn unregister(&mut self, id: PinId) {
+        self.windows.remove(&id);
+    }
+    pub fn register(&mut self, id: PinId, handle: usize) -> Result<bool, AppError> {
+        if !self.system.is_owned(id, handle) {
+            return Err(AppError::Capture("pin window identity changed"));
+        }
+        if let Some(old) = self.windows.get(&id)
+            && old.handle == handle
+        {
+            return Ok(old.exclusion_verified);
+        }
+        if !self.windows.contains_key(&id) && self.windows.len() >= MAX_PINS * 2 {
+            return Err(AppError::InUse("too many native pin windows"));
+        }
+        let exclusion_verified = self.system.exclude_from_capture(handle);
+        // New viewports start hidden and cannot reveal themselves during a
+        // concurrent recording/snapshot, even if affinity is unavailable.
+        if self.suspended() {
+            self.system.set_visible(handle, false)?;
+        }
+        self.windows.insert(
+            id,
+            NativePin {
+                handle,
+                desired_visible: true,
+                exclusion_verified,
+            },
+        );
+        Ok(exclusion_verified)
+    }
+    pub fn set_visible(&mut self, id: PinId, visible: bool) -> Result<(), AppError> {
+        let suspended = self.suspended();
+        let pin = self
+            .windows
+            .get_mut(&id)
+            .ok_or(AppError::Capture("pin HWND is not registered"))?;
+        if !self.system.is_owned(id, pin.handle) {
+            return Err(AppError::Capture("pin window identity changed"));
+        }
+        pin.desired_visible = visible;
+        if self.system.is_visible(pin.handle) != (visible && !suspended) {
+            self.system.set_visible(pin.handle, visible && !suspended)?;
+        }
+        Ok(())
+    }
+    pub fn suspend_for_capture(&mut self) -> Result<(), AppError> {
+        let next = self
+            .depth
+            .checked_add(1)
+            .ok_or(AppError::Capture("pin capture nesting overflows"))?;
+        if self.suspended() {
+            self.depth = next;
+            return Ok(());
+        }
+        self.windows
+            .retain(|id, pin| self.system.is_owned(*id, pin.handle));
+        let mut hidden = vec![];
+        let result = (|| {
+            for pin in self.windows.values() {
+                let visible = self.system.is_visible(pin.handle);
+                if visible {
+                    self.system.set_visible(pin.handle, false)?;
+                }
+                hidden.push((pin.handle, visible));
+            }
+            if !hidden.is_empty() {
+                self.system.flush()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for (handle, visible) in hidden {
+                if let Err(restore) = self.system.set_visible(handle, visible) {
+                    eprintln!("pin visibility rollback failed: {restore}");
+                }
+            }
+            return Err(error);
+        }
+        self.depth = next;
+        Ok(())
+    }
+    pub fn restore_after_capture(&mut self) -> Result<(), AppError> {
+        self.depth = self.depth.saturating_sub(1);
+        if self.suspended() {
+            return Ok(());
+        }
+        let mut error = None;
+        for (id, pin) in &self.windows {
+            if self.system.is_owned(*id, pin.handle)
+                && let Err(e) = self.system.set_visible(pin.handle, pin.desired_visible)
+            {
+                error.get_or_insert(e);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
 }

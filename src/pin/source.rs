@@ -40,6 +40,16 @@ pub struct LoadedPin {
     pub work_areas: Vec<PhysicalRect>,
     pub pointer: crate::capture::geometry::PhysicalPoint,
 }
+pub struct PinWorkAreas {
+    pub work_areas: Vec<PhysicalRect>,
+    pub pointer: crate::capture::geometry::PhysicalPoint,
+}
+pub fn query_pin_work_areas() -> Result<PinWorkAreas, AppError> {
+    Ok(PinWorkAreas {
+        work_areas: crate::platform::windows::monitors::enumerate_work_areas()?,
+        pointer: crate::platform::windows::windows::physical_pointer()?,
+    })
+}
 impl PinLoad {
     pub fn load(
         self,
