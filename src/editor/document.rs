@@ -173,7 +173,6 @@ struct State {
 }
 /// Clones share the immutable source and all stroke/text storage. Each revision
 /// is local to this document identity; undo/redo never reuse a prior revision.
-#[derive(Clone)]
 pub struct EditorDocument {
     id: Uuid,
     source: Arc<RgbaImage>,
@@ -183,6 +182,22 @@ pub struct EditorDocument {
     undo: VecDeque<State>,
     redo: VecDeque<State>,
     revision: u64,
+}
+impl Clone for EditorDocument {
+    /// An editable fork shares pixels and geometry, but has its own identity so
+    /// equal revision counters on divergent forks cannot authorize stale output.
+    fn clone(&self) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            source: self.source.clone(),
+            bounds: self.bounds,
+            monitors: self.monitors.clone(),
+            state: self.state.clone(),
+            undo: self.undo.clone(),
+            redo: self.redo.clone(),
+            revision: self.revision,
+        }
+    }
 }
 impl EditorDocument {
     pub fn new(snapshot: CaptureSnapshot) -> Result<Self, AppError> {
@@ -240,6 +255,13 @@ impl EditorDocument {
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn export_revision(&self) -> super::export::DocumentRevision {
+        let mut document = self.clone();
+        document.id = self.id;
+        document.undo.clear();
+        document.redo.clear();
+        super::export::DocumentRevision { document }
     }
     pub fn screen_location(&self) -> Option<PhysicalPoint> {
         self.monitors

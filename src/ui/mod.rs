@@ -1,5 +1,6 @@
 pub mod capture_overlay;
 pub mod destinations;
+pub mod image_export;
 pub mod settings;
 pub mod shell;
 pub mod uploads;
