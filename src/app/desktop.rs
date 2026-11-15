@@ -27,6 +27,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct DesktopView {
+    pub pending_ingress: Vec<super::controller::ingress::PendingSelectionView>,
+    pub install: Option<super::controller::ingress::InstallView>,
     pub task_workflows: Vec<crate::workflow::runner::TaskRunner>,
     pub scrolling: Option<super::controller::ScrollingView>,
     pub recording: Option<super::controller::RecordingView>,
@@ -74,6 +76,8 @@ pub struct DesktopView {
 impl Default for DesktopView {
     fn default() -> Self {
         Self {
+            pending_ingress: vec![],
+            install: None,
             task_workflows: vec![],
             scrolling: None,
             recording: None,
@@ -147,6 +151,18 @@ impl DesktopClient {
             .try_send(command)
             .map_err(|_| AppError::InUse("controller busy or stopped; try again"))
     }
+    pub fn accept_handoff(
+        &self,
+        request: super::cli::LaunchRequest,
+    ) -> Result<uuid::Uuid, AppError> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.submit(AppCommand::Launch {
+            request,
+            reply: Some(tx),
+        })?;
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| AppError::InUse("instance ingress timed out; retry delivery"))?
+    }
     pub fn report_error(&self, error: AppError) {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).error = Some(error);
         (self.wake)();
@@ -216,6 +232,11 @@ type ConnectionTask = tokio::task::JoinHandle<(
     Result<crate::vectr::uploader_info::UploaderInfoSupport, AppError>,
 )>;
 /// `index` is the file's position in its original picker selection.
+type ClipboardRead = (
+    super::destinations::DestinationSelection,
+    Option<super::shortcuts::ShortcutAction>,
+    Result<super::upload_sources::UploadSource, AppError>,
+);
 type StagingTask = (uuid::Uuid, usize, String, Result<Artifact, AppError>);
 /// How many `stage_file_cancellable` calls (and therefore open source-file
 /// handles) may be in flight at once, regardless of how many files were
@@ -226,6 +247,8 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    clipboard_sources: tokio::task::JoinSet<ClipboardRead>,
+    install_metadata: Option<ConnectionTask>,
     scrolling_selections: tokio::task::JoinSet<(
         uuid::Uuid,
         Result<crate::platform::windows::capture::ScrollingSelectionSnapshot, AppError>,
@@ -266,6 +289,66 @@ struct Effects {
     staging_meta: HashMap<tokio::task::Id, (uuid::Uuid, usize, String)>,
 }
 impl Effects {
+    fn stage_files(&mut self, batch: uuid::Uuid, paths: Vec<(usize, PathBuf)>) {
+        self.state.failed_uploads.clear();
+        for (index, path) in paths {
+            let display_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "selected file".to_owned());
+            // Bounded pending backlog: a request beyond the cap
+            // is bounced with an explicit busy outcome rather
+            // than growing the queue (and the open-handle count
+            // behind it) without limit.
+            if self.staging.len() >= MAX_PENDING_STAGING {
+                let display_name = display_name.clone();
+                self.staging.spawn(async move {
+                    (
+                        batch,
+                        index,
+                        display_name,
+                        Err(AppError::InUse(
+                            "the staging queue is busy; try again shortly",
+                        )),
+                    )
+                });
+                continue;
+            }
+            let artifacts = self.artifacts.clone();
+            let cancel = self.local_cancel.clone();
+            let limit = self.staging_limit.clone();
+            let task_display_name = display_name.clone();
+            let handle = self.staging.spawn(async move {
+                if cancel.is_cancelled() {
+                    return (batch, index, task_display_name, Err(AppError::Cancelled));
+                }
+                // Bounds concurrent `stage_file_cancellable` calls
+                // (and therefore concurrently open source-file
+                // handles) to a small fixed number, independent
+                // of how many files/batches were accepted.
+                let Ok(_permit) = limit.acquire_owned().await else {
+                    return (
+                        batch,
+                        index,
+                        task_display_name,
+                        Err(AppError::Persistence("staging worker pool closed")),
+                    );
+                };
+                if cancel.is_cancelled() {
+                    return (batch, index, task_display_name, Err(AppError::Cancelled));
+                }
+                let outcome = tokio::task::spawn_blocking(move || {
+                    artifacts.stage_file_cancellable(&path, ArtifactKind::File, &cancel)
+                })
+                .await
+                .unwrap_or(Err(AppError::Persistence("file staging worker failed")));
+                (batch, index, task_display_name, outcome)
+            });
+            self.staging_meta
+                .insert(handle.id(), (batch, index, display_name));
+        }
+    }
+
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
@@ -566,62 +649,36 @@ impl Effects {
                 }
                 AppEffect::Error(error) => self.state.error = Some(error),
                 AppEffect::StageFiles { batch, paths } => {
-                    self.state.failed_uploads.clear();
-                    for (index, path) in paths.into_iter().enumerate() {
-                        let display_name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "selected file".to_owned());
-                        // Bounded pending backlog: a request beyond the cap
-                        // is bounced with an explicit busy outcome rather
-                        // than growing the queue (and the open-handle count
-                        // behind it) without limit.
-                        if self.staging.len() >= MAX_PENDING_STAGING {
-                            let display_name = display_name.clone();
-                            self.staging.spawn(async move {
-                                (
-                                    batch,
-                                    index,
-                                    display_name,
-                                    Err(AppError::InUse(
-                                        "the staging queue is busy; try again shortly",
-                                    )),
-                                )
-                            });
-                            continue;
-                        }
-                        let artifacts = self.artifacts.clone();
-                        let cancel = self.local_cancel.clone();
-                        let limit = self.staging_limit.clone();
-                        let task_display_name = display_name.clone();
-                        let handle = self.staging.spawn(async move {
-                            if cancel.is_cancelled() {
-                                return (batch, index, task_display_name, Err(AppError::Cancelled));
-                            }
-                            // Bounds concurrent `stage_file_cancellable` calls
-                            // (and therefore concurrently open source-file
-                            // handles) to a small fixed number, independent
-                            // of how many files/batches were accepted.
-                            let Ok(_permit) = limit.acquire_owned().await else {
-                                return (
-                                    batch,
-                                    index,
-                                    task_display_name,
-                                    Err(AppError::Persistence("staging worker pool closed")),
-                                );
-                            };
-                            if cancel.is_cancelled() {
-                                return (batch, index, task_display_name, Err(AppError::Cancelled));
-                            }
-                            let outcome = tokio::task::spawn_blocking(move || {
-                                artifacts.stage_file_cancellable(&path, ArtifactKind::File, &cancel)
-                            })
-                            .await
-                            .unwrap_or(Err(AppError::Persistence("file staging worker failed")));
-                            (batch, index, task_display_name, outcome)
+                    self.stage_files(batch, paths.into_iter().enumerate().collect())
+                }
+                AppEffect::StageIngressFile { batch, index, path } => {
+                    self.stage_files(batch, vec![(index, path)])
+                }
+                AppEffect::ReadUploadClipboard { selection, action } => {
+                    if self.clipboard_sources.is_empty() {
+                        self.clipboard_sources.spawn_blocking(move || {
+                            use crate::platform::windows::clipboard_sources::ClipboardSourceReader;
+                            (selection,action,crate::platform::windows::clipboard_sources::WindowsClipboardSources.snapshot())
                         });
-                        self.staging_meta
-                            .insert(handle.id(), (batch, index, display_name));
+                    }
+                }
+                AppEffect::VerifyInstall { request, client } => {
+                    if let Some(task) = self.install_metadata.take() {
+                        task.abort();
+                    }
+                    self.install_metadata = Some(tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(20),
+                            client.uploader_info(),
+                        )
+                        .await
+                        .unwrap_or(Err(AppError::Network));
+                        (request, result)
+                    }));
+                }
+                AppEffect::CancelInstallVerify => {
+                    if let Some(task) = self.install_metadata.take() {
+                        task.abort();
                     }
                 }
                 AppEffect::FileRejected {
@@ -703,6 +760,8 @@ async fn serve(
     let mut recording_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     recording_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut effects = Effects {
+        clipboard_sources: tokio::task::JoinSet::new(),
+        install_metadata: None,
         scrolling_selections: tokio::task::JoinSet::new(),
         scrolling_cancel: None,
         scroller: None,
@@ -736,8 +795,11 @@ async fn serve(
         },
     };
     let mut startup = controller.startup_effects();
+    startup.extend(controller.resume_ingress()?);
+    effects.state.pending_ingress = controller.pending_selections()?;
     startup.extend(controller.recover_tasks());
     effects.apply(startup, &history).await?;
+    let mut ingress_revision = controller.settings().revision;
     let mut driver = tokio::spawn(queue.serve(uploader, queue_rx, effect_tx));
     effects.publish(&view, wake.as_ref());
     let mut effect_open = true;
@@ -820,6 +882,12 @@ async fn serve(
                     let result = result.unwrap_or(Err(AppError::Persistence("upload driver failed")));
                     controller.on_event(AppEvent::WorkerStopped(result))
                 }
+                result=effects.clipboard_sources.join_next(),if !effects.clipboard_sources.is_empty()=>{
+                    match result{Some(Ok((selection,action,Ok(source))))=>controller.dispatch(AppCommand::UploadSourceFor{source,selection,action}),Some(Ok((_,_,Err(error))))=>vec![AppEffect::Error(error)],_=>vec![AppEffect::Error(AppError::Persistence("clipboard source worker failed"))]}
+                }
+                result=async{match effects.install_metadata.as_mut(){Some(task)=>task.await,None=>std::future::pending().await}}=>{
+                    effects.install_metadata=None;match result{Ok((request,result))=>controller.on_event(AppEvent::ConnectionTest{request,result}),Err(_)=>vec![AppEffect::Error(AppError::Network)]}
+                }
                 result = async { match effects.metadata.as_mut() { Some(task) => task.await, None => std::future::pending().await } } => {
                     effects.metadata = None;
                     match result {
@@ -831,6 +899,18 @@ async fn serve(
         };
         if let Some(m) = &effects.audio_test {
             effects.state.audio_meter = m.status.lock().ok().map(|s| s.clone());
+        }
+        if ingress_revision != controller.settings().revision {
+            ingress_revision = controller.settings().revision;
+            match controller.resume_ingress() {
+                Ok(out) => effects.apply(out, &history).await?,
+                Err(error) => effects.state.error = Some(error),
+            }
+        }
+        effects.state.install = controller.install_view();
+        match controller.pending_selections() {
+            Ok(pending) => effects.state.pending_ingress = pending,
+            Err(error) => effects.state.error = Some(error),
         }
         effects.state.scrolling = controller.scrolling_view();
         effects.state.task_workflows = controller.task_views();
@@ -921,6 +1001,9 @@ async fn serve(
     }
     effects.publish(&view, wake.as_ref());
     effects.queue.take();
+    if let Some(task) = effects.install_metadata.take() {
+        task.abort();
+    }
     if let Some(task) = effects.metadata.take() {
         task.abort();
         let _ = task.await;

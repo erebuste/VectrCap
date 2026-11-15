@@ -12,3 +12,9 @@ pub mod types;
 
 pub mod local_actions;
 pub mod shortcuts;
+
+pub mod batches;
+pub mod cli;
+pub mod destination_install;
+pub mod ingress;
+pub mod upload_sources;

@@ -18,13 +18,9 @@ fn main() {
     }
 }
 fn run() -> Result<(), AppError> {
-    // File/config/Explorer ingress belongs to Task 11. Never interpret arguments
-    // as paths, tokens, commands, destinations, or upload requests.
-    if std::env::args_os().len() != 1 {
-        return Err(AppError::InvalidInput(
-            "command-line ingress is not supported",
-        ));
-    }
+    use vectrcap::app::cli::{LaunchMode, parse_launch_args};
+    use vectrcap::platform::windows::{drop_target::DropServer, ipc};
+    let launch = parse_launch_args(std::env::args_os().skip(1))?;
     let context = Arc::new(OnceLock::<eframe::egui::Context>::new());
     let focused = Arc::new(AtomicBool::new(false));
     let wake_context = context.clone();
@@ -39,13 +35,26 @@ fn run() -> Result<(), AppError> {
         }),
     )?
     else {
-        return Ok(());
+        return match launch {
+            LaunchMode::Ui => Ok(()),
+            LaunchMode::Request(request) => ipc::send_request(&request).map(|_| ()),
+            LaunchMode::ShellServer => DropServer::serve_once(Arc::new(|request| {
+                ipc::send_request(&request)?;
+                Ok(request.request_id)
+            })),
+        };
     };
     // dirs 7's Windows adapter uses SHGetKnownFolderPath(FOLDERID_LocalAppData).
     let root = dirs::data_local_dir()
         .ok_or(AppError::Persistence("Windows LocalAppData unavailable"))?
         .join("VectrCap");
+    std::fs::create_dir_all(&root).map_err(|e| AppError::Io {
+        stage: "opening application data",
+        kind: e.kind(),
+    })?;
     let mut runtime = None;
+    let mut pipe_server = None;
+    let mut drop_server = None;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([610.0, 650.0])
@@ -69,6 +78,22 @@ fn run() -> Result<(), AppError> {
                 factory,
                 Arc::new(move || ctx.request_repaint()),
             )?;
+            let pipe_client = worker.client.clone();
+            pipe_server = Some(ipc::PipeServer::start(Arc::new(move |request| {
+                pipe_client.accept_handoff(request)
+            }))?);
+            let drop_client = worker.client.clone();
+            drop_server = Some(DropServer::start(Arc::new(move |request| {
+                drop_client.accept_handoff(request)
+            }))?);
+            if let LaunchMode::Request(request) = launch {
+                worker
+                    .client
+                    .submit(vectrcap::app::events::AppCommand::Launch {
+                        request,
+                        reply: None,
+                    })?;
+            }
             let shell = Shell::new(worker.client.clone(), focused, cc.egui_ctx.clone())?;
             runtime = Some(worker);
             Ok(Box::new(shell))
@@ -76,6 +101,8 @@ fn run() -> Result<(), AppError> {
     );
     // Normally already settled before Close. Also drain after GUI initialization
     // failure/OS teardown, without blocking a live UI on disk or network work.
+    drop(drop_server);
+    drop(pipe_server);
     drop(runtime);
     result.map_err(|_| AppError::Persistence("native desktop initialization failed"))
 }
@@ -83,7 +110,7 @@ fn run() -> Result<(), AppError> {
 fn startup_error() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     let title: Vec<u16> = "VectrCap\0".encode_utf16().collect();
-    let message: Vec<u16> = "VectrCap could not start safely. Another settings owner, an unavailable Windows service, or unsupported arguments may be responsible. No upload was requested.\0".encode_utf16().collect();
+    let message: Vec<u16> = "VectrCap could not start safely. Another settings owner, an unavailable Windows service, or unsupported arguments may be responsible. Accepted requests remain recoverable on the next start.\0".encode_utf16().collect();
     unsafe {
         MessageBoxW(
             std::ptr::null_mut(),

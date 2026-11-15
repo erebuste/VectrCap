@@ -499,6 +499,73 @@ pub fn spawn_task_save(client: DesktopClient, gate: PickerGate, id: uuid::Uuid, 
     }
 }
 
+fn pick_destination_file() -> Result<Option<PathBuf>, AppError> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows::{Win32::UI::Shell::Common::COMDLG_FILTERSPEC, core::w};
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|_| error())?;
+        let _com = Com;
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER).map_err(|_| error())?;
+        dialog
+            .SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)
+            .map_err(|_| error())?;
+        dialog
+            .SetTitle(w!("Import VectrCap destination"))
+            .map_err(|_| error())?;
+        dialog
+            .SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("VectrCap destination (*.vectrcap)"),
+                pszSpec: w!("*.vectrcap"),
+            }])
+            .map_err(|_| error())?;
+        match dialog.Show(None) {
+            Ok(()) => {}
+            Err(e) if e.code().0 == ERROR_CANCELLED => return Ok(None),
+            Err(_) => return Err(error()),
+        }
+        let item = dialog.GetResult().map_err(|_| error())?;
+        let name = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|_| error())?;
+        let path = PathBuf::from(OsString::from_wide(name.as_wide()));
+        CoTaskMemFree(Some(name.0.cast()));
+        Ok(Some(path))
+    }
+}
+
+/// Destination import uses a file selection only; the controller reads and
+/// prompts after durable path-only admission, even on first-run setup.
+pub fn spawn_import_destination(client: DesktopClient, gate: PickerGate) {
+    let Some(guard) = gate.try_acquire() else {
+        return;
+    };
+    let report = client.clone();
+    let result = std::thread::Builder::new()
+        .name("destination-file-picker".into())
+        .spawn(move || {
+            let _guard = guard;
+            let result = pick_destination_file().and_then(|path| match path {
+                None => Ok(()),
+                Some(path) => {
+                    let request = crate::app::cli::LaunchRequest::import(path.into_os_string())?;
+                    client.submit(AppCommand::Launch {
+                        request,
+                        reply: None,
+                    })
+                }
+            });
+            if let Err(error) = result {
+                client.report_error(error);
+            }
+        });
+    if result.is_err() {
+        report.report_error(error());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

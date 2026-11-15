@@ -29,6 +29,33 @@ pub struct WorkflowContext {
     requested_origin: Option<crate::persistence::settings::ServerOrigin>,
 }
 impl WorkflowContext {
+    pub(crate) fn resolve_ingress_setup(
+        &mut self,
+        destinations: &Destinations,
+    ) -> Result<(), crate::app::error::AppError> {
+        if self.destination.is_some() {
+            return Ok(());
+        }
+        if let DestinationSelection::Specific(id) = self.requested_destination
+            && destinations
+                .get(id)
+                .is_none_or(|d| self.requested_origin.as_ref() != Some(&d.origin))
+        {
+            return Err(crate::app::error::AppError::NeedsSetup(
+                "original ingress destination changed",
+            ));
+        }
+        let snapshot = resolve_destination(
+            self.requested_destination,
+            DestinationSelection::Inherit,
+            destinations,
+        )?;
+        self.requested_destination = DestinationSelection::Specific(snapshot.id);
+        self.requested_origin = Some(snapshot.origin.clone());
+        self.destination = Some(snapshot);
+        self.destination_issue = None;
+        Ok(())
+    }
     pub fn new(
         kind: ArtifactKind,
         effective: EffectiveProfile,

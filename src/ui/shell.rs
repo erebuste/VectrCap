@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
+    install_review: super::destination_install::InstallReview,
     scrolling_host: super::scrolling_controls::ScrollingHost,
     recording_host: super::recording_overlay::RecordingHost,
     pin_sources: super::pin_sources::PinSources,
@@ -45,6 +46,7 @@ impl Shell {
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
+            install_review: Default::default(),
             scrolling_host: Default::default(),
             recording_host: Default::default(),
             pin_sources: Default::default(),
@@ -96,6 +98,12 @@ impl eframe::App for Shell {
             self.submit(AppCommand::Show(Window::Settings));
         }
         self.view = self.client.snapshot();
+        let install_commands =
+            self.install_review
+                .show(ctx, self.view.install.as_ref(), self.view.settings.as_ref());
+        for command in install_commands {
+            self.submit(command);
+        }
         self.capture_host.show(ctx, &self.client, &self.view);
         self.scrolling_host.show(ctx, &self.client, &self.view);
         self.recording_host.show(ctx, &self.client, &self.view);
@@ -274,6 +282,35 @@ impl eframe::App for Shell {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match (self.view.window, &self.view.settings) {
                             (Some(Window::Settings), Some(settings)) => {
+                                if ui.button("Import VectrCap config…").clicked() {
+                                    crate::platform::windows::file_dialog::spawn_import_destination(
+                                        self.client.clone(),
+                                        self.picker_gate.clone(),
+                                    );
+                                }
+
+                                let zone = ui.add(
+                                    egui::Label::new(
+                                        "Drop one .vectrcap config here to review installation",
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+
+                                if zone.hovered() {
+                                    let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+                                    if files.len() == 1 {
+                                        match crate::app::cli::LaunchRequest::import(
+                                            files[0].path().to_path_buf().into_os_string(),
+                                        ) {
+                                            Ok(request) => commands.push(AppCommand::Launch {
+                                                request,
+                                                reply: None,
+                                            }),
+                                            Err(error) => self.client.report_error(error),
+                                        }
+                                    }
+                                }
+
                                 commands.extend(self.pane.draw(
                                     ui,
                                     settings,

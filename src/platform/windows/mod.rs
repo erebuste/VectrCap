@@ -15,3 +15,10 @@ pub mod poster;
 pub mod windows;
 
 pub mod recording_events;
+
+pub mod clipboard_sources;
+pub mod destination_association;
+pub mod explorer;
+pub mod ipc;
+
+pub mod drop_target;

@@ -15,6 +15,66 @@ pub fn draw(
 ) -> Vec<AppCommand> {
     let mut commands = vec![];
     ui.heading("Uploads");
+    for pending in &view.pending_ingress {
+        ui.push_id(pending.request, |ui| {
+            ui.label(format!(
+                "{} {} waiting: {}",
+                pending.count,
+                if pending.import {
+                    "config file"
+                } else {
+                    "file(s) for setup"
+                },
+                pending.names.join(", ")
+            ));
+            if ui.button("Cancel pending selection").clicked() {
+                commands.push(AppCommand::CancelPendingIngress(pending.request));
+            }
+        });
+    }
+    if !view.pending_ingress.is_empty() && ui.button("Retry pending selections").clicked() {
+        commands.push(AppCommand::ResumeIngress);
+    }
+    if ui.button("Upload from clipboard").clicked() {
+        commands.push(AppCommand::UploadClipboard);
+    }
+
+    let zone = ui.add(
+        eframe::egui::Label::new(
+            "Drop files here to upload · click here, then Ctrl+V to upload from clipboard",
+        )
+        .sense(eframe::egui::Sense::click()),
+    );
+
+    if zone.clicked() {
+        zone.request_focus();
+    }
+
+    if zone.hovered() {
+        let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if !files.is_empty() {
+            let paths = files
+                .into_iter()
+                .map(|f| f.path().to_path_buf().into_os_string())
+                .collect();
+            match crate::app::upload_sources::UploadSource::files(paths) {
+                Ok(source) => commands.push(AppCommand::UploadSource(source)),
+                Err(error) => client.report_error(error),
+            }
+        }
+    }
+
+    if zone.has_focus()
+        && ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, eframe::egui::Event::Paste(_)))
+                || i.modifiers.ctrl && i.key_pressed(eframe::egui::Key::V)
+        })
+    {
+        commands.push(AppCommand::UploadClipboard);
+    }
+
     if ui.button("Upload file…").clicked() {
         crate::platform::windows::file_dialog::spawn_pick_and_upload(
             client.clone(),

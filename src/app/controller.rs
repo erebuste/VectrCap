@@ -1,6 +1,7 @@
 //! Single owner for workflow/job acceptance and settings/credential transactions.
 //! There is no await point between reference inspection and durable commit.
 mod capture;
+pub mod ingress;
 mod recording;
 mod scrolling;
 mod task_chains;
@@ -145,6 +146,7 @@ pub struct BatchSummaryRow {
 /// last upload settlement, so every file's completion can be grouped into a
 /// single notice instead of one toast per file.
 struct FileBatch {
+    results: super::batches::UploadBatch,
     task_context: crate::workflow::runner::WorkflowContext,
     /// Paths not yet staged (succeeded or failed). The destination snapshot
     /// in `workflows` is released once this reaches zero, independent of
@@ -162,6 +164,8 @@ struct FileBatch {
     completions: Vec<Option<JobCompletion>>,
 }
 pub struct AppController {
+    ingress: super::ingress::Ingress,
+    install: Option<(Uuid, super::destination_install::DestinationInstallSession)>,
     task_runners: HashMap<Uuid, crate::workflow::runner::TaskRunner>,
     task_images: HashMap<Uuid, crate::ui::image_export::ImageFinish>,
     task_batches: HashMap<Uuid, (Uuid, usize)>,
@@ -208,6 +212,22 @@ impl AppController {
         clipboard: Arc<dyn ClipboardWriter>,
     ) -> Result<Self, AppError> {
         let references = Arc::new(References::default());
+        let ingress = super::ingress::Ingress::open(
+            &artifacts
+                .root()
+                .parent()
+                .ok_or(AppError::Persistence("ingress root missing"))?
+                .join("ingress.db"),
+        )?;
+        references
+            .0
+            .lock()
+            .map_err(|_| AppError::Persistence("references unavailable"))?
+            .active = ingress
+            .pending()?
+            .into_iter()
+            .filter_map(|p| p.destination.map(|d| d.id))
+            .collect();
         let manager = DestinationManager::open(
             repository,
             store.clone(),
@@ -223,6 +243,8 @@ impl AppController {
         let mut notifications = NotificationCenter::new();
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
+            ingress,
+            install: None,
             task_runners: recovered.into_iter().map(|r| (r.context().id, r)).collect(),
             task_images: HashMap::new(),
             task_batches: HashMap::new(),
@@ -515,44 +537,15 @@ impl AppController {
         paths: Vec<std::path::PathBuf>,
         selection: DestinationSelection,
     ) -> Result<Vec<AppEffect>, AppError> {
-        if paths.is_empty() || paths.len() > super::notifications::MAX_BATCH_ITEMS {
-            return Err(AppError::InvalidInput("select 1 to 100 files to upload"));
-        }
-        if self.workflows.len() >= 32 || self.batches.len() >= 32 {
-            return Err(AppError::InvalidInput(
-                "too many concurrent uploads accepted",
-            ));
-        }
-        self.manager.ensure_not_corrupted()?;
-        let task_context = self.task_context(
-            ArtifactKind::File,
-            Some(super::shortcuts::ShortcutAction::UploadFile),
+        let request = super::cli::LaunchRequest::upload(
+            paths.into_iter().map(|p| p.into_os_string()).collect(),
+        )?;
+        self.accept_launch_for(
+            request,
             selection,
-        );
-        let snapshot = task_context
-            .destination
-            .clone()
-            .ok_or(AppError::NeedsSetup(
-                "selected file upload destination needs setup",
-            ))?;
-        self.store.read(&snapshot.credential)?;
-        let batch = Uuid::new_v4();
-        self.workflows.insert(batch, snapshot);
-        self.batches.insert(
-            batch,
-            FileBatch {
-                task_context,
-                staging_remaining: paths.len(),
-                staging_done: vec![false; paths.len()],
-                jobs_remaining: 0,
-                completions: vec![None; paths.len()],
-            },
-        );
-        self.update_active()?;
-        Ok(vec![
-            AppEffect::WorkflowAccepted(batch),
-            AppEffect::StageFiles { batch, paths },
-        ])
+            Some(super::shortcuts::ShortcutAction::UploadFile),
+        )
+        .map(|(_, effects)| effects)
     }
     /// Creates the durable job for one successfully staged batch file,
     /// reusing the batch's single pre-resolved destination snapshot. The
@@ -572,7 +565,7 @@ impl AppController {
             .ok_or(AppError::InvalidInput("unknown accepted batch"))?
             .task_context
             .clone();
-        context.id = Uuid::new_v4();
+        context.id = ingress::member_id(batch, index);
         context.batch_id = Some(batch);
         context.kind = artifact.kind;
         context.intent = crate::workflow::runner::TaskIntent::Direct(
@@ -616,16 +609,9 @@ impl AppController {
     ) -> Vec<AppEffect> {
         let valid = self
             .batches
-            .get_mut(&batch)
-            .and_then(|state| state.staging_done.get_mut(index))
-            .is_some_and(|done| {
-                if *done {
-                    false
-                } else {
-                    *done = true;
-                    true
-                }
-            });
+            .get(&batch)
+            .and_then(|state| state.staging_done.get(index))
+            .is_some_and(|done| !*done);
         if !valid {
             let mut effects = vec![AppEffect::Error(AppError::InvalidInput(
                 "unknown or duplicate staging result",
@@ -637,11 +623,13 @@ impl AppController {
             }
             return effects;
         }
-        let mut effects = Vec::new();
+        let mut effects = vec![];
+        let mut rejected = false;
         match outcome {
             Ok(artifact) => match self.accept_batch_artifact(batch, index, &artifact) {
-                Ok(job_effects) => effects.extend(job_effects),
+                Ok(out) => effects.extend(out),
                 Err(error) => {
+                    rejected = true;
                     effects.push(AppEffect::FileRejected {
                         display_name,
                         error,
@@ -651,20 +639,38 @@ impl AppController {
                     }
                 }
             },
-            Err(error) => effects.push(AppEffect::FileRejected {
-                display_name,
-                error,
-            }),
+            Err(error) => {
+                rejected = true;
+                effects.push(AppEffect::FileRejected {
+                    display_name,
+                    error,
+                });
+            }
+        }
+        if rejected {
+            if let Err(error) = self.ingress.reject_slot(batch, index) {
+                effects.push(AppEffect::Error(error));
+                return effects;
+            }
+            if let Some(state) = self.batches.get_mut(&batch)
+                && let Err(error) = state
+                    .results
+                    .resolve(index, super::batches::BatchOutcome::Failed)
+            {
+                effects.push(AppEffect::Error(error));
+            }
         }
         if let Some(state) = self.batches.get_mut(&batch) {
+            state.staging_done[index] = true;
             state.staging_remaining = state.staging_remaining.saturating_sub(1);
             if state.staging_remaining == 0 {
-                // Every path has either become a durable job or been
-                // explicitly rejected; the destination reservation is no
-                // longer needed even if some jobs are still uploading.
                 self.workflows.remove(&batch);
-                let _ = self.update_active();
-                let _ = self.manager.cleanup();
+                if let Err(error) = self.update_active() {
+                    effects.push(AppEffect::Error(error));
+                }
+                if let Err(error) = self.manager.cleanup() {
+                    effects.push(AppEffect::Error(error));
+                }
             }
         }
         self.maybe_flush_batch(batch, &mut effects);
@@ -690,10 +696,35 @@ impl AppController {
         completion: Option<JobCompletion>,
         effects: &mut Vec<AppEffect>,
     ) -> bool {
-        let Some((batch, index)) = self.job_batch.remove(&job) else {
+        let Some(&(batch, index)) = self.job_batch.get(&job) else {
             return false;
         };
+        let outcome = match self.history.job(job) {
+            Ok(Some(record)) => match record.status {
+                JobStatus::Completed(receipt) => {
+                    super::batches::BatchOutcome::Success(receipt.url().into())
+                }
+                JobStatus::Uncertain => super::batches::BatchOutcome::Uncertain,
+                JobStatus::Cancelled => super::batches::BatchOutcome::Cancelled,
+                JobStatus::Failed { .. } => super::batches::BatchOutcome::Failed,
+                _ => return true,
+            },
+            Ok(None) => {
+                effects.push(AppEffect::Error(AppError::Persistence(
+                    "batch job is missing",
+                )));
+                return true;
+            }
+            Err(error) => {
+                effects.push(AppEffect::Error(error));
+                return true;
+            }
+        };
         if let Some(state) = self.batches.get_mut(&batch) {
+            if let Err(error) = state.results.resolve(index, outcome) {
+                effects.push(AppEffect::Error(error));
+                return true;
+            }
             state.jobs_remaining = state.jobs_remaining.saturating_sub(1);
             if let Some(completion) = completion
                 && let Some(slot) = state.completions.get_mut(index)
@@ -701,6 +732,7 @@ impl AppController {
                 *slot = Some(completion);
             }
         }
+        self.job_batch.remove(&job);
         self.maybe_flush_batch(batch, effects);
         true
     }
@@ -755,9 +787,24 @@ impl AppController {
         if !done {
             return;
         }
-        let Some(state) = self.batches.remove(&batch) else {
+        // Commit the once-only batch settlement before external clipboard work.
+        // A clipboard failure keeps links in History for explicit retry.
+        if let Err(error) = self.ingress.complete(batch) {
+            effects.push(AppEffect::Error(error));
+            return;
+        }
+        let Some(mut state) = self.batches.remove(&batch) else {
             return;
         };
+        self.workflows.remove(&batch);
+        if let Err(error) = self.update_active() {
+            effects.push(AppEffect::Error(error));
+        }
+        if let Some(text) = state.results.take_automatic_copy()
+            && let Err(error) = self.clipboard.write_text(&text)
+        {
+            effects.push(AppEffect::Error(error));
+        }
         // The slot count is the ORIGINAL picker-selection size; a selection
         // of exactly one file gets an ordinary single-job notice instead of
         // a one-item "batch", regardless of how many siblings were rejected
@@ -820,6 +867,12 @@ impl AppController {
             .workflows
             .values()
             .map(|s| s.id)
+            .chain(
+                self.ingress
+                    .pending()?
+                    .into_iter()
+                    .filter_map(|p| p.destination.map(|d| d.id)),
+            )
             .chain(
                 self.task_runners
                     .values()
@@ -1271,6 +1324,37 @@ impl AppController {
                 self.notifications.request(notice, &action)?;
                 self.execute_completion_action(notice, action)?
             }
+            AppCommand::Launch { request, reply } => match self.accept_launch(request) {
+                Ok((ack, effects)) => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(ack.request_id));
+                    }
+                    effects
+                }
+                Err(error) => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(error.clone()));
+                    }
+                    return Err(error);
+                }
+            },
+            AppCommand::Install { request, command } => self.install_command(request, command)?,
+            AppCommand::UploadSource(source) => self.accept_upload_source(source)?,
+            AppCommand::UploadClipboard => vec![AppEffect::ReadUploadClipboard {
+                selection: DestinationSelection::Inherit,
+                action: None,
+            }],
+            AppCommand::UploadClipboardFor(selection) => vec![AppEffect::ReadUploadClipboard {
+                selection,
+                action: Some(super::shortcuts::ShortcutAction::UploadFromClipboard),
+            }],
+            AppCommand::UploadSourceFor {
+                source,
+                selection,
+                action,
+            } => self.accept_upload_source_for(source, selection, action)?,
+            AppCommand::ResumeIngress => self.resume_ingress()?,
+            AppCommand::CancelPendingIngress(id) => self.cancel_pending_ingress(id)?,
             AppCommand::AcceptFileSelection(paths) => {
                 self.accept_file_selection(paths, DestinationSelection::Inherit)?
             }
@@ -1584,6 +1668,23 @@ impl AppController {
                 outcome,
             } => self.file_staged(batch, index, display_name, outcome),
             AppEvent::Queue(_) => vec![AppEffect::RefreshQueue],
+            AppEvent::ConnectionTest { request, result }
+                if self.install.as_ref().is_some_and(|(id, s)| {
+                    *id == request
+                        && s.state() == super::destination_install::InstallState::Verifying
+                }) =>
+            {
+                match self
+                    .install
+                    .as_mut()
+                    .expect("checked install")
+                    .1
+                    .verification_result(result)
+                {
+                    Ok(()) => vec![],
+                    Err(e) => vec![AppEffect::Error(e)],
+                }
+            }
             AppEvent::ConnectionTest { request, result }
                 if self.lifecycle == Lifecycle::Running =>
             {

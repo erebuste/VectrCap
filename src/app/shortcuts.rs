@@ -207,6 +207,7 @@ impl ShortcutAction {
                     | ShortcutAction::ShowHistory
                     | ShortcutAction::ShowSettings
                     | ShortcutAction::UploadFile
+                    | ShortcutAction::UploadFromClipboard
                     | ShortcutAction::RegionScreenshot
                     | ShortcutAction::WindowScreenshot
                     | ShortcutAction::FullscreenScreenshot
@@ -525,6 +526,9 @@ fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
         ShortcutAction::ShowSettings => {
             Some(ShortcutOutcome::Command(AppCommand::Show(Window::Settings)))
         }
+        ShortcutAction::UploadFromClipboard => {
+            Some(ShortcutOutcome::Command(AppCommand::UploadClipboard))
+        }
         ShortcutAction::UploadFile => Some(ShortcutOutcome::OpenFilePicker(
             DestinationSelection::Inherit,
         )),
@@ -689,6 +693,14 @@ impl ShortcutManager {
         }
         let outcome = command_for(event.action)?;
         match outcome {
+            ShortcutOutcome::Command(crate::app::events::AppCommand::UploadClipboard) => Some(
+                ShortcutOutcome::Command(crate::app::events::AppCommand::UploadClipboardFor(
+                    self.bindings
+                        .iter()
+                        .find(|b| b.action == event.action)?
+                        .destination,
+                )),
+            ),
             ShortcutOutcome::Command(crate::app::events::AppCommand::PinSource(
                 crate::pin::source::PinSource::Screen,
             )) => Some(ShortcutOutcome::Command(

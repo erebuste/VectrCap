@@ -130,8 +130,8 @@ impl ArtifactStore {
         let display_name = display_name_of(source)?;
         check_source_path(source)?;
         let mut src = winfs::open_read_exclusive(source).map_err(|e| {
-            // Directories fail to open as files with access-denied; the lookup
-            // only classifies the error, the handle check is authoritative.
+            // This legacy/trusted-source API retains resolved-local-parent
+            // behavior. External ingress uses the stricter cancellable API.
             let not_file = fs::symlink_metadata(source).is_ok_and(|m| !m.is_file());
             if e.kind() == io::ErrorKind::InvalidInput || not_file {
                 NOT_REGULAR
@@ -224,9 +224,10 @@ impl ArtifactStore {
         }
         let display_name = display_name_of(source)?;
         check_source_path(source)?;
-        let mut src = winfs::open_read_exclusive(source).map_err(|e| {
-            let not_file = fs::symlink_metadata(source).is_ok_and(|m| !m.is_file());
-            if e.kind() == io::ErrorKind::InvalidInput || not_file {
+        let mut src = winfs::open_local_source(source, false).map_err(|e| {
+            // Never reopen a rejected path to classify it: a reparse parent
+            // could make that secondary lookup contact a network provider.
+            if e.kind() == io::ErrorKind::InvalidInput {
                 NOT_REGULAR
             } else {
                 open_error("opening the source file", &e)

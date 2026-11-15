@@ -48,6 +48,24 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    Launch {
+        request: super::cli::LaunchRequest,
+        reply: Option<std::sync::mpsc::SyncSender<Result<Uuid, AppError>>>,
+    },
+    Install {
+        request: Uuid,
+        command: super::controller::ingress::InstallCommand,
+    },
+    ResumeIngress,
+    CancelPendingIngress(Uuid),
+    UploadSource(super::upload_sources::UploadSource),
+    UploadClipboard,
+    UploadClipboardFor(DestinationSelection),
+    UploadSourceFor {
+        source: super::upload_sources::UploadSource,
+        selection: DestinationSelection,
+        action: Option<ShortcutAction>,
+    },
     PinFromScreenFor(DestinationSelection),
     SetTaskProfiles {
         tasks: crate::workflow::profile::TaskProfiles,
@@ -284,6 +302,20 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    CancelInstallVerify,
+    VerifyInstall {
+        request: Uuid,
+        client: crate::vectr::client::VectrClient,
+    },
+    ReadUploadClipboard {
+        selection: DestinationSelection,
+        action: Option<ShortcutAction>,
+    },
+    StageIngressFile {
+        batch: Uuid,
+        index: usize,
+        path: PathBuf,
+    },
     AcquireScrolling(Uuid),
     CancelScrolling,
     StartScrolling {

@@ -14,6 +14,7 @@ use eframe::egui::{self, Ui};
 use uuid::Uuid;
 #[derive(Default)]
 pub struct SettingsPane {
+    integrations: super::integrations::IntegrationsPane,
     recorder: Option<super::recording_settings::RecordingSettingsPane>,
     audio_endpoints: Vec<super::audio_sources::AudioEndpoint>,
     audio_meter: Option<Result<f32, AppError>>,
@@ -88,6 +89,7 @@ impl SettingsPane {
         )],
         recorded_shortcut: Option<(Uuid, crate::app::shortcuts::KeyChord)>,
     ) -> Vec<AppCommand> {
+        self.integrations.draw(ui);
         let mut commands = super::task_settings::draw(ui, settings);
         let mut recording_open = false;
         ui.collapsing("Recording", |ui| {

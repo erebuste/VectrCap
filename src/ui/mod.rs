@@ -33,3 +33,6 @@ pub mod scrolling_controls;
 pub mod quick_tasks;
 pub mod task_results;
 pub mod task_settings;
+
+pub mod destination_install;
+pub mod integrations;

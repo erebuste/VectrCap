@@ -17,6 +17,7 @@ use std::path::PathBuf;
 /// against this same document; snapshots never duplicate frozen image buffers.
 pub struct CaptureSurface {
     pub task_target: String,
+    pub image_local: bool,
     pub intended_pin: bool,
     pub scrolling_review: Option<crate::ui::scrolling_review::ScrollReviewStatus>,
     pub review_viewport: crate::ui::image_review::ImageViewport,
@@ -147,6 +148,7 @@ impl AppController {
                     || "Upload destination needs setup".into(),
                     |d| format!("Upload target: {} ({})", d.label, d.origin.as_str()),
                 ),
+                image_local: false,
                 intended_pin: capture.intended_pin,
                 scrolling_review: None,
                 review_viewport: Default::default(),
@@ -596,6 +598,7 @@ impl AppController {
                 || "Upload destination needs setup".into(),
                 |d| format!("Upload target: {} ({})", d.label, d.origin.as_str()),
             ),
+            image_local: true,
             intended_pin: false,
             scrolling_review: Some(status),
             review_viewport: Default::default(),
@@ -618,5 +621,84 @@ impl AppController {
             save_path: None,
         });
         Ok(vec![AppEffect::CaptureSurface(Some(surface))])
+    }
+}
+
+impl AppController {
+    pub(super) fn accept_upload_source(
+        &mut self,
+        source: super::super::upload_sources::UploadSource,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        self.accept_upload_source_for(source, DestinationSelection::Inherit, None)
+    }
+    pub(super) fn accept_upload_source_for(
+        &mut self,
+        source: super::super::upload_sources::UploadSource,
+        selection: DestinationSelection,
+        action: Option<super::super::shortcuts::ShortcutAction>,
+    ) -> Result<Vec<AppEffect>, AppError> {
+        use super::super::upload_sources::*;
+        match route_source(source, SourceFocus::ExplicitAction)? {
+            SourceAction::UploadFiles(paths) => self
+                .accept_launch_for(
+                    super::super::cli::LaunchRequest::upload(paths)?,
+                    selection,
+                    action,
+                )
+                .map(|(_, effects)| effects),
+            SourceAction::ReviewImage(image) => {
+                if self.capture.is_some()
+                    || self.scrolling.is_some()
+                    || self
+                        .recording
+                        .as_ref()
+                        .is_some_and(|w| w.session.acquiring())
+                {
+                    return Err(AppError::InUse(
+                        "finish the active capture before opening clipboard review",
+                    ));
+                }
+                let overlay =
+                    crate::ui::image_review::ImageReview::from_image(image)?.into_editor();
+                let context = self.task_context(ArtifactKind::Screenshot, action, selection);
+                let id = context.id;
+                let surface = Arc::new(Mutex::new(CaptureSurface {
+                    image_local: true,
+                    intended_pin: false,
+                    task_target: context.destination.as_ref().map_or_else(
+                        || "Upload destination needs setup".into(),
+                        |d| format!("Upload target: {} ({})", d.label, d.origin.as_str()),
+                    ),
+                    scrolling_review: None,
+                    review_viewport: Default::default(),
+                    session: id,
+                    overlay,
+                    archive_failed: false,
+                    pending_finish: false,
+                    native_scale: 1.0,
+                    dialog_open: false,
+                    working: false,
+                }));
+                if let Some(d) = &context.destination {
+                    self.workflows.insert(id, d.clone());
+                    if let Err(error) = self.update_active() {
+                        self.workflows.remove(&id);
+                        return Err(error);
+                    }
+                }
+                self.capture = Some(CaptureWorkflow {
+                    intended_pin: false,
+                    id,
+                    surface: Some(surface.clone()),
+                    mode: CaptureMode::Fullscreen,
+                    context,
+                    monitors: vec![],
+                    pending: None,
+                    save_path: None,
+                });
+                Ok(vec![AppEffect::CaptureSurface(Some(surface))])
+            }
+            SourceAction::KeepTextPaste => Ok(vec![]),
+        }
     }
 }

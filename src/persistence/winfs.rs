@@ -249,6 +249,57 @@ pub(crate) fn open_read_exclusive(path: &Path) -> io::Result<File> {
     )
 }
 
+/// File ingress pins every ancestor to a local disk handle. Checking only a
+/// final resolved path is too late: traversing a mapped drive or reparse parent
+/// can already contact a network provider before the file is classified.
+pub(crate) fn open_local_source(path: &Path, delete: bool) -> io::Result<File> {
+    use std::path::{Component, PathBuf, Prefix};
+    use windows_sys::Win32::{
+        Storage::FileSystem::GetDriveTypeW,
+        System::WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE},
+    };
+    let mut parts = path.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else {
+        return Err(invalid("source requires a local drive"));
+    };
+    let drive = match prefix.kind() {
+        Prefix::Disk(d) | Prefix::VerbatimDisk(d) => d,
+        _ => return Err(invalid("source requires a local drive")),
+    };
+    if !matches!(parts.next(), Some(Component::RootDir)) {
+        return Err(invalid("source requires an absolute path"));
+    }
+    let root = [u16::from(drive), 58, 92, 0];
+    // These are local storage classes. Network providers and unavailable drives
+    // are rejected without opening any source directory or file.
+    if !matches!(
+        unsafe { GetDriveTypeW(root.as_ptr()) },
+        DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK
+    ) {
+        return Err(invalid("source drive is not local"));
+    }
+    let root = PathBuf::from(format!("{}:\\", char::from(drive)));
+    let mut parent = open_root(&root)?;
+    let components: Vec<_> = parts.collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(invalid("unsafe source component"));
+        };
+        let name = name
+            .to_str()
+            .ok_or_else(|| invalid("source component must be Unicode"))?;
+        if index == components.len() - 1 {
+            return if delete {
+                open_child_file(&parent, name)
+            } else {
+                open_child_read(&parent, name)
+            };
+        }
+        parent = open_child_dir(&parent, name, false)?;
+    }
+    Err(invalid("source file missing"))
+}
+
 /// Like `open_read_exclusive`, with DELETE access for `delete_by_handle`.
 pub(crate) fn open_owned_by_path(path: &Path) -> io::Result<File> {
     regular(

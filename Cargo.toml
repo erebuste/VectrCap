@@ -31,7 +31,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 rand = "0.10"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "multipart", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 zeroize = "1.9.1"
 eframe = { version = "=0.37.0", default-features = false, features = ["glow", "accesskit", "default_fonts", "clipboard"] }
@@ -46,7 +46,8 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 # NtCreateFile opens, rename/delete/identity by handle, final-path checks, free space.
 [target.'cfg(windows)'.dependencies]
 windows-capture = "=2.0.1"
-windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_FunctionDiscovery", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Performance", "Win32_System_Threading", "Win32_Security"] }
+windows-core = "=0.62.2"
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_FunctionDiscovery", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Performance", "Win32_System_Threading", "Win32_Security"] }
 windows-sys = { version = "0.61.2", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -55,6 +56,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Credentials",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_WindowsProgramming",
     "Win32_System_RemoteDesktop",
     "Win32_System_Com",
     "Win32_System_Registry",

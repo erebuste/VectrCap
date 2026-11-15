@@ -85,6 +85,7 @@ impl Tray {
                 return;
             }
             let command = match event.id.as_ref() {
+                "upload-clipboard" => Some(AppCommand::UploadClipboard),
                 "scrolling" => Some(AppCommand::ToggleScrolling),
                 "record-gif" => Some(AppCommand::ToggleRecording { mp4: false }),
                 "record-mp4" => Some(AppCommand::ToggleRecording { mp4: true }),
@@ -203,6 +204,13 @@ impl Tray {
             menu.append(&MenuItem::with_id(
                 "cancel-capture",
                 "Cancel active capture / delay",
+                true,
+                None,
+            ))
+            .map_err(|_| error())?;
+            menu.append(&MenuItem::with_id(
+                "upload-clipboard",
+                "Upload from clipboard",
                 true,
                 None,
             ))

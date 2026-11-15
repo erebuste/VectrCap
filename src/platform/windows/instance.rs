@@ -1,17 +1,13 @@
-//! Handle lifetime guard plus event-only focus request. No upload/config ingress.
+//! Per-logon lifetime guard and focus event; path handoff uses the secured pipe.
 #![allow(unsafe_code)]
 use crate::app::error::AppError;
 use std::{ptr, sync::Arc, thread::JoinHandle};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree},
     Security::{
-        Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW, SECURITY_ATTRIBUTES,
     },
-    System::Threading::{
-        CreateEventW, CreateMutexW, GetCurrentProcess, INFINITE, OpenProcessToken, SetEvent,
-        WaitForMultipleObjects,
-    },
+    System::Threading::{CreateEventW, CreateMutexW, INFINITE, SetEvent, WaitForMultipleObjects},
 };
 struct Handle(HANDLE);
 impl Drop for Handle {
@@ -26,45 +22,6 @@ fn error() -> AppError {
 }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
-}
-fn current_sid() -> Result<String, AppError> {
-    // GetTokenInformation requires aligned storage; Vec<usize> supplies it.
-    unsafe {
-        let mut token = ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(error());
-        }
-        let token = Handle(token);
-        let mut bytes = 0;
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut bytes);
-        if bytes == 0 || bytes > 65536 {
-            return Err(error());
-        }
-        let mut buffer = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
-        if GetTokenInformation(
-            token.0,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            bytes,
-            &mut bytes,
-        ) == 0
-        {
-            return Err(error());
-        }
-        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
-        let mut sid = ptr::null_mut();
-        if ConvertSidToStringSidW(user.User.Sid, &mut sid) == 0 {
-            return Err(error());
-        }
-        let mut length = 0;
-        while *sid.add(length) != 0 {
-            length += 1;
-        }
-        let result =
-            String::from_utf16(std::slice::from_raw_parts(sid, length)).map_err(|_| error());
-        LocalFree(sid.cast());
-        result
-    }
 }
 pub struct InstanceGuard {
     _mutex: Handle,
@@ -85,12 +42,37 @@ impl InstanceGuard {
         {
             return Err(AppError::InvalidInput("invalid instance namespace"));
         }
-        let base = format!("Local\\{}-{}", namespace, current_sid()?);
-        // Default token DACL, current interactive session and SID-qualified name.
-        // Create the event first so a racing secondary always has a signal target.
+        let policy = super::ipc::current_policy()?;
+        let base = policy.instance_name(namespace)?;
+        // The same explicit logon-SID DACL and namespace protect the guard and
+        // pipe. Create the event before the mutex so racing activation can focus.
         unsafe {
+            let mut descriptor = ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide(&policy.sddl()).as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            ) == 0
+            {
+                return Err(error());
+            }
+            struct Descriptor(*mut std::ffi::c_void);
+            impl Drop for Descriptor {
+                fn drop(&mut self) {
+                    unsafe {
+                        LocalFree(self.0);
+                    }
+                }
+            }
+            let descriptor = Descriptor(descriptor);
+            let security = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: 0,
+            };
             let event = Handle(CreateEventW(
-                ptr::null(),
+                &security,
                 0,
                 0,
                 wide(&format!("{base}-focus")).as_ptr(),
@@ -98,7 +80,7 @@ impl InstanceGuard {
             if event.0.is_null() {
                 return Err(error());
             }
-            let mutex = CreateMutexW(ptr::null(), 0, wide(&format!("{base}-guard")).as_ptr());
+            let mutex = CreateMutexW(&security, 0, wide(&format!("{base}-guard")).as_ptr());
             let existed = GetLastError() == ERROR_ALREADY_EXISTS;
             let mutex = Handle(mutex);
             if mutex.0.is_null() {

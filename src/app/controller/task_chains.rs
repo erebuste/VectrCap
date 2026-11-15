@@ -188,6 +188,7 @@ impl AppController {
                     .as_ref()
                     .ok_or(AppError::InUse("a confirmed receipt is required"))?;
                 match t {
+                    UploadTask::CopyUrl if c.batch_id.is_some() => {}
                     UploadTask::CopyUrl => self.clipboard.write_text(receipt.url())?,
                     UploadTask::OpenUrl => self.shell.open_url(receipt.url())?,
                     UploadTask::ShowResult => {
@@ -247,9 +248,15 @@ impl AppController {
         }
         if r.complete() {
             self.task_images.remove(&id);
-            if let Some((batch, _)) = self.task_batches.remove(&id) {
+            if let Some((batch, index)) = self.task_batches.remove(&id) {
                 if let Some(state) = self.batches.get_mut(&batch) {
                     state.jobs_remaining = state.jobs_remaining.saturating_sub(1);
+                    if let Err(error) = state
+                        .results
+                        .resolve(index, super::super::batches::BatchOutcome::Cancelled)
+                    {
+                        out.push(AppEffect::Error(error));
+                    }
                 }
                 self.maybe_flush_batch(batch, &mut out);
             }

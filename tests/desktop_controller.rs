@@ -704,17 +704,23 @@ fn bad_file_alongside_valid_file_in_a_batch_still_uploads_the_valid_one() {
 }
 
 #[test]
-fn file_selection_without_a_configured_destination_fails_before_touching_any_file() {
+fn file_selection_without_a_configured_destination_is_retained_without_touching_any_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
     let mut app = controller(dir.path(), store);
     let path = dir.path().join("a.txt");
     std::fs::write(&path, b"content").unwrap();
     let effects = app.dispatch(AppCommand::AcceptFileSelection(vec![path.clone()]));
-    assert!(matches!(
-        effects.as_slice(),
-        [AppEffect::Error(AppError::NeedsSetup(_))]
-    ));
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::Settings))))
+    );
+    assert!(!effects.iter().any(|e| matches!(
+        e,
+        AppEffect::StageFiles { .. } | AppEffect::StageIngressFile { .. }
+    )));
+    assert_eq!(app.pending_ingress_count().unwrap(), 1);
     assert_eq!(app.active_workflow_count(), 0);
     // Nothing was staged: the source still has its original bytes, and no
     // spool directory was ever populated.

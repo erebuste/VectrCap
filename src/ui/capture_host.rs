@@ -23,9 +23,9 @@ impl CaptureHost {
         }
         if let Some(surface) = &view.capture_surface {
             if let Ok(state) = surface.try_lock() {
-                match if state.scrolling_review.is_some() {
+                match if state.image_local || state.scrolling_review.is_some() {
                     Ok(egui::ViewportBuilder::default()
-                        .with_title("VectrCap scrolling image review")
+                        .with_title("VectrCap image review")
                         .with_inner_size([1000.0, 800.0]))
                 } else {
                     state.overlay.viewport_builder(state.native_scale)
@@ -101,7 +101,7 @@ impl CaptureHost {
                             Some(CaptureOverlayEvent::Cancel)
                         } else {
                             view.settings.as_ref().and_then(|settings| {
-                                if state.scrolling_review.is_some(){
+                                if state.image_local || state.scrolling_review.is_some(){
                                     let super::super::app::controller::CaptureSurface{overlay,review_viewport,..}=&mut *state;
                                     ui.add_enabled_ui(!partial_blocked,|ui|overlay.show_review(ui,&settings.shortcuts,review_viewport)).inner
                                 }else{state.overlay.show(ui,&settings.shortcuts)}
