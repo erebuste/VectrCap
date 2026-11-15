@@ -28,7 +28,7 @@ impl eframe::App for Probe {
             format!(
                 "Native geometry: {:?}; ppp {}; source {:?}",
                 i.viewport().inner_rect,
-                ctx.pixels_per_point(),
+                i.pixels_per_point,
                 self.overlay.document().bounds()
             )
         });
