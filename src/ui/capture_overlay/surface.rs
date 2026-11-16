@@ -157,7 +157,7 @@ impl CaptureOverlay {
                 });
                 if self.sampling { ui.label("Click a nearby background pixel to sample; the following gesture paints it."); }
                 if self.tool==AnnotationTool::SmartEraser && self.sampled.is_none() { ui.label("Sample a frozen source color before painting."); }
-                ui.label("Release left mouse: finish screenshot selection. Enter: commit text or show output options. Escape: cancel active edit first. Shift+Tab: focus tools; Tab/Shift+Tab: traverse focused controls.");
+                ui.label("Release left mouse: run configured capture tasks. Enter: commit text or show output options. Escape: cancel active edit first. Shift+Tab: focus tools; Tab/Shift+Tab: traverse focused controls.");
                 ui.label("Region arrows: move 1 physical pixel; Shift+arrows: resize 1 physical pixel.");
                 if self.preview.accepted!=Some(self.generation) { ui.label("Preparing annotation preview..."); }
                 if let Some(error)=&self.error { ui.colored_label(ui.visuals().error_fg_color,error.to_string()); }
@@ -314,8 +314,34 @@ impl CaptureOverlay {
             self.finishing = true;
             return Some(CaptureOverlayEvent::RecordingSelected(rect));
         }
+        if self.finish_tasks_on_release && !self.finishing && !self.has_active_edit() {
+            let wake = ctx.clone();
+            self.prepare_output(move || wake.request_repaint());
+            if let Some(error) = self.output.error().cloned() {
+                // Retain the source and expose the existing preview/retry controls.
+                self.finish_tasks_on_release = false;
+                self.error = Some(error);
+            } else if self.output.ready(&self.document).is_some() {
+                let result = self.confirm_finish(OverlayAction::RunSelectedTasks);
+                self.finish_tasks_on_release = false;
+                match result {
+                    Ok(finish) => {
+                        self.finished_on_release = true;
+                        self.finish_visible = false;
+                        return Some(CaptureOverlayEvent::Finish(finish));
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            } else {
+                egui::Area::new(egui::Id::unique("preparing-screenshot"))
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .show(&ctx, |ui| {
+                        ui.label("Preparing screenshot…");
+                    });
+            }
+        }
         let mut finish = None;
-        if self.finish_visible && !self.has_active_edit() {
+        if self.finish_visible && !self.finish_tasks_on_release && !self.has_active_edit() {
             let mut open = true;
             egui::Window::new("Final image output")
                 .id(egui::Id::unique(("capture-finish", self.document.id())))
@@ -333,12 +359,13 @@ impl CaptureOverlay {
             }
         }
         if let Some(output) = finish {
+            self.finished_on_release = false;
             // draw() can emit only a ready revision. Do not admit edits until
             // the owner acknowledges success or calls finish_failed.
             self.finishing = true;
             return Some(CaptureOverlayEvent::Finish(output));
         }
-        if !self.finishing {
+        if !self.finishing && !self.finish_tasks_on_release {
             for event in &events {
                 let result = match event {
                     egui::Event::PointerMoved(pos) => {

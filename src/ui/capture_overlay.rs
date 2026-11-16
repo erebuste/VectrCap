@@ -172,6 +172,9 @@ pub struct CaptureOverlay {
     sampling: bool,
     options: ToolOptions,
     finish_visible: bool,
+    finish_tasks_on_release: bool,
+    release_runs_tasks: bool,
+    finished_on_release: bool,
     finishing: bool,
     cancelled: bool,
     error: Option<AppError>,
@@ -203,6 +206,9 @@ impl CaptureOverlay {
             sampling: false,
             options: Default::default(),
             finish_visible: false,
+            finish_tasks_on_release: false,
+            release_runs_tasks: true,
+            finished_on_release: false,
             finishing: false,
             cancelled: false,
             error: None,
@@ -247,6 +253,13 @@ impl CaptureOverlay {
         overlay.pointer = Some(pointer);
         Ok(overlay)
     }
+    /// Pin-from-screen keeps explicit image output choices instead of invoking screenshot tasks.
+    pub fn finished_on_release(&self) -> bool {
+        self.finished_on_release
+    }
+    pub fn retain_editor_after_selection(&mut self) {
+        self.release_runs_tasks = false;
+    }
     pub fn set_recording_summary(&mut self, summary: String) {
         self.recording_summary = summary;
     }
@@ -286,6 +299,7 @@ impl CaptureOverlay {
         }
     }
     fn changed(&mut self) {
+        self.finish_tasks_on_release = false;
         self.generation = self.generation.wrapping_add(1);
         self.finish_visible = false;
     }
@@ -407,6 +421,7 @@ impl CaptureOverlay {
         self.editable()?;
         match input {
             OverlayInput::Escape => {
+                self.finish_tasks_on_release = false;
                 if self.has_active_edit() {
                     self.text = None;
                     self.gesture = None;
@@ -459,6 +474,7 @@ impl CaptureOverlay {
     }
     /// Failed downstream IO returns to this exact document and output settings.
     pub fn finish_failed(&mut self, error: AppError) {
+        self.finish_tasks_on_release = false;
         self.finishing = false;
         self.output.set_finishing(false);
         self.error = Some(error);

@@ -227,6 +227,7 @@ impl CaptureOverlay {
             // Recording/scrolling keep their explicit Start/countdown boundary.
             if selected && !self.recording_selection {
                 self.handle(OverlayInput::Enter)?;
+                self.finish_tasks_on_release = self.release_runs_tasks;
             }
             return Ok(());
         }

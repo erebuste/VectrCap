@@ -148,6 +148,9 @@ impl AppController {
                     });
             let mut overlay = CaptureOverlay::from_snapshot(snapshot, pointer, (4, 4))?;
             overlay.initialize_preferences(&preferences)?;
+            if capture.intended_pin {
+                overlay.retain_editor_after_selection();
+            }
             Ok(Arc::new(Mutex::new(CaptureSurface {
                 task_target: capture.context.destination.as_ref().map_or_else(
                     || "Upload destination needs setup".into(),
@@ -557,7 +560,21 @@ impl AppController {
         {
             return Err(primary_task_error);
         }
-        if action == OverlayAction::RunSelectedTasks {
+        let needs_attention = self
+            .task_runners
+            .get(&capture.context.id)
+            .is_some_and(|runner| {
+                runner.states().iter().any(|step| {
+                    matches!(
+                        step.outcome,
+                        crate::workflow::steps::StepOutcome::NeedsUserAction(_)
+                            | crate::workflow::steps::StepOutcome::Failed(_)
+                    )
+                })
+            });
+        if action == OverlayAction::RunSelectedTasks
+            && (!surface.overlay.finished_on_release() || needs_attention)
+        {
             self.window = Some(Window::Tasks);
             effects.push(AppEffect::Window(self.window));
         }

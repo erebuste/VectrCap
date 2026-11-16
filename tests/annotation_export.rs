@@ -2006,3 +2006,70 @@ fn direct_copy_failure_retains_the_primary_clipboard_diagnosis() {
         AppEffect::Error(AppError::Persistence("injected image clipboard failure"))
     )));
 }
+
+#[test]
+fn quick_capture_runs_profile_and_closes_without_opening_task_results() {
+    use vectrcap::{
+        app::events::{AppCommand, AppEffect, Window},
+        capture::request::CaptureMode,
+        ui::{annotation_toolbar::AnnotationTool, capture_overlay::CaptureOverlayEvent},
+        workflow::profile::CaptureTask,
+    };
+    let mut fx = ControllerFixture::new();
+    let mut tasks = fx.app.settings().tasks.clone();
+    tasks.global.capture.insert(CaptureTask::CopyImage);
+    assert_no_error(&fx.app.dispatch(AppCommand::SetTaskProfiles {
+        tasks,
+        archive: fx.app.settings().archive.clone(),
+        revision: fx.app.settings().revision,
+    }));
+    let (session, surface) = fx.start(CaptureMode::Region);
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut state = surface.lock().unwrap();
+        let overlay = &mut state.overlay;
+        overlay.clear_crop().unwrap();
+        overlay.set_tool(AnnotationTool::Region).unwrap();
+        overlay.pointer_down(PhysicalPoint { x: 0, y: 0 }).unwrap();
+        overlay
+            .pointer_move(PhysicalPoint { x: 20, y: 20 }, false)
+            .unwrap();
+        overlay
+            .pointer_up(PhysicalPoint { x: 20, y: 20 }, false)
+            .unwrap();
+        overlay.prepare_output(move || {
+            let _ = tx.send(());
+        });
+    }
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let ctx = eframe::egui::Context::default();
+    let mut event = None;
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        event = surface
+            .lock()
+            .unwrap()
+            .overlay
+            .show(ui, &Default::default())
+    });
+    output.textures_delta.clear();
+    let Some(CaptureOverlayEvent::Finish(finish)) = event else {
+        panic!("missing quick finish")
+    };
+    let effects = fx.app.dispatch(AppCommand::FinishCapture {
+        session,
+        finish,
+        save_path: None,
+    });
+    assert_no_error(&effects);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::CaptureSurface(None)))
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::Tasks))))
+    );
+    assert_eq!(fx.clipboard.images.lock().unwrap().len(), 1);
+}

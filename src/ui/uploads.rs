@@ -87,20 +87,44 @@ pub fn draw(
             ui.colored_label(ui.visuals().error_fg_color, format!("{name}: {error}"));
         }
     }
-    ui.label(if view.queue_paused {
-        "Queue paused. Resume all keeps individually paused jobs paused."
-    } else {
-        "Queue active. One upload runs at a time."
-    });
-    ui.horizontal_wrapped(|ui| {
-        for (label, action) in [
-            ("Pause all", QueueAction::PauseAll),
-            ("Resume all", QueueAction::ResumeAll),
-            ("Retry eligible failures", QueueAction::RetryEligible),
-        ] {
+    ui.add_space(8.0);
+    eframe::egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                eframe::egui::RichText::new(if view.queue_paused {
+                    "Uploads paused"
+                } else {
+                    "Uploads active"
+                })
+                .strong()
+                .color(ui.visuals().text_color()),
+            );
+            let (label, action) = if view.queue_paused {
+                ("Resume uploads", QueueAction::ResumeAll)
+            } else {
+                ("Pause uploads", QueueAction::PauseAll)
+            };
             if ui.button(label).clicked() {
                 commands.push(AppCommand::Queue(action));
             }
+        });
+        if view.queue_paused {
+            ui.label("New and waiting uploads will stay here until you resume.");
+        }
+        if view
+            .jobs
+            .iter()
+            .any(|job| job.paused && !job.status.is_terminal())
+        {
+            ui.small("Individually paused uploads also need Resume job.");
+        }
+        if view
+            .jobs
+            .iter()
+            .any(|job| matches!(job.status, JobStatus::Failed { .. }))
+            && ui.button("Retry failed uploads").clicked()
+        {
+            commands.push(AppCommand::Queue(QueueAction::RetryEligible));
         }
     });
     ui.add_space(12.0);
@@ -139,7 +163,9 @@ pub fn draw(
                 _ => "Waiting",
             };
             ui.label(status);
-            if let Some((bytes, speed)) = view.transfers.get(&job.id) {
+            if !job.status.is_terminal()
+                && let Some((bytes, speed)) = view.transfers.get(&job.id)
+            {
                 ui.label(format!(
                     "Acknowledged: {bytes} / {} bytes",
                     job.artifact.size
@@ -151,7 +177,11 @@ pub fn draw(
                         .map(|n| format!("Payload speed: {:.1} KiB/s", n / 1024.0))
                         .unwrap_or_else(|| "Payload speed: Waiting".into())
                 } else {
-                    "Payload speed: Paused / Waiting".into()
+                    if job.paused || view.queue_paused {
+                        "Paused".into()
+                    } else {
+                        "Waiting to upload".into()
+                    }
                 });
             }
             ui.horizontal_wrapped(|ui| {

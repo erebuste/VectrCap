@@ -495,3 +495,50 @@ fn cancelled_screenshot_drag_release_does_not_finish() {
     overlay.pointer_up(point(100, 100), false).unwrap();
     assert!(!overlay.finish_visible());
 }
+
+#[test]
+fn release_runs_configured_tasks_once_without_output_dialog_confirmation() {
+    let mut overlay = session();
+    overlay.set_tool(Tool::Region).unwrap();
+    drag(&mut overlay, point(-90, -40), point(100, 100));
+    let (tx, rx) = std::sync::mpsc::channel();
+    overlay.prepare_output(move || {
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let ctx = eframe::egui::Context::default();
+    let mut event = None;
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        event = overlay.show(ui, &Default::default())
+    });
+    output.textures_delta.clear();
+    let Some(CaptureOverlayEvent::Finish(finish)) = event else {
+        panic!("release must finish without a second confirmation")
+    };
+    assert_eq!(finish.action, OverlayAction::RunSelectedTasks);
+    assert!(overlay.finished_on_release());
+    assert!(overlay.validate_finish(&finish).is_ok());
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        assert!(overlay.show(ui, &Default::default()).is_none())
+    });
+    output.textures_delta.clear();
+}
+
+#[test]
+fn pin_selection_preserves_explicit_output_choices() {
+    let mut overlay = session();
+    overlay.retain_editor_after_selection();
+    overlay.set_tool(Tool::Region).unwrap();
+    drag(&mut overlay, point(-90, -40), point(100, 100));
+    let (tx, rx) = std::sync::mpsc::channel();
+    overlay.prepare_output(move || {
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let ctx = eframe::egui::Context::default();
+    let mut output = ctx.run_ui(Default::default(), |ui| {
+        assert!(overlay.show(ui, &Default::default()).is_none())
+    });
+    output.textures_delta.clear();
+    assert!(overlay.finish_visible());
+}

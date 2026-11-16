@@ -19,6 +19,7 @@ struct Probe {
     shortcuts: ShortcutSettings,
     zoom: f32,
     last_view: Option<String>,
+    close_after_finish: bool,
 }
 impl eframe::App for Probe {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
@@ -72,7 +73,11 @@ impl eframe::App for Probe {
                     finish.prepared.extension(),
                     finish.prepared.encoded_size()
                 );
-                self.overlay.finish_failed(AppError::InUse("verification probe received the prepared output; production output effects are not connected in this probe"));
+                if self.close_after_finish {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.overlay.finish_failed(AppError::InUse("verification probe received the prepared output; production output effects are not connected in this probe"));
+                }
             }
             Some(CaptureOverlayEvent::RecordingSelected(_)) | None => {}
         }
@@ -83,23 +88,53 @@ impl eframe::App for Probe {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _dpi = DpiContext::enter()?;
-    let request = CaptureRequest::new(CaptureMode::Region, 0, false, Default::default())?;
-    let snapshot = CaptureService::new(
-        WindowsCaptureSource::new(),
-        NativeCountdown::new(|| Ok(())),
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .snapshot(request)?;
-    let pointer = snapshot
-        .launch_pointer()
-        .ok_or(AppError::Capture("snapshot has no launch pointer"))?;
-    let scale = snapshot
-        .monitors()
-        .iter()
-        .find(|m| m.bounds().contains(pointer))
-        .ok_or(AppError::Capture("launch monitor is unavailable"))?
-        .scale_factor() as f32;
-    let threshold = system_drag_threshold_at(pointer)?;
+    let synthetic = std::env::args().any(|arg| arg == "--synthetic");
+    let (snapshot, pointer, scale, threshold) = if synthetic {
+        use vectrcap::capture::{
+            geometry::{MonitorGeometry, PhysicalPoint, PhysicalRect},
+            request::CaptureSnapshot,
+        };
+        let bounds = PhysicalRect::new(0, 0, 960, 640)?;
+        let pixels = image::RgbaImage::from_fn(960, 640, |x, y| {
+            image::Rgba([
+                ((x / 16 % 2) * 100 + 50) as u8,
+                ((y / 16 % 2) * 100 + 50) as u8,
+                100,
+                255,
+            ])
+        })
+        .into_raw();
+        (
+            CaptureSnapshot::new(
+                pixels,
+                bounds,
+                vec![MonitorGeometry::new("synthetic-probe".into(), bounds, 1.0)?],
+                vec![],
+            )?,
+            PhysicalPoint { x: 100, y: 100 },
+            1.0,
+            (4, 4),
+        )
+    } else {
+        let request = CaptureRequest::new(CaptureMode::Region, 0, false, Default::default())?;
+        let snapshot = CaptureService::new(
+            WindowsCaptureSource::new(),
+            NativeCountdown::new(|| Ok(())),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .snapshot(request)?;
+        let pointer = snapshot
+            .launch_pointer()
+            .ok_or(AppError::Capture("snapshot has no launch pointer"))?;
+        let scale = snapshot
+            .monitors()
+            .iter()
+            .find(|m| m.bounds().contains(pointer))
+            .ok_or(AppError::Capture("launch monitor is unavailable"))?
+            .scale_factor() as f32;
+        let threshold = system_drag_threshold_at(pointer)?;
+        (snapshot, pointer, scale, threshold)
+    };
     let overlay = CaptureOverlay::from_snapshot(snapshot, pointer, threshold)?;
     let viewport = overlay.viewport_builder(scale)?;
     eframe::run_native(
@@ -116,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shortcuts: Default::default(),
                 zoom: 1.0,
                 last_view: None,
+                close_after_finish: synthetic,
             }))
         }),
     )?;
