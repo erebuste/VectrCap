@@ -10,6 +10,13 @@ use windows_sys::Win32::{
 };
 
 pub trait ClipboardWriter: Send + Sync {
+    /// Explicit utility copy only. Selecting/canceling a sample never calls this.
+    fn write_utility_text(&self, text: &str) -> Result<(), AppError> {
+        if text.len() > 2048 || text.contains('\0') {
+            return Err(AppError::InvalidInput("utility clipboard text is invalid"));
+        }
+        self.write_text(text)
+    }
     fn read_image(&self) -> Result<crate::pin::PinnedImage, AppError> {
         Err(AppError::InvalidInput(
             "clipboard does not contain a supported image",

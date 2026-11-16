@@ -48,6 +48,13 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    StartUtility(crate::tools::session::UtilityKind),
+    Utility {
+        session: Uuid,
+        input: crate::tools::session::UtilityInput,
+    },
+    InterruptUtility,
+
     Launch {
         request: super::cli::LaunchRequest,
         reply: Option<std::sync::mpsc::SyncSender<Result<Uuid, AppError>>>,
@@ -261,6 +268,11 @@ impl From<QueueAction> for QueueCommand {
     }
 }
 pub enum AppEvent {
+    UtilityAcquired {
+        session: Uuid,
+        result: Result<crate::tools::UtilitySnapshot, AppError>,
+    },
+
     ScrollingAcquired {
         session: Uuid,
         result: Result<crate::platform::windows::capture::ScrollingSelectionSnapshot, AppError>,
@@ -302,6 +314,14 @@ pub enum AppEvent {
     },
 }
 pub enum AppEffect {
+    AcquireUtility {
+        session: Uuid,
+    },
+    CancelUtilityAcquisition,
+    UtilitySurface(
+        Option<std::sync::Arc<std::sync::Mutex<crate::ui::screen_sampler::UtilitySurface>>>,
+    ),
+
     CancelInstallVerify,
     VerifyInstall {
         request: Uuid,

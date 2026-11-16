@@ -207,6 +207,16 @@ pub trait Countdown {
     fn hide_chrome(&mut self) -> Result<(), AppError>;
 }
 pub trait CaptureSource {
+    /// Utility sources must explicitly support visible references. Refuse an
+    /// adapter that would silently apply screenshot exclusion policy.
+    fn set_purpose(&mut self, purpose: SourcePurpose) -> Result<(), AppError> {
+        match purpose {
+            SourcePurpose::Screenshot => Ok(()),
+            SourcePurpose::Utility => {
+                Err(AppError::Capture("utility capture source is unsupported"))
+            }
+        }
+    }
     fn monitors(&mut self) -> Result<Vec<MonitorGeometry>, AppError>;
     fn pointer(&mut self) -> Result<PhysicalPoint, AppError>;
     fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError>;
@@ -223,6 +233,12 @@ pub trait CaptureSource {
     /// Return an error if no source was prepared; never resolve a new source here.
     fn window(&mut self, target: WindowCandidate, cursor: bool) -> Result<Vec<u8>, AppError>;
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SourcePurpose {
+    #[default]
+    Screenshot,
+    Utility,
+}
 pub struct CaptureService<S, C> {
     source: S,
     countdown: C,
@@ -236,6 +252,40 @@ fn same_window_layout(a: &[WindowCandidate], b: &[WindowCandidate]) -> bool {
     a.len() == b.len() && a_set.len() == a.len() && a_set == b_set
 }
 impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
+    pub fn utility_snapshot(&mut self) -> Result<crate::tools::UtilitySnapshot, AppError> {
+        self.check_cancel()?;
+        self.source.set_purpose(SourcePurpose::Utility)?;
+        let layout = self.source.monitors()?;
+        validate_layout(&layout)?;
+        let pointer = self.source.pointer()?;
+        let bounds = virtual_bounds(&layout.iter().map(|m| m.bounds()).collect::<Vec<_>>())?;
+        bounds.rgba_len()?;
+        self.countdown.hide_chrome()?;
+        self.check_cancel()?;
+        if !same_layout(&layout, &self.source.monitors()?) {
+            return Err(AppError::Capture(
+                "display layout changed before utility capture",
+            ));
+        }
+        let pixels = self.source.desktop(bounds, &layout, false)?;
+        self.check_cancel()?;
+        if !same_layout(&layout, &self.source.monitors()?) {
+            return Err(AppError::Capture(
+                "display layout changed during utility capture",
+            ));
+        }
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = GENERATION
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |g| g.checked_add(1),
+            )
+            .map_err(|_| AppError::Capture("utility geometry generation exhausted"))?;
+        let mut snapshot = crate::tools::UtilitySnapshot::new(pixels, bounds, layout, generation)?;
+        snapshot.set_launch_pointer(pointer);
+        Ok(snapshot)
+    }
     pub fn new(source: S, countdown: C, cancel: CancellationToken) -> Self {
         Self {
             source,
@@ -255,6 +305,7 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
     }
     pub fn snapshot(&mut self, request: CaptureRequest) -> Result<CaptureSnapshot, AppError> {
         request.validate()?;
+        self.source.set_purpose(SourcePurpose::Screenshot)?;
         self.check_cancel()?;
         let layout = self.source.monitors()?;
         validate_layout(&layout)?;

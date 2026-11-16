@@ -34,7 +34,7 @@ pub fn place_overlay(title: &str, bounds: PhysicalRect) -> Result<(), AppError> 
             return Err(AppError::Capture("recording overlay identity changed"));
         }
         // Best effort only; strict geometric exclusion remains the fallback.
-        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        let _ = super::windows::set_capture_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         if SetWindowPos(
             hwnd,
             HWND_TOPMOST,

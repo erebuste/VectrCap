@@ -6,15 +6,10 @@
 //! `platform::windows::hotkeys` and only ever talks to this module through
 //! `ShortcutRegistrar`, so the policy here is fully testable with a fake.
 //!
-//! Only a few approved global actions have a real handler today (Show
-//! History, Show settings, Upload file). Other global actions from
-//! the spec's hotkey section is modeled and persisted — so a saved
-//! assignment survives restarts and is ready the moment its owning
-//! capture/recording/editor feature ships — but [`ShortcutAction::is_available_now`]
-//! is false for them, and this module never asks the registrar to claim
-//! their key: an unimplemented action must never silently take a combination
-//! away from the OS or another app while doing nothing. Editor tools resolve
-//! locally through saved bindings and never use native global registration.
+//! Global actions dispatch typed controller commands. Editor, ruler and screen
+//! sampler shortcuts resolve only in their saved local scope and never use OS
+//! registration. Availability remains an explicit registration/dispatch gate:
+//! future unimplemented actions must not claim a key while doing nothing.
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -107,8 +102,7 @@ pub enum ShortcutAction {
     ShowHistory,
     ShowSettings,
     UploadFile,
-    // Approved global actions whose owning capture/recording/pin feature is
-    // a later task. Modeled and persisted now; never registered or dispatched.
+    // Capture, recording, pin and memory-only utility global actions.
     RegionScreenshot,
     WindowScreenshot,
     FullscreenScreenshot,
@@ -127,6 +121,32 @@ pub enum ShortcutAction {
     CloseAllPins,
     ScreenColorPicker,
     Ruler,
+    SamplerSelect,
+    SamplerClose,
+    RulerSelect,
+    RulerClose,
+    RulerHorizontal,
+    RulerVertical,
+    RulerToggleAxis,
+    RulerCopy,
+    RulerClear,
+    RulerRemove,
+    SamplerLeft,
+    SamplerFastLeft,
+    SamplerUp,
+    SamplerFastUp,
+    SamplerRight,
+    SamplerFastRight,
+    SamplerDown,
+    SamplerFastDown,
+    RulerLeft,
+    RulerFastLeft,
+    RulerUp,
+    RulerFastUp,
+    RulerRight,
+    RulerFastRight,
+    RulerDown,
+    RulerFastDown,
     // Editor-local tool shortcuts.
     ToolRegion,
     ToolRectangle,
@@ -167,6 +187,32 @@ impl ShortcutAction {
             CloseAllPins,
             ScreenColorPicker,
             Ruler,
+            SamplerSelect,
+            SamplerClose,
+            RulerSelect,
+            RulerClose,
+            RulerHorizontal,
+            RulerVertical,
+            RulerToggleAxis,
+            RulerCopy,
+            RulerClear,
+            RulerRemove,
+            SamplerLeft,
+            SamplerFastLeft,
+            SamplerUp,
+            SamplerFastUp,
+            SamplerRight,
+            SamplerFastRight,
+            SamplerDown,
+            SamplerFastDown,
+            RulerLeft,
+            RulerFastLeft,
+            RulerUp,
+            RulerFastUp,
+            RulerRight,
+            RulerFastRight,
+            RulerDown,
+            RulerFastDown,
             ToolRegion,
             ToolRectangle,
             ToolEllipse,
@@ -185,6 +231,30 @@ impl ShortcutAction {
     pub fn scope(&self) -> ShortcutScope {
         use ShortcutAction::*;
         match self {
+            SamplerSelect => ShortcutScope::ScreenSampler,
+            SamplerClose => ShortcutScope::ScreenSampler,
+            RulerSelect => ShortcutScope::Ruler,
+            RulerClose => ShortcutScope::Ruler,
+            RulerHorizontal | RulerVertical | RulerToggleAxis => ShortcutScope::Ruler,
+            RulerCopy => ShortcutScope::Ruler,
+            RulerClear => ShortcutScope::Ruler,
+            RulerRemove => ShortcutScope::Ruler,
+            SamplerLeft => ShortcutScope::ScreenSampler,
+            SamplerFastLeft => ShortcutScope::ScreenSampler,
+            SamplerUp => ShortcutScope::ScreenSampler,
+            SamplerFastUp => ShortcutScope::ScreenSampler,
+            SamplerRight => ShortcutScope::ScreenSampler,
+            SamplerFastRight => ShortcutScope::ScreenSampler,
+            SamplerDown => ShortcutScope::ScreenSampler,
+            SamplerFastDown => ShortcutScope::ScreenSampler,
+            RulerLeft => ShortcutScope::Ruler,
+            RulerFastLeft => ShortcutScope::Ruler,
+            RulerUp => ShortcutScope::Ruler,
+            RulerFastUp => ShortcutScope::Ruler,
+            RulerRight => ShortcutScope::Ruler,
+            RulerFastRight => ShortcutScope::Ruler,
+            RulerDown => ShortcutScope::Ruler,
+            RulerFastDown => ShortcutScope::Ruler,
             ToolRegion | ToolRectangle | ToolEllipse | ToolLine | ToolArrow | ToolFreehand
             | ToolText | ToolStep | ToolHighlight | ToolSpotlight | ToolAnnotationEraser
             | ToolSmartEraser => ShortcutScope::Editor,
@@ -195,10 +265,12 @@ impl ShortcutAction {
     /// Whether a real handler exists today. See the module docs: an
     /// unavailable action is never registered or dispatched, only persisted.
     pub fn is_available_now(&self) -> bool {
-        self.scope() == ShortcutScope::Editor
+        self.scope() != ShortcutScope::Global
             || matches!(
                 self,
-                ShortcutAction::ToggleScrollingCapture
+                ShortcutAction::ScreenColorPicker
+                    | ShortcutAction::Ruler
+                    | ShortcutAction::ToggleScrollingCapture
                     | ShortcutAction::ToggleGifRecording
                     | ShortcutAction::ToggleMp4Recording
                     | ShortcutAction::StopRecording
@@ -223,6 +295,32 @@ impl ShortcutAction {
     pub fn label(&self) -> &'static str {
         use ShortcutAction::*;
         match self {
+            SamplerSelect => "Select sampled color",
+            SamplerClose => "Close screen sampler",
+            RulerSelect => "Retain axis measurement",
+            RulerClose => "Close ruler",
+            RulerHorizontal => "Horizontal ruler axis",
+            RulerVertical => "Vertical ruler axis",
+            RulerToggleAxis => "Toggle ruler axis",
+            RulerCopy => "Copy selected measurement",
+            RulerClear => "Clear all measurements",
+            RulerRemove => "Remove selected measurement",
+            SamplerLeft => "Sampler: move left 1 physical pixels",
+            SamplerFastLeft => "Sampler: move left 10 physical pixels",
+            SamplerUp => "Sampler: move up 1 physical pixels",
+            SamplerFastUp => "Sampler: move up 10 physical pixels",
+            SamplerRight => "Sampler: move right 1 physical pixels",
+            SamplerFastRight => "Sampler: move right 10 physical pixels",
+            SamplerDown => "Sampler: move down 1 physical pixels",
+            SamplerFastDown => "Sampler: move down 10 physical pixels",
+            RulerLeft => "Ruler: move left 1 physical pixels",
+            RulerFastLeft => "Ruler: move left 10 physical pixels",
+            RulerUp => "Ruler: move up 1 physical pixels",
+            RulerFastUp => "Ruler: move up 10 physical pixels",
+            RulerRight => "Ruler: move right 1 physical pixels",
+            RulerFastRight => "Ruler: move right 10 physical pixels",
+            RulerDown => "Ruler: move down 1 physical pixels",
+            RulerFastDown => "Ruler: move down 10 physical pixels",
             ShowHistory => "Show history",
             ShowSettings => "Show settings",
             UploadFile => "Upload file",
@@ -279,6 +377,50 @@ pub struct ShortcutBinding {
 impl ShortcutBinding {
     pub fn default_for(action: ShortcutAction) -> Self {
         use ShortcutAction::*;
+        let utility = match action {
+            ShortcutAction::SamplerSelect => Some((13, false, false)),
+            ShortcutAction::SamplerClose => Some((27, false, false)),
+            ShortcutAction::RulerSelect => Some((13, false, false)),
+            ShortcutAction::RulerClose => Some((27, false, false)),
+            ShortcutAction::RulerHorizontal => Some((0x48, false, false)),
+            ShortcutAction::RulerVertical => Some((0x56, false, false)),
+            ShortcutAction::RulerToggleAxis => Some((32, false, false)),
+            ShortcutAction::RulerCopy => Some((67, true, false)),
+            ShortcutAction::RulerClear => Some((46, false, false)),
+            ShortcutAction::RulerRemove => Some((8, false, false)),
+            ShortcutAction::SamplerLeft => Some((37, false, false)),
+            ShortcutAction::SamplerFastLeft => Some((37, false, true)),
+            ShortcutAction::SamplerUp => Some((38, false, false)),
+            ShortcutAction::SamplerFastUp => Some((38, false, true)),
+            ShortcutAction::SamplerRight => Some((39, false, false)),
+            ShortcutAction::SamplerFastRight => Some((39, false, true)),
+            ShortcutAction::SamplerDown => Some((40, false, false)),
+            ShortcutAction::SamplerFastDown => Some((40, false, true)),
+            ShortcutAction::RulerLeft => Some((37, false, false)),
+            ShortcutAction::RulerFastLeft => Some((37, false, true)),
+            ShortcutAction::RulerUp => Some((38, false, false)),
+            ShortcutAction::RulerFastUp => Some((38, false, true)),
+            ShortcutAction::RulerRight => Some((39, false, false)),
+            ShortcutAction::RulerFastRight => Some((39, false, true)),
+            ShortcutAction::RulerDown => Some((40, false, false)),
+            ShortcutAction::RulerFastDown => Some((40, false, true)),
+            _ => None,
+        };
+        if let Some((vk, ctrl, shift)) = utility {
+            return Self {
+                action,
+                scope: action.scope(),
+                chord: Some(KeyChord {
+                    ctrl,
+                    alt: false,
+                    shift,
+                    win: false,
+                    key: KeyCode(vk),
+                }),
+                enabled: true,
+                destination: DestinationSelection::Inherit,
+            };
+        }
         let vk = match action {
             ToolRegion => 0x09,
             ToolRectangle => 0x52,
@@ -395,12 +537,13 @@ impl ShortcutSettings {
             .iter()
             .map(|&action| {
                 self.get(action).cloned().unwrap_or_else(|| {
-                    if action == ShortcutAction::ToolRegion {
+                    if action == ShortcutAction::ToolRegion
+                        || action.scope() == ShortcutScope::ScreenSampler
+                        || action.scope() == ShortcutScope::Ruler
+                    {
                         let default = ShortcutBinding::default_for(action);
                         if !self.bindings.iter().any(|b| {
-                            b.enabled
-                                && b.scope == ShortcutScope::Editor
-                                && b.chord == default.chord
+                            b.enabled && b.scope == action.scope() && b.chord == default.chord
                         }) {
                             return default;
                         }
@@ -409,6 +552,21 @@ impl ShortcutSettings {
                 })
             })
             .collect()
+    }
+    pub fn local_action_for(
+        &self,
+        scope: ShortcutScope,
+        chord: KeyChord,
+        focus: ShortcutFocus,
+        repeat: bool,
+    ) -> Option<ShortcutAction> {
+        if scope == ShortcutScope::Global || focus != ShortcutFocus::Normal || repeat {
+            return None;
+        }
+        self.effective()
+            .into_iter()
+            .find(|b| b.enabled && b.scope == scope && b.chord == Some(chord))
+            .map(|b| b.action)
     }
     pub fn editor_action_for(
         &self,
@@ -487,6 +645,12 @@ fn command_for(action: ShortcutAction) -> Option<ShortcutOutcome> {
         return Some(ShortcutOutcome::Command(command));
     }
     match action {
+        ShortcutAction::ScreenColorPicker => Some(ShortcutOutcome::Command(
+            AppCommand::StartUtility(crate::tools::session::UtilityKind::Sampler),
+        )),
+        ShortcutAction::Ruler => Some(ShortcutOutcome::Command(AppCommand::StartUtility(
+            crate::tools::session::UtilityKind::Ruler,
+        ))),
         ShortcutAction::ToggleScrollingCapture => {
             Some(ShortcutOutcome::Command(AppCommand::ToggleScrolling))
         }
@@ -610,7 +774,7 @@ impl ShortcutManager {
             None => ShortcutStatus::Unassigned,
             Some(b) if b.chord.is_none() => ShortcutStatus::Unassigned,
             Some(b) if !b.enabled => ShortcutStatus::Disabled,
-            Some(b) if b.scope == ShortcutScope::Editor => ShortcutStatus::Active,
+            Some(b) if b.scope != ShortcutScope::Global => ShortcutStatus::Active,
             Some(_) if self.live.contains_key(&action) => ShortcutStatus::Active,
             Some(_) => ShortcutStatus::Unavailable,
         }
@@ -1127,25 +1291,25 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_actions_are_never_registered_or_dispatched() {
-        let (manager, fake) = manager_with(vec![binding(
-            ShortcutAction::ScreenColorPicker,
-            chord(true, false, 0x52),
-            true,
-        )]);
-        assert!(
-            fake.taken.lock().unwrap().is_empty(),
-            "an unimplemented action's key must never be taken from the OS"
-        );
-        assert_eq!(
-            manager.status(ShortcutAction::ScreenColorPicker),
-            ShortcutStatus::NotYetImplemented
-        );
-        let event = ShortcutEvent {
-            action: ShortcutAction::ScreenColorPicker,
-            repeat: false,
-        };
-        assert!(manager.handle(event, ShortcutFocus::Normal).is_none());
+    fn utility_actions_are_registered_and_dispatched() {
+        for (action, kind) in [
+            (
+                ShortcutAction::ScreenColorPicker,
+                crate::tools::session::UtilityKind::Sampler,
+            ),
+            (
+                ShortcutAction::Ruler,
+                crate::tools::session::UtilityKind::Ruler,
+            ),
+        ] {
+            let (manager, fake) =
+                manager_with(vec![binding(action, chord(true, false, 0x52), true)]);
+            assert_eq!(fake.taken.lock().unwrap().len(), 1);
+            assert_eq!(manager.status(action), ShortcutStatus::Active);
+            assert!(
+                matches!(manager.handle(ShortcutEvent{action,repeat:false},ShortcutFocus::Normal),Some(ShortcutOutcome::Command(crate::app::events::AppCommand::StartUtility(actual))) if actual==kind)
+            );
+        }
     }
 
     #[test]

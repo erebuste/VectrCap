@@ -202,7 +202,7 @@ impl crate::pin::manager::PinWindowSystem for NativePinSystem {
             let mut affinity = 0;
             DwmIsCompositionEnabled(&mut enabled) >= 0
                 && enabled != 0
-                && SetWindowDisplayAffinity(handle as HWND, WDA_EXCLUDEFROMCAPTURE) != 0
+                && set_capture_affinity(handle as HWND, WDA_EXCLUDEFROMCAPTURE)
                 && GetWindowDisplayAffinity(handle as HWND, &mut affinity) != 0
                 && affinity == WDA_EXCLUDEFROMCAPTURE
         }
@@ -245,6 +245,110 @@ fn native_pins()
 }
 pub fn pins_suspended() -> bool {
     native_pins().lock().map_or(true, |pins| pins.suspended())
+}
+
+// Track only affinity changes owned by VectrCap. GetWindowDisplayAffinity is
+// documented to fail on ordinary non-layered windows, so it cannot inventory
+// the otherwise-visible app windows for a utility snapshot.
+const AFFINITY_PROPERTY: windows_sys::core::PCWSTR =
+    windows_sys::core::w!("VectrCap.CaptureAffinity");
+fn app_affinities() -> &'static std::sync::Mutex<HashMap<usize, (u32, u32)>> {
+    static AFFINITIES: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, (u32, u32)>>> =
+        std::sync::OnceLock::new();
+    AFFINITIES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+#[allow(unsafe_code)]
+fn affinity_identity(hwnd: HWND, tid: u32) -> bool {
+    let mut pid = 0;
+    // Window properties disappear when the HWND is destroyed, preventing a
+    // recycled handle on the same GUI thread from inheriting our policy.
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid) == tid
+            && pid == std::process::id()
+            && GetPropW(hwnd, AFFINITY_PROPERTY) as usize == 1
+    }
+}
+#[allow(unsafe_code)]
+pub(crate) fn set_capture_affinity(hwnd: HWND, affinity: u32) -> bool {
+    let Ok(mut states) = app_affinities().lock() else {
+        return false;
+    };
+    let mut pid = 0;
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != std::process::id() || tid == 0 {
+            return false;
+        }
+        states.retain(|&handle, (tid, _)| affinity_identity(handle as HWND, *tid));
+        // Publish ownership before changing affinity, so every successful native
+        // change is restorable even when GetWindowDisplayAffinity is unsupported.
+        if SetPropW(hwnd, AFFINITY_PROPERTY, 1usize as HANDLE) == 0 {
+            return false;
+        }
+        if SetWindowDisplayAffinity(hwnd, affinity) == 0 {
+            return false;
+        }
+        states.insert(hwnd as usize, (tid, affinity));
+        true
+    }
+}
+/// Include visible reference/app windows while retaining screenshot exclusion.
+/// The pin registry lock serializes with pin registration and visibility.
+#[allow(unsafe_code)]
+pub(crate) fn with_utility_capture<T>(
+    capture: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let pins = native_pins()
+        .lock()
+        .map_err(|_| AppError::Capture("native pin registry unavailable"))?;
+    if pins.suspended() {
+        return Err(AppError::InUse(
+            "another acquisition owns reference windows",
+        ));
+    }
+    let mut states = app_affinities()
+        .lock()
+        .map_err(|_| AppError::Capture("window capture policy unavailable"))?;
+    states.retain(|&handle, (tid, _)| affinity_identity(handle as HWND, *tid));
+    struct Affinities(Vec<(HWND, u32, u32)>);
+    impl Drop for Affinities {
+        fn drop(&mut self) {
+            for &(hwnd, tid, affinity) in &self.0 {
+                // Restoration is secondary to the captured result. Future app
+                // screenshot/recording capture also synchronously hides pins.
+                unsafe {
+                    if affinity_identity(hwnd, tid) && SetWindowDisplayAffinity(hwnd, affinity) == 0
+                    {
+                        eprintln!("restoring utility source window affinity failed");
+                    }
+                }
+            }
+        }
+    }
+    let mut restore = Affinities(vec![]);
+    for (&handle, &(tid, affinity)) in states.iter() {
+        let hwnd = handle as HWND;
+        if affinity != WDA_NONE && unsafe { IsWindowVisible(hwnd) } != 0 {
+            restore.0.push((hwnd, tid, affinity));
+            if unsafe { SetWindowDisplayAffinity(hwnd, WDA_NONE) } == 0 {
+                return Err(AppError::Capture(
+                    "visible utility references could not be included",
+                ));
+            }
+        }
+    }
+    if unsafe { DwmFlush() } < 0 {
+        return Err(AppError::Capture(
+            "utility source presentation could not be synchronized",
+        ));
+    }
+    // The guard restores on success, failure and unwinding, never masking the
+    // primary capture result with a secondary affinity-restoration error.
+    let result = capture();
+    drop(restore);
+    drop(states);
+    drop(pins);
+    result
 }
 pub fn unregister_pin_window(id: crate::pin::PinId) {
     if let Ok(mut pins) = native_pins().lock()

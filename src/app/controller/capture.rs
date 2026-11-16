@@ -53,7 +53,9 @@ impl AppController {
         selection: DestinationSelection,
         action: Option<super::super::shortcuts::ShortcutAction>,
     ) -> Result<Vec<AppEffect>, AppError> {
-        if self.scrolling.is_some()
+        if !self.pending_acquisitions.is_empty()
+            || self.utility.is_some()
+            || self.scrolling.is_some()
             || self.capture.is_some()
             || self
                 .recording
@@ -105,6 +107,7 @@ impl AppController {
                 request,
             },
         ]);
+        self.pending_acquisitions.insert(id);
         Ok(effects)
     }
     pub(super) fn capture_acquired(
@@ -647,7 +650,9 @@ impl AppController {
                 )
                 .map(|(_, effects)| effects),
             SourceAction::ReviewImage(image) => {
-                if self.capture.is_some()
+                if !self.pending_acquisitions.is_empty()
+                    || self.utility.is_some()
+                    || self.capture.is_some()
                     || self.scrolling.is_some()
                     || self
                         .recording

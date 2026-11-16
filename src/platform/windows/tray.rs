@@ -85,6 +85,12 @@ impl Tray {
                 return;
             }
             let command = match event.id.as_ref() {
+                "tool-sampler" => Some(AppCommand::StartUtility(
+                    crate::tools::session::UtilityKind::Sampler,
+                )),
+                "tool-ruler" => Some(AppCommand::StartUtility(
+                    crate::tools::session::UtilityKind::Ruler,
+                )),
                 "upload-clipboard" => Some(AppCommand::UploadClipboard),
                 "scrolling" => Some(AppCommand::ToggleScrolling),
                 "record-gif" => Some(AppCommand::ToggleRecording { mp4: false }),
@@ -181,6 +187,19 @@ impl Tray {
     pub fn update(&mut self, destinations: &Destinations, revision: u64) -> Result<(), AppError> {
         if self.revision != Some(revision) {
             let menu = Menu::new();
+            let tools = Submenu::new("Tools", true);
+            tools
+                .append(&MenuItem::with_id(
+                    "tool-sampler",
+                    "Screen color picker",
+                    true,
+                    None,
+                ))
+                .map_err(|_| error())?;
+            tools
+                .append(&MenuItem::with_id("tool-ruler", "Ruler", true, None))
+                .map_err(|_| error())?;
+            menu.append(&tools).map_err(|_| error())?;
             for (id, label) in [
                 ("capture-region", "Capture region"),
                 ("capture-window", "Capture window under pointer"),

@@ -90,7 +90,11 @@ impl AppController {
         if self.recording.is_some() {
             return self.recording_input(RecordingInput::ToggleFormat(mp4));
         }
-        if self.scrolling.is_some() || self.capture.is_some() {
+        if !self.pending_acquisitions.is_empty()
+            || self.utility.is_some()
+            || self.scrolling.is_some()
+            || self.capture.is_some()
+        {
             return Err(AppError::InUse("a capture session is already active"));
         }
         self.manager.ensure_not_corrupted()?;
@@ -146,6 +150,7 @@ impl AppController {
                     .capture_request(crate::capture::request::CaptureMode::Region)?,
             },
         ]);
+        self.pending_acquisitions.insert(id);
         Ok(effects)
     }
     pub(super) fn recording_acquired(

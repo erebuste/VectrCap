@@ -166,7 +166,7 @@ impl SettingsPane {
         });
         let shortcut_panel = ui.collapsing("Keyboard shortcuts", |ui| {
             use crate::platform::windows::hotkeys::{ShortcutRecorder, chord_label};
-            ui.label("Editor shortcuts apply only in the editor. Unavailable global actions keep their saved assignments without registering keys. Apply validates all assignments together; conflicts keep the previous settings.");
+            ui.label("Local shortcuts apply only in their editor, screen sampler, or ruler scope and respect text focus. Global actions work outside those windows. Apply validates assignments together; conflicts keep the previous settings.");
             let bindings = self.shortcuts.get_or_insert_with(|| settings.shortcuts.effective());
             for binding in bindings.iter_mut() {
                 if let Some((_, status)) = statuses.iter().find(|(action, _)| *action == binding.action) { ui.label(format!("Current registration: {status:?}")); }

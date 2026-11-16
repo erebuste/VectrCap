@@ -9,6 +9,13 @@ use crate::{
 };
 use eframe::egui::{self, Color32, Context, Id, LayerId, Order, Pos2, Rect, Stroke, Vec2};
 
+pub fn hex_text([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+pub fn rgb_text([r, g, b]: [u8; 3]) -> String {
+    format!("{r}, {g}, {b}")
+}
+
 pub struct CaptureReadout {
     count: u8,
     pixels: Vec<Option<[u8; 4]>>,
@@ -21,6 +28,18 @@ pub struct MagnifierLayout {
 }
 impl MagnifierLayout {
     pub fn fit(pointer: Pos2, viewport: Rect, count: u8, scale: u8) -> Result<Self, AppError> {
+        Self::fit_physical(pointer, viewport, count, scale, 1.0)
+    }
+    pub fn fit_physical(
+        pointer: Pos2,
+        viewport: Rect,
+        count: u8,
+        scale: u8,
+        pixels_per_point: f32,
+    ) -> Result<Self, AppError> {
+        if !pixels_per_point.is_finite() || !(0.1..=20.0).contains(&pixels_per_point) {
+            return Err(AppError::InvalidInput("magnifier display scale is invalid"));
+        }
         if !(9..=35).contains(&count)
             || count.is_multiple_of(2)
             || !(4..=24).contains(&scale)
@@ -33,7 +52,7 @@ impl MagnifierLayout {
             return Err(AppError::InvalidInput("magnifier geometry is invalid"));
         }
         // Fitting affects presentation only, never count, center or sample positions.
-        let pixel_scale = f32::from(scale)
+        let pixel_scale = (f32::from(scale) / pixels_per_point)
             .min(viewport.width() / f32::from(count))
             .min(viewport.height() / f32::from(count));
         let side = pixel_scale * f32::from(count);
@@ -104,13 +123,13 @@ impl CaptureReadout {
         if prefs.show_rgb {
             lines.push(center.map_or_else(
                 || "RGB: Unavailable".into(),
-                |[r, g, b, _]| format!("RGB: {r}, {g}, {b}"),
+                |[r, g, b, _]| format!("RGB: {}", rgb_text([r, g, b])),
             ));
         }
         if prefs.show_hex {
             lines.push(center.map_or_else(
                 || "HEX: Unavailable".into(),
-                |[r, g, b, _]| format!("HEX: #{r:02X}{g:02X}{b:02X}"),
+                |[r, g, b, _]| format!("HEX: {}", hex_text([r, g, b])),
             ));
         }
         Ok(Self {
@@ -142,8 +161,26 @@ impl CaptureReadout {
         viewport: Rect,
         prefs: &RegionCapturePreferences,
     ) -> Result<(), AppError> {
+        self.paint_scaled(ctx, pointer, viewport, prefs, 1.0)
+    }
+    /// The utility lens is specified in physical display pixels. Screenshot
+    /// chrome retains its existing logical sizing policy via `paint` above.
+    pub fn paint_scaled(
+        &mut self,
+        ctx: &Context,
+        pointer: Pos2,
+        viewport: Rect,
+        prefs: &RegionCapturePreferences,
+        pixels_per_point: f32,
+    ) -> Result<(), AppError> {
         prefs.validate()?;
-        let layout = MagnifierLayout::fit(pointer, viewport, self.count, prefs.lens_scale)?;
+        let layout = MagnifierLayout::fit_physical(
+            pointer,
+            viewport,
+            self.count,
+            prefs.lens_scale,
+            pixels_per_point,
+        )?;
         let painter = ctx
             .layer_painter(LayerId::new(Order::Tooltip, Id::unique("capture-readout")))
             .with_clip_rect(viewport);
@@ -228,6 +265,31 @@ impl CaptureReadout {
                     layout.rect.center(),
                     layout.rect.width() / 2.0,
                     Stroke::new(2.0, Color32::WHITE),
+                );
+            }
+            for i in 1..self.count {
+                let offset = (f32::from(i) - f32::from(self.count) / 2.0) * layout.pixel_scale;
+                let half = layout.rect.width() / 2.0;
+                let extent = if prefs.lens_shape == LensShape::Circle {
+                    (half * half - offset * offset).max(0.0).sqrt()
+                } else {
+                    half
+                };
+                let c = layout.rect.center();
+                let grid = Stroke::new(1.0 / pixels_per_point, Color32::from_black_alpha(100));
+                painter.line_segment(
+                    [
+                        Pos2::new(c.x + offset, c.y - extent),
+                        Pos2::new(c.x + offset, c.y + extent),
+                    ],
+                    grid,
+                );
+                painter.line_segment(
+                    [
+                        Pos2::new(c.x - extent, c.y + offset),
+                        Pos2::new(c.x + extent, c.y + offset),
+                    ],
+                    grid,
                 );
             }
             let center =

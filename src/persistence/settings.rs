@@ -393,6 +393,22 @@ impl Settings {
             region.validate()?;
         }
         self.shortcuts.validate()?;
+        // Utilities have no destination/task routing, even in hand-edited JSON.
+        if self.shortcuts.bindings.iter().any(|binding| {
+            (matches!(
+                binding.action,
+                crate::app::shortcuts::ShortcutAction::ScreenColorPicker
+                    | crate::app::shortcuts::ShortcutAction::Ruler
+            ) || matches!(
+                binding.scope,
+                crate::app::shortcuts::ShortcutScope::Ruler
+                    | crate::app::shortcuts::ShortcutScope::ScreenSampler
+            )) && binding.destination != crate::app::destinations::DestinationSelection::Inherit
+        }) {
+            return Err(AppError::InvalidInput(
+                "utility shortcuts cannot route to upload destinations",
+            ));
+        }
         if self.shortcuts.bindings.iter().any(|binding| matches!(binding.destination, crate::app::destinations::DestinationSelection::Specific(id) if self.destinations.get(id).is_none())) {
             return Err(AppError::InvalidInput("shortcut references an unknown destination"));
         }

@@ -53,7 +53,11 @@ impl AppController {
                 vec![AppEffect::ScrollingControl(ScrollControl::Stop)]
             });
         }
-        if self.capture.is_some() || self.recording.is_some() {
+        if !self.pending_acquisitions.is_empty()
+            || self.utility.is_some()
+            || self.capture.is_some()
+            || self.recording.is_some()
+        {
             return Err(AppError::InUse("a capture or review is already active"));
         }
         self.manager.ensure_not_corrupted()?;
@@ -93,6 +97,7 @@ impl AppController {
             AppEffect::CancelConnectionTest,
             AppEffect::AcquireScrolling(id),
         ]);
+        self.pending_acquisitions.insert(id);
         Ok(effects)
     }
     pub(super) fn scrolling_acquired(

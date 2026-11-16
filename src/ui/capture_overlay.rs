@@ -22,6 +22,7 @@ use crate::{
 };
 use eframe::egui;
 use gesture::EditGesture;
+pub(crate) use gesture::native_chord;
 
 /// One physical pixel remains one physical pixel at every chrome zoom factor.
 /// The native host must place its borderless viewport at the source origin.

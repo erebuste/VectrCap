@@ -105,6 +105,7 @@ impl eframe::App for Shell {
             self.submit(command);
         }
         self.capture_host.show(ctx, &self.client, &self.view);
+        super::screen_sampler::show_host(ctx, &self.client, &self.view);
         self.scrolling_host.show(ctx, &self.client, &self.view);
         self.recording_host.show(ctx, &self.client, &self.view);
         self.pin_sources

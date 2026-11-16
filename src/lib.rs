@@ -15,6 +15,7 @@ pub mod pin;
 pub mod platform;
 pub mod recording;
 pub mod scrolling;
+pub mod tools;
 pub mod ui;
 pub mod vectr;
 

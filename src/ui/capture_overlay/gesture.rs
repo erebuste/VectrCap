@@ -340,7 +340,7 @@ impl CaptureOverlay {
     }
 }
 
-pub(super) fn native_chord(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyChord> {
+pub(crate) fn native_chord(key: egui::Key, modifiers: egui::Modifiers) -> Option<KeyChord> {
     use egui::Key::*;
     // egui keys are logical, and numpad digits intentionally normalize to the
     // same chord as their main-row equivalents. No drawing key lives here.

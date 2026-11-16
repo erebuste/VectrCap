@@ -35,6 +35,8 @@ pub struct DesktopView {
     pub audio_test_stop: u64,
     pub audio_meter: Option<Result<f32, AppError>>,
     pub audio_endpoints: Vec<crate::ui::audio_sources::AudioEndpoint>,
+    pub utility_surface: Option<Arc<Mutex<crate::ui::screen_sampler::UtilitySurface>>>,
+    pub utility_acquiring: Option<uuid::Uuid>,
     pub capture_acquiring: Option<uuid::Uuid>,
     pub capture_surface: Option<Arc<Mutex<super::controller::CaptureSurface>>>,
     pub pins: Vec<crate::pin::PinSnapshot>,
@@ -84,6 +86,8 @@ impl Default for DesktopView {
             audio_test_stop: 0,
             audio_meter: None,
             audio_endpoints: vec![],
+            utility_surface: None,
+            utility_acquiring: None,
             capture_acquiring: None,
             capture_surface: None,
             pins: vec![],
@@ -247,6 +251,8 @@ const MAX_CONCURRENT_STAGING: usize = 4;
 /// outcome instead of growing the backlog without limit.
 const MAX_PENDING_STAGING: usize = 64;
 struct Effects {
+    utilities: tokio::task::JoinSet<(uuid::Uuid, Result<crate::tools::UtilitySnapshot, AppError>)>,
+    utility_cancel: Option<CancellationToken>,
     clipboard_sources: tokio::task::JoinSet<ClipboardRead>,
     install_metadata: Option<ConnectionTask>,
     scrolling_selections: tokio::task::JoinSet<(
@@ -352,6 +358,38 @@ impl Effects {
     async fn apply(&mut self, effects: Vec<AppEffect>, history: &History) -> Result<(), AppError> {
         for effect in effects {
             match effect {
+                AppEffect::AcquireUtility { session } => {
+                    let cancel = CancellationToken::new();
+                    self.utility_cancel = Some(cancel.clone());
+                    self.state.utility_acquiring = Some(session);
+                    let busy = !self.utilities.is_empty();
+                    self.utilities.spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            if busy {
+                                return Err(AppError::InUse(
+                                    "utility acquisition is still stopping",
+                                ));
+                            }
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                crate::platform::windows::capture::acquire_utility(cancel)
+                            }))
+                            .unwrap_or(Err(AppError::Capture("utility acquisition worker failed")))
+                        })
+                        .await
+                        .unwrap_or(Err(AppError::Capture("utility acquisition worker failed")));
+                        (session, result)
+                    });
+                }
+                AppEffect::CancelUtilityAcquisition => {
+                    if let Some(cancel) = self.utility_cancel.take() {
+                        cancel.cancel();
+                    }
+                    self.state.utility_acquiring = None;
+                }
+                AppEffect::UtilitySurface(surface) => {
+                    self.state.utility_acquiring = None;
+                    self.state.utility_surface = surface;
+                }
                 AppEffect::AcquireScrolling(session) => {
                     let cancel = CancellationToken::new();
                     self.scrolling_cancel = Some(cancel.clone());
@@ -760,6 +798,8 @@ async fn serve(
     let mut recording_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     recording_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut effects = Effects {
+        utilities: tokio::task::JoinSet::new(),
+        utility_cancel: None,
         clipboard_sources: tokio::task::JoinSet::new(),
         install_metadata: None,
         scrolling_selections: tokio::task::JoinSet::new(),
@@ -830,6 +870,12 @@ async fn serve(
                     match result {
                         Some(Ok((request, result))) => controller.on_event(AppEvent::PinLoaded { request, result }),
                         _ => vec![AppEffect::Error(AppError::Capture("pin source worker failed"))],
+                    }
+                }
+                result=effects.utilities.join_next(),if !effects.utilities.is_empty()=>{
+                    match result {
+                        Some(Ok((session,result)))=>controller.on_event(AppEvent::UtilityAcquired{session,result}),
+                        _=>effects.state.utility_acquiring.map_or_else(Vec::new,|session|controller.on_event(AppEvent::UtilityAcquired{session,result:Err(AppError::Capture("utility acquisition worker failed"))})),
                     }
                 }
                 result = effects.captures.join_next(), if !effects.captures.is_empty() => {
@@ -957,6 +1003,16 @@ async fn serve(
         let _ = tokio::task::spawn_blocking(move || r.join()).await;
     }
     while effects.recording_selections.join_next().await.is_some() {}
+    if let Some(cancel) = effects.utility_cancel.take() {
+        cancel.cancel();
+    }
+    if let Some(surface) = effects.state.utility_surface.take() {
+        match surface.lock() {
+            Ok(mut s) => s.release(),
+            Err(poison) => poison.into_inner().release(),
+        }
+    }
+    while effects.utilities.join_next().await.is_some() {}
     effects.local_cancel.cancel();
     if let Some(cancel) = effects.capture_cancel.take() {
         cancel.cancel();

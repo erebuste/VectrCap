@@ -34,6 +34,7 @@ use windows_sys::Win32::{
 };
 #[derive(Default)]
 pub struct WindowsCaptureSource {
+    purpose: crate::capture::request::SourcePurpose,
     windows: Windows,
     prepared: Option<(WindowCandidate, PreparedWindowItem)>,
     // Declared after the WinRT item so it drops after all interfaces are released.
@@ -159,6 +160,29 @@ pub fn acquire_screenshot(
     result
 }
 
+pub fn acquire_utility(
+    cancel: CancellationToken,
+) -> Result<crate::tools::UtilitySnapshot, AppError> {
+    // Unlike screenshots, preserve app/pin visibility. Only utility chrome is
+    // hidden and flushed before refreshing the frozen desktop.
+    let hide = || {
+        for title in [
+            "VectrCap screen sampler",
+            "VectrCap pixel ruler",
+            "VectrCap sampled color",
+        ] {
+            super::recording_events::hide_selection(title)?;
+        }
+        Ok(())
+    };
+    crate::capture::request::CaptureService::new(
+        WindowsCaptureSource::new(),
+        NativeCountdown::new(hide),
+        cancel,
+    )
+    .utility_snapshot()
+}
+
 #[allow(unsafe_code)]
 fn hide_app_chrome() -> Result<(), AppError> {
     unsafe extern "system" fn hide(hwnd: windows_sys::Win32::Foundation::HWND, _: isize) -> i32 {
@@ -179,6 +203,13 @@ fn hide_app_chrome() -> Result<(), AppError> {
     Ok(())
 }
 impl CaptureSource for WindowsCaptureSource {
+    fn set_purpose(
+        &mut self,
+        purpose: crate::capture::request::SourcePurpose,
+    ) -> Result<(), AppError> {
+        self.purpose = purpose;
+        Ok(())
+    }
     fn prepare_window(&mut self, target: WindowCandidate) -> Result<(), AppError> {
         let _dpi = DpiContext::enter()?;
         let native = self.windows.resolve(target)?;
@@ -211,32 +242,53 @@ impl CaptureSource for WindowsCaptureSource {
         monitors: &[MonitorGeometry],
         cursor: bool,
     ) -> Result<Vec<u8>, AppError> {
-        let _dpi = DpiContext::enter()?;
-        validate_layout(monitors)?;
-        let mut result = allocate_rgba(bounds)?;
-        let mut any = false;
-        for monitor in monitors {
-            if let Some(part) = bounds.intersection(monitor.bounds()) {
-                any = true;
-                let pixels = capture_region(part, cursor)?;
-                let dx = bounds.left().abs_diff(part.left()) as usize;
-                let dy = bounds.top().abs_diff(part.top()) as usize;
-                for row in 0..part.height() as usize {
-                    let dst = ((dy + row) * bounds.width() as usize + dx) * 4;
-                    let src = row * part.width() as usize * 4;
-                    let len = part.width() as usize * 4;
-                    result[dst..dst + len].copy_from_slice(&pixels[src..src + len]);
-                }
-            }
+        if self.purpose == crate::capture::request::SourcePurpose::Utility {
+            return super::windows::with_utility_capture(|| {
+                capture_desktop(bounds, monitors, cursor)
+            });
         }
-        if !any {
-            return Err(AppError::Capture(
-                "capture source contains only monitor gaps",
-            ));
-        }
-        Ok(result)
+        capture_desktop(bounds, monitors, cursor)
     }
     fn window(&mut self, target: WindowCandidate, cursor: bool) -> Result<Vec<u8>, AppError> {
+        self.capture_window(target, cursor)
+    }
+}
+fn capture_desktop(
+    bounds: PhysicalRect,
+    monitors: &[MonitorGeometry],
+    cursor: bool,
+) -> Result<Vec<u8>, AppError> {
+    let _dpi = DpiContext::enter()?;
+    validate_layout(monitors)?;
+    let mut result = allocate_rgba(bounds)?;
+    let mut any = false;
+    for monitor in monitors {
+        if let Some(part) = bounds.intersection(monitor.bounds()) {
+            any = true;
+            let pixels = capture_region(part, cursor)?;
+            let dx = bounds.left().abs_diff(part.left()) as usize;
+            let dy = bounds.top().abs_diff(part.top()) as usize;
+            for row in 0..part.height() as usize {
+                let dst = ((dy + row) * bounds.width() as usize + dx) * 4;
+                let src = row * part.width() as usize * 4;
+                let len = part.width() as usize * 4;
+                result[dst..dst + len].copy_from_slice(&pixels[src..src + len]);
+            }
+        }
+    }
+    if !any {
+        return Err(AppError::Capture(
+            "capture source contains only monitor gaps",
+        ));
+    }
+    Ok(result)
+}
+impl WindowsCaptureSource {
+    fn capture_window(
+        &mut self,
+        target: WindowCandidate,
+        cursor: bool,
+    ) -> Result<Vec<u8>, AppError> {
         let (prepared, item) = self
             .prepared
             .take()

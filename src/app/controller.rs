@@ -5,6 +5,7 @@ pub mod ingress;
 mod recording;
 mod scrolling;
 mod task_chains;
+mod utility;
 use super::{
     destination_manager::{
         DestinationEdit, DestinationManager, DestinationReferences, DestinationRepository,
@@ -171,6 +172,10 @@ pub struct AppController {
     task_batches: HashMap<Uuid, (Uuid, usize)>,
     accepted_task_contexts: HashMap<Uuid, crate::workflow::runner::WorkflowContext>,
 
+    // Worker ownership outlives a canceled selection/surface until acquisition
+    // actually settles. A canceled worker must not overlap a replacement tool.
+    pending_acquisitions: HashSet<Uuid>,
+    utility: Option<utility::UtilityWorkflow>,
     capture: Option<capture::CaptureWorkflow>,
     scrolling: Option<scrolling::ScrollingWorkflow>,
     recording: Option<recording::RecordingWorkflow>,
@@ -249,6 +254,8 @@ impl AppController {
             task_images: HashMap::new(),
             task_batches: HashMap::new(),
             accepted_task_contexts: HashMap::new(),
+            pending_acquisitions: HashSet::new(),
+            utility: None,
             capture: None,
             scrolling: None,
             recording: None,
@@ -984,6 +991,17 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::StartUtility(kind) => self.start_utility(kind)?,
+            AppCommand::Utility { session, input } => self.utility_input(session, input),
+            AppCommand::InterruptUtility => {
+                let mut effects = self.close_utility();
+                if !effects.is_empty() {
+                    effects.push(AppEffect::Error(AppError::Capture(
+                        "utility closed after a display or session interruption",
+                    )));
+                }
+                effects
+            }
             AppCommand::PinFromScreenFor(selection) => {
                 let mut effects = self.start_capture_profile(
                     crate::capture::request::CaptureMode::Region,
@@ -1190,13 +1208,15 @@ impl AppController {
                 effects
             }
             AppCommand::CloseWindow => {
+                let mut effects = self.close_utility();
                 self.shortcut_entry_active = None;
                 self.window = None;
-                vec![
+                effects.extend([
                     AppEffect::Window(None),
                     AppEffect::CancelConnectionTest,
                     AppEffect::StopAudioTest,
-                ]
+                ]);
+                effects
             }
             AppCommand::ApplyDestinations { edit, revision } => {
                 self.manager.apply(edit, revision)?;
@@ -1378,7 +1398,7 @@ impl AppController {
                 vec![]
             }
             AppCommand::NativeHotkeyFired(id) => {
-                if self.capture.is_some() {
+                if self.capture.is_some() || self.utility.is_some() {
                     return Ok(vec![]);
                 }
                 if let Some(request) = self.shortcut_entry_active
@@ -1498,13 +1518,14 @@ impl AppController {
                     return self.quit_recording();
                 }
                 self.quit_recording()?;
-
+                let utility_effects = self.close_utility();
                 let mut capture_effects = if let Some(capture) = &self.capture {
                     self.cancel_capture(capture.id)
                 } else {
                     vec![]
                 };
                 capture_effects.extend(scrolling_effects);
+                capture_effects.extend(utility_effects);
                 self.shortcuts = None;
                 self.pin_load = None;
                 capture_effects.extend(self.pins.close_all().into_iter().map(AppEffect::Pin));
@@ -1525,11 +1546,14 @@ impl AppController {
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
+            AppEvent::UtilityAcquired { session, result } => self.utility_acquired(session, result),
             AppEvent::ScrollingAcquired { session, result } => {
+                self.pending_acquisitions.remove(&session);
                 self.scrolling_acquired(session, result)
             }
             AppEvent::Scrolling(event) => self.scrolling_event(event),
             AppEvent::RecordingAcquired { session, result } => {
+                self.pending_acquisitions.remove(&session);
                 self.recording_acquired(session, result)
             }
             AppEvent::RecordingWorker { session, input } => {
@@ -1568,7 +1592,10 @@ impl AppController {
                     vec![AppEffect::PinSourceChooser(true), AppEffect::Error(error)]
                 })
             }
-            AppEvent::CaptureAcquired { session, result } => self.capture_acquired(session, result),
+            AppEvent::CaptureAcquired { session, result } => {
+                self.pending_acquisitions.remove(&session);
+                self.capture_acquired(session, result)
+            }
             AppEvent::WorkerStopped(result) => {
                 self.lifecycle = Lifecycle::Exited;
                 let mut effects = vec![];

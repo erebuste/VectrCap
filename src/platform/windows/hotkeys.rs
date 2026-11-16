@@ -168,6 +168,7 @@ unsafe extern "system" fn hotkey_message(
         crate::scrolling::runtime::invalidate_candidates();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let client = &*(data as *const crate::app::desktop::DesktopClient);
+            let _ = client.submit(crate::app::events::AppCommand::InterruptUtility);
             let _ = client.submit(crate::app::events::AppCommand::ScrollingControl(
                 crate::scrolling::runtime::ScrollControl::Interrupt(reason.label()),
             ));
