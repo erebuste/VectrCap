@@ -1,3 +1,4 @@
+mod desktop_support;
 mod support;
 use std::{
     collections::HashMap,
@@ -7,7 +8,7 @@ use std::{
 use vectrcap::{
     app::{
         controller::AppController,
-        desktop::{DesktopRuntime, DesktopView},
+        desktop::DesktopView,
         destination_manager::{DestinationEdit, FileDestinationRepository},
         destinations::{DestinationId, DestinationSelection},
         error::AppError,
@@ -321,7 +322,7 @@ fn accept_versus_credential_mutation_is_serialized_in_both_orders() {
             .stage_file(&source, ArtifactKind::File)
             .unwrap();
         let (tx, rx) = mpsc::channel();
-        let runtime = DesktopRuntime::spawn(
+        let runtime = desktop_support::spawn(
             dir.path().into(),
             store.clone(),
             Arc::new(CredentialClientFactory::new(store)),
@@ -390,7 +391,7 @@ fn idle_queue_pause_and_resume_publish_durable_state_without_polling() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
     let (tx, rx) = mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::new(store)),
@@ -430,7 +431,7 @@ fn explicit_quit_is_accepted_when_command_channel_is_full() {
     );
     drop(app);
     let (tx, rx) = mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::new(store)),
@@ -495,7 +496,7 @@ async fn quit_drains_real_private_tls_request_and_preserves_confirmed_receipt() 
     });
     drop(app);
     let (tx, rx) = mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::with_root_certificate(
@@ -777,7 +778,7 @@ async fn native_file_batch_settles_two_files_through_a_fixture_tls_server() {
     std::fs::write(&first, []).unwrap();
     std::fs::write(&second, []).unwrap();
     let (tx, rx) = mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let (runtime, clipboard) = desktop_support::spawn_recording(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::with_root_certificate(
@@ -803,6 +804,13 @@ async fn native_file_batch_settles_two_files_through_a_fixture_tls_server() {
             .iter()
             .all(|j| matches!(j.status, JobStatus::Completed(_)))
     );
+    let receipt: serde_json::Value = serde_json::from_str(RECEIPT).unwrap();
+    let url = receipt["url"].as_str().unwrap();
+    assert_eq!(
+        *clipboard.0.lock().unwrap(),
+        vec![format!("{url}\n{url}")],
+        "fixture links must go only to the injected clipboard"
+    );
     assert_eq!(server.requests.lock().unwrap().len(), 2);
     runtime.client.submit(AppCommand::Quit).unwrap();
     wait(&runtime.client, &rx, |s| s.lifecycle == Lifecycle::Exited);
@@ -823,7 +831,7 @@ async fn quitting_during_staging_never_orphans_an_accepted_file() {
     let path = dir.path().join("during-quit.txt");
     std::fs::write(&path, b"synthetic").unwrap();
     let (tx, rx) = mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::new(store)),
@@ -924,7 +932,7 @@ async fn oversized_staging_backlog_gets_explicit_busy_feedback_without_losing_an
         })
         .collect();
     let (tx, rx) = mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::new(store)),

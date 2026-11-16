@@ -179,6 +179,13 @@ impl DesktopClient {
         (self.wake)();
     }
 }
+/// Explicit runtime boundaries let fixture tests avoid the user's OS clipboard/shell.
+pub struct DesktopServices {
+    pub credentials: Arc<dyn CredentialStore>,
+    pub clients: Arc<dyn ClientFactory>,
+    pub shell: Arc<dyn crate::platform::windows::shell_actions::ShellActions>,
+    pub clipboard: Arc<dyn crate::platform::windows::clipboard::ClipboardWriter>,
+}
 pub struct DesktopRuntime {
     pub client: DesktopClient,
     stop: CancellationToken,
@@ -189,6 +196,22 @@ impl DesktopRuntime {
         root: PathBuf,
         store: Arc<dyn CredentialStore>,
         factory: Arc<dyn ClientFactory>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, AppError> {
+        Self::spawn_with_services(
+            root,
+            DesktopServices {
+                credentials: store,
+                clients: factory,
+                shell: Arc::new(crate::platform::windows::shell_actions::WindowsShellActions),
+                clipboard: Arc::new(crate::platform::windows::clipboard::WindowsClipboard),
+            },
+            wake,
+        )
+    }
+    pub fn spawn_with_services(
+        root: PathBuf,
+        services: DesktopServices,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, AppError> {
         let (tx, rx) = mpsc::channel(32);
@@ -213,8 +236,7 @@ impl DesktopRuntime {
                     .and_then(|runtime| {
                         runtime.block_on(serve(
                             root,
-                            store,
-                            factory,
+                            services,
                             rx,
                             view.clone(),
                             wake.clone(),
@@ -779,14 +801,19 @@ impl Effects {
 }
 async fn serve(
     root: PathBuf,
-    store: Arc<dyn CredentialStore>,
-    factory: Arc<dyn ClientFactory>,
+    services: DesktopServices,
     mut commands: mpsc::Receiver<AppCommand>,
     view: Arc<Mutex<DesktopView>>,
     wake: Arc<dyn Fn() + Send + Sync>,
     shutdown: (CancellationToken, Arc<tokio::sync::Notify>),
 ) -> Result<(), AppError> {
     let (stop, interrupt_utility) = shutdown;
+    let DesktopServices {
+        credentials: store,
+        clients: factory,
+        shell,
+        clipboard,
+    } = services;
     let paths = crate::persistence::AppPaths::from_root(root)?;
     let history = Arc::new(History::open(&paths.history)?);
     let artifacts = Arc::new(ArtifactStore::new(paths.spool)?);
@@ -795,8 +822,8 @@ async fn serve(
         history.clone(),
         store,
         artifacts.clone(),
-        Arc::new(crate::platform::windows::shell_actions::WindowsShellActions),
-        Arc::new(crate::platform::windows::clipboard::WindowsClipboard),
+        shell,
+        clipboard,
     )?;
     let queue = QueueController::new(history.clone())?;
     let uploader = Arc::new(Uploader::new(history.clone(), artifacts.clone(), factory));

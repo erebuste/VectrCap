@@ -3,6 +3,7 @@
 //! existing `#[ignore]`d smoke tests in `file_dialog.rs` are manual-only and
 //! prove nothing on their own; these tests exercise the same gating logic
 //! through the injectable picker closure instead.
+mod desktop_support;
 use std::{
     collections::HashMap,
     sync::{
@@ -61,7 +62,7 @@ async fn runtime() -> (DesktopRuntime, std::sync::mpsc::Receiver<()>) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::with_backend(Memory::default()));
     let (tx, rx) = std::sync::mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().into(),
         store.clone(),
         Arc::new(CredentialClientFactory::new(store)),

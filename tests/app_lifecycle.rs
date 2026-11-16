@@ -1,3 +1,4 @@
+mod desktop_support;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -191,14 +192,13 @@ fn second_instance_exits_cleanly_and_requests_focus() {
 
 #[test]
 fn actor_initializes_off_thread_and_quit_drains_without_ui_polling() {
-    use vectrcap::app::desktop::DesktopRuntime;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::default());
     let factory = Arc::new(vectrcap::platform::CredentialClientFactory::new(
         store.clone(),
     ));
     let (tx, rx) = std::sync::mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().to_owned(),
         store,
         factory,
@@ -222,7 +222,6 @@ fn actor_initializes_off_thread_and_quit_drains_without_ui_polling() {
 
 #[test]
 fn failed_initialization_still_accepts_explicit_quit() {
-    use vectrcap::app::desktop::DesktopRuntime;
     let dir = tempfile::tempdir().unwrap();
     let _lease = FileDestinationRepository::open(&dir.path().join("settings.json")).unwrap();
     let store = Arc::new(Store::default());
@@ -230,7 +229,7 @@ fn failed_initialization_still_accepts_explicit_quit() {
         store.clone(),
     ));
     let (tx, rx) = std::sync::mpsc::channel();
-    let runtime = DesktopRuntime::spawn(
+    let runtime = desktop_support::spawn(
         dir.path().to_owned(),
         store,
         factory,
