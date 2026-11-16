@@ -170,6 +170,7 @@ struct DeferredImport {
     reply: std::sync::mpsc::SyncSender<Result<(), AppError>>,
 }
 pub struct AppController {
+    diagnostics: crate::diagnostics::checks::DiagnosticService,
     deferred_import: Option<DeferredImport>,
     ingress: super::ingress::Ingress,
     install: Option<(Uuid, super::destination_install::DestinationInstallSession)>,
@@ -270,6 +271,7 @@ impl AppController {
             pins: crate::pin::PinManager::with_defaults(manager.settings().pin.clone())?,
             pin_load: None,
             manager,
+            diagnostics: Default::default(),
             history,
             store,
             artifacts,
@@ -1072,6 +1074,57 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::RefreshDiagnostics { reply } => {
+                self.diagnostics.refresh(
+                    self.history.clone(),
+                    crate::diagnostics::checks::StorageRoots {
+                        spool: self.artifacts.root().to_owned(),
+                        archive: self.settings().archive.resolved_root().ok(),
+                    },
+                    self.settings().destinations.len() as u32,
+                    reply,
+                );
+                vec![]
+            }
+            AppCommand::TestDiagnosticConnection {
+                id,
+                revision,
+                cancel,
+                reply,
+            } => {
+                let settings = self.settings();
+                match self.manager.ensure_revision(revision).and_then(|()| {
+                    settings
+                        .destinations
+                        .get(id)
+                        .ok_or(AppError::NeedsSetup("select a destination"))
+                }) {
+                    Ok(d) => {
+                        let origin = d.origin.clone();
+                        let destination = resolve_destination(
+                            DestinationSelection::Specific(id),
+                            DestinationSelection::Inherit,
+                            &settings.destinations,
+                        );
+                        self.diagnostics.connection(
+                            origin,
+                            destination,
+                            Arc::new(crate::platform::CredentialClientFactory::new(
+                                self.store.clone(),
+                            )),
+                            cancel,
+                            reply,
+                        );
+                    }
+                    Err(error) => {
+                        let _ = reply.try_send(crate::diagnostics::report::ConnectionCheck {
+                            uploader: crate::diagnostics::checks::uploader_result(Err(error)),
+                            ..Default::default()
+                        });
+                    }
+                }
+                vec![]
+            }
             AppCommand::ApplySettingsImport {
                 preview,
                 selection,

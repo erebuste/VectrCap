@@ -19,4 +19,5 @@ pub mod tools;
 pub mod ui;
 pub mod vectr;
 
+pub mod diagnostics;
 pub mod workflow;

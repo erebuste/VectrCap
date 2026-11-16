@@ -121,19 +121,7 @@ impl VectrClient {
         token: UploadToken,
         root: Option<reqwest::Certificate>,
     ) -> Result<Self, AppError> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut builder = reqwest::Client::builder()
-            .https_only(true)
-            .no_proxy()
-            .referer(false)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(300));
-        if let Some(root) = root {
-            builder = builder.tls_certs_only([root]);
-        }
-        let http = builder.build().map_err(|_| AppError::Tls)?;
+        let http = build_http(root)?;
         Ok(Self {
             origin,
             token,
@@ -346,7 +334,7 @@ fn validate_filename(name: &str) -> Result<(), AppError> {
 fn decode<T: DeserializeOwned>(body: Vec<u8>) -> Result<T, AppError> {
     serde_json::from_slice(&body).map_err(|_| AppError::Protocol("malformed response"))
 }
-async fn bounded_body(mut response: Response) -> Result<Vec<u8>, AppError> {
+pub(crate) async fn bounded_body(mut response: Response) -> Result<Vec<u8>, AppError> {
     if response
         .content_length()
         .is_some_and(|n| n > MAX_BODY as u64)
@@ -362,7 +350,7 @@ async fn bounded_body(mut response: Response) -> Result<Vec<u8>, AppError> {
     }
     Ok(body)
 }
-fn transport_error(error: reqwest::Error) -> AppError {
+pub(crate) fn transport_error(error: reqwest::Error) -> AppError {
     let mut source = error.source();
     let mut known_network = false;
     while let Some(e) = source {
@@ -387,6 +375,24 @@ fn transport_error(error: reqwest::Error) -> AppError {
     } else {
         AppError::Network
     }
+}
+
+/// Shared secure transport policy for token requests and the separate,
+/// unauthenticated diagnostic health client. No default authentication headers.
+pub(crate) fn build_http(root: Option<reqwest::Certificate>) -> Result<reqwest::Client, AppError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut builder = reqwest::Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .referer(false)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300));
+    if let Some(root) = root {
+        builder = builder.tls_certs_only([root]);
+    }
+    builder.build().map_err(|_| AppError::Tls)
 }
 pub fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     value

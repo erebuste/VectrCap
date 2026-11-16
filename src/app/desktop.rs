@@ -787,12 +787,11 @@ async fn serve(
     shutdown: (CancellationToken, Arc<tokio::sync::Notify>),
 ) -> Result<(), AppError> {
     let (stop, interrupt_utility) = shutdown;
-    let history = Arc::new(History::open(&root.join("history.db"))?);
-    let artifacts = Arc::new(ArtifactStore::new(root.join("spool"))?);
+    let paths = crate::persistence::AppPaths::from_root(root)?;
+    let history = Arc::new(History::open(&paths.history)?);
+    let artifacts = Arc::new(ArtifactStore::new(paths.spool)?);
     let mut controller = AppController::open(
-        Box::new(FileDestinationRepository::open(
-            &root.join("settings.json"),
-        )?),
+        Box::new(FileDestinationRepository::open(&paths.settings)?),
         history.clone(),
         store,
         artifacts.clone(),

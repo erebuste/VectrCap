@@ -21,6 +21,42 @@ pub(crate) const PARTIAL_PREFIX: &str = ".vectrcap-partial-";
 pub(crate) const FREE_SPACE_RESERVE: u64 = 64 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Version-one per-user layout; filenames stay compatible with existing
+/// installations. JSON and SQLite carry their own schema versions.
+/// Resolution never creates, moves or deletes user data.
+#[derive(Clone)]
+pub struct AppPaths {
+    pub root: PathBuf,
+    pub settings: PathBuf,
+    pub history: PathBuf,
+    pub spool: PathBuf,
+}
+impl AppPaths {
+    pub const LAYOUT_VERSION: u8 = 1;
+    pub fn current_user() -> Result<Self, AppError> {
+        let root = dirs::data_local_dir()
+            .ok_or(AppError::Persistence("Windows LocalAppData unavailable"))?
+            .join("VectrCap");
+        Self::from_root(root)
+    }
+    pub fn from_root(root: PathBuf) -> Result<Self, AppError> {
+        if !root.is_absolute() {
+            return Err(AppError::InvalidInput(
+                "application data root must be absolute",
+            ));
+        }
+        Ok(Self {
+            settings: root.join("settings.json"),
+            history: root.join("history.db"),
+            spool: root.join("spool"),
+            root,
+        })
+    }
+    pub fn default_archive_root() -> Result<PathBuf, AppError> {
+        default_archive_root()
+    }
+}
+
 /// Default archive root: the user's Windows Pictures known folder + `VectrCap`.
 /// Resolved at use time; never created or changed here.
 pub fn default_archive_root() -> Result<PathBuf, AppError> {

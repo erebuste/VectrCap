@@ -205,6 +205,21 @@ pub struct History {
 }
 
 impl History {
+    /// Aggregate diagnostics only: never select paths, receipts, names,
+    /// destination snapshots, failure strings or serialized workflow contents.
+    pub fn diagnostic_counts(&self) -> Result<(u64, u64), AppError> {
+        let c = self.lock()?;
+        let counts: (i64, i64) = c.query_row(
+            "SELECT count(CASE WHEN status NOT IN ('completed','cancelled') THEN 1 END), count(CASE WHEN status='completed' THEN 1 END) FROM jobs",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            u64::try_from(counts.0)
+                .map_err(|_| AppError::Persistence("invalid diagnostic count"))?,
+            u64::try_from(counts.1)
+                .map_err(|_| AppError::Persistence("invalid diagnostic count"))?,
+        ))
+    }
     /// Bounded shell view, without running recovery or modifying any job.
     pub fn shell_jobs(&self) -> Result<Vec<UploadJob>, AppError> {
         let conn = self.lock()?;

@@ -44,10 +44,7 @@ fn run() -> Result<(), AppError> {
             })),
         };
     };
-    // dirs 7's Windows adapter uses SHGetKnownFolderPath(FOLDERID_LocalAppData).
-    let root = dirs::data_local_dir()
-        .ok_or(AppError::Persistence("Windows LocalAppData unavailable"))?
-        .join("VectrCap");
+    let root = vectrcap::persistence::AppPaths::current_user()?.root;
     std::fs::create_dir_all(&root).map_err(|e| AppError::Io {
         stage: "opening application data",
         kind: e.kind(),

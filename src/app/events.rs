@@ -48,6 +48,15 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    RefreshDiagnostics {
+        reply: std::sync::mpsc::SyncSender<crate::diagnostics::report::DiagnosticSnapshot>,
+    },
+    TestDiagnosticConnection {
+        id: DestinationId,
+        revision: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        reply: std::sync::mpsc::SyncSender<crate::diagnostics::report::ConnectionCheck>,
+    },
     ApplySettingsImport {
         preview: Box<crate::persistence::settings_transfer::ImportPreview>,
         selection: crate::persistence::settings_transfer::ImportSelection,

@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
+    troubleshooting: super::troubleshooting::TroubleshootingPane,
     preferences_transfer: super::settings_transfer::SettingsTransferPane,
     install_review: super::destination_install::InstallReview,
     scrolling_host: super::scrolling_controls::ScrollingHost,
@@ -47,6 +48,7 @@ impl Shell {
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
+            troubleshooting: Default::default(),
             preferences_transfer: Default::default(),
             install_review: Default::default(),
             scrolling_host: Default::default(),
@@ -100,6 +102,9 @@ impl eframe::App for Shell {
             self.submit(AppCommand::Show(Window::Settings));
         }
         self.view = self.client.snapshot();
+        if self.view.window != Some(Window::Settings) {
+            self.troubleshooting.cancel_connection();
+        }
         self.preferences_transfer.reconcile();
         let install_commands =
             self.install_review
@@ -286,6 +291,12 @@ impl eframe::App for Shell {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match (self.view.window, &self.view.settings) {
                             (Some(Window::Settings), Some(settings)) => {
+                                self.troubleshooting.draw(
+                                    ui,
+                                    settings,
+                                    &self.client,
+                                    &self.picker_gate,
+                                );
                                 self.preferences_transfer.draw(
                                     ui,
                                     settings,
