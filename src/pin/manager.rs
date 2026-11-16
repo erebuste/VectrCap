@@ -38,6 +38,7 @@ pub enum PinEffect {
 }
 #[derive(Default)]
 pub struct PinManager {
+    defaults: PinOptions,
     pins: HashMap<PinId, PinSnapshot>,
     pixels: u64,
     work_areas: Vec<PhysicalRect>,
@@ -45,6 +46,17 @@ pub struct PinManager {
     capture_depth: u32,
 }
 impl PinManager {
+    pub fn with_defaults(defaults: PinOptions) -> Result<Self, AppError> {
+        defaults.validate()?;
+        Ok(Self {
+            defaults,
+            ..Default::default()
+        })
+    }
+    pub(crate) fn set_defaults(&mut self, defaults: PinOptions) {
+        self.defaults = defaults;
+    }
+
     pub fn get(&self, id: PinId) -> Option<&PinSnapshot> {
         self.pins.get(&id)
     }
@@ -101,6 +113,7 @@ impl PinManager {
             state: PinState::new(position),
             visible: self.capture_depth == 0,
         };
+        pin.state.options = self.defaults.clone();
         clamp_to_area(&mut pin, area);
         self.pixels += pin.image.pixel_count();
         self.pins.insert(id, pin);
@@ -149,7 +162,10 @@ impl PinManager {
                 pin.state.opacity = 100;
                 pin.state.minimized = false;
             }
-            PinInput::Options(options) => pin.state.options = options,
+            PinInput::Options(options) => {
+                options.validate()?;
+                pin.state.options = options;
+            }
             PinInput::Copy => return Ok(vec![PinEffect::CopyImage(pin.image.pixels().clone())]),
             PinInput::Close => unreachable!(),
         }

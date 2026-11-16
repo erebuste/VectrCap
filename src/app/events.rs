@@ -48,6 +48,11 @@ pub enum HistoryAction {
     DeleteLocalFile,
 }
 pub enum AppCommand {
+    ApplySettingsImport {
+        preview: Box<crate::persistence::settings_transfer::ImportPreview>,
+        selection: crate::persistence::settings_transfer::ImportSelection,
+        reply: std::sync::mpsc::SyncSender<Result<(), AppError>>,
+    },
     StartUtility(crate::tools::session::UtilityKind),
     Utility {
         session: Uuid,

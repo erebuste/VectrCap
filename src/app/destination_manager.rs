@@ -391,26 +391,53 @@ impl DestinationManager {
     /// `ShortcutManager::apply`); this method is exactly the "configuration
     /// writer" that transaction is injected with.
     pub fn save_shortcuts(&mut self, candidate: &[ShortcutBinding]) -> Result<(), AppError> {
-        self.ensure_not_corrupted()?;
-        for binding in candidate {
-            if let DestinationSelection::Specific(id) = binding.destination
-                && self.settings.destinations.get(id).is_none()
-            {
+        let mut settings = self.settings.clone();
+        settings.shortcuts.bindings = candidate.to_vec();
+        self.commit_preferences(settings, self.settings.revision)
+    }
+    /// Shared manual/import checkpoint. Preserve every existing destination's
+    /// identity and credential binding; preferences can only append tokenless ones.
+    /// There is no in-memory mutation or fallible step after the durable commit.
+    pub(crate) fn preflight_preferences(
+        &self,
+        candidate: &Settings,
+        revision: u64,
+    ) -> Result<(), AppError> {
+        self.ensure_revision(revision)?;
+        for old in self.settings.destinations.iter() {
+            if candidate.destinations.get(old.id) != Some(old) {
                 return Err(AppError::InvalidInput(
-                    "shortcut destination no longer exists",
+                    "preferences cannot replace destination credentials or identity",
                 ));
             }
         }
-        let mut settings = self.settings.clone();
-        settings.shortcuts.bindings = candidate.to_vec();
-        settings.revision = settings
-            .revision
+        if candidate
+            .destinations
+            .iter()
+            .any(|d| self.settings.destinations.get(d.id).is_none() && d.credential_ref.is_some())
+        {
+            return Err(AppError::InvalidInput(
+                "preferences cannot install credentials",
+            ));
+        }
+        let mut next = candidate.clone();
+        next.revision = revision
             .checked_add(1)
             .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
-        settings.validate()?;
-        self.repository.save_settings(&settings)?;
-        self.settings = settings;
-
+        next.encode_persistence()?;
+        self.references.validate_configured(&next)
+    }
+    pub(crate) fn commit_preferences(
+        &mut self,
+        mut candidate: Settings,
+        revision: u64,
+    ) -> Result<(), AppError> {
+        self.preflight_preferences(&candidate, revision)?;
+        candidate.revision = revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
         Ok(())
     }
     /// Cooperating acceptance and edits share this leased revision boundary.

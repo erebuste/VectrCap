@@ -174,3 +174,31 @@ impl EffectiveProfile {
         }
     }
 }
+
+impl TaskProfile {
+    /// Importing local task choices must not change effective upload/browser
+    /// automation, including the review gates and scope that constrain it.
+    pub(crate) fn preserve_automation_from(&mut self, current: &Self) {
+        for task in [
+            CaptureTask::Upload,
+            CaptureTask::QuickMenu,
+            CaptureTask::Review,
+            CaptureTask::BeforeUploadReview,
+        ] {
+            if task == CaptureTask::Upload || current.capture.contains(&CaptureTask::Upload) {
+                if current.capture.contains(&task) {
+                    self.capture.insert(task);
+                } else {
+                    self.capture.remove(&task);
+                }
+            }
+        }
+        if current.after_upload.contains(&UploadTask::OpenUrl) {
+            self.after_upload.insert(UploadTask::OpenUrl);
+        } else {
+            self.after_upload.remove(&UploadTask::OpenUrl);
+        }
+        self.scope = current.scope;
+        self.before_upload_review = current.before_upload_review;
+    }
+}

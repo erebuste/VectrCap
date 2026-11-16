@@ -10,7 +10,7 @@ use std::{
 use uuid::Uuid;
 
 pub const MAX_ENCODED_BYTES: usize = 128 * 1024 * 1024;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExportFormat {
     Png,
     Jpeg,
@@ -51,7 +51,7 @@ impl ExportFormat {
         matches!(self, Self::Jpeg | Self::WebpLossy)
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Resize {
     Original,
     Percent(u8),

@@ -310,6 +310,12 @@ pub struct StartupPreference {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
+    pub tools: ToolPreferences,
+    #[serde(default)]
+    pub image: ImageExportPreferences,
+    #[serde(default)]
+    pub pin: crate::pin::PinOptions,
+    #[serde(default)]
     pub tasks: crate::workflow::profile::TaskProfiles,
     #[serde(default)]
     pub region: crate::capture::preferences::RegionCapturePreferences,
@@ -347,6 +353,9 @@ fn notifications_default_enabled() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            tools: Default::default(),
+            image: Default::default(),
+            pin: Default::default(),
             tasks: Default::default(),
             region: crate::capture::preferences::RegionCapturePreferences::default(),
             screenshot: crate::capture::request::ScreenshotPreferences::default(),
@@ -381,6 +390,9 @@ impl Settings {
         if self.version != SETTINGS_VERSION {
             return Err(AppError::InvalidInput("unsupported settings version"));
         }
+        self.tools.validate()?;
+        self.image.validate()?;
+        self.pin.validate()?;
         self.destinations.validate()?;
         self.tasks.validate(self)?;
         self.archive.validate()?;
@@ -481,7 +493,7 @@ fn save_encoded_json(bytes: &[u8], path: &Path) -> Result<(), AppError> {
 }
 
 #[allow(unsafe_code)]
-fn replace_write_through(source: &Path, destination: &Path) -> Result<(), AppError> {
+pub(crate) fn replace_write_through(source: &Path, destination: &Path) -> Result<(), AppError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -514,4 +526,83 @@ fn replace_write_through(source: &Path, destination: &Path) -> Result<(), AppErr
     // No fallible operation after the commit point: callers may now retire old
     // credentials. Tempfile drop only removes the no-longer-existing old name.
     Ok(())
+}
+
+/// Persisted image defaults contain no preview pixels or document revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageExportPreferences {
+    pub format: crate::editor::export::ExportFormat,
+    pub quality: u8,
+    pub resize: crate::editor::export::Resize,
+}
+impl Default for ImageExportPreferences {
+    fn default() -> Self {
+        Self {
+            format: crate::editor::export::ExportFormat::Png,
+            quality: 90,
+            resize: crate::editor::export::Resize::Original,
+        }
+    }
+}
+impl ImageExportPreferences {
+    pub fn options(&self) -> Result<crate::editor::export::ImageExportOptions, AppError> {
+        crate::editor::export::ImageExportOptions::new(self.format, self.quality, self.resize)
+    }
+    pub fn validate(&self) -> Result<(), AppError> {
+        self.options().map(|_| ())
+    }
+}
+
+/// Integer units keep persisted tool defaults finite and exactly comparable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPreferences {
+    pub color: [u8; 3],
+    pub fill_color: [u8; 3],
+    pub fill: bool,
+    pub width_tenths: u16,
+    pub text_size: u16,
+    pub step_radius: u16,
+    pub highlight_color: [u8; 3],
+    pub opacity_percent: u8,
+    pub dim_percent: u8,
+    pub eraser_width: u16,
+}
+impl Default for ToolPreferences {
+    fn default() -> Self {
+        Self {
+            color: [255, 60, 60],
+            fill_color: [255, 60, 60],
+            fill: false,
+            width_tenths: 30,
+            text_size: 24,
+            step_radius: 16,
+            highlight_color: [255, 255, 0],
+            opacity_percent: 35,
+            dim_percent: 60,
+            eraser_width: 20,
+        }
+    }
+}
+impl ToolPreferences {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(5..=640).contains(&self.width_tenths)
+            || !(4..=512).contains(&self.text_size)
+            || !(4..=512).contains(&self.step_radius)
+            || self.opacity_percent > 100
+            || self.dim_percent > 100
+            || !(1..=1024).contains(&self.eraser_width)
+        {
+            return Err(AppError::InvalidInput(
+                "tool display defaults are out of range",
+            ));
+        }
+        crate::editor::Style::new(
+            [self.color[0], self.color[1], self.color[2], 255],
+            f32::from(self.width_tenths) / 10.0,
+            None,
+        )?;
+        Ok(())
+    }
 }

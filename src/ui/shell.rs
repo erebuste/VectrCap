@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
+    preferences_transfer: super::settings_transfer::SettingsTransferPane,
     install_review: super::destination_install::InstallReview,
     scrolling_host: super::scrolling_controls::ScrollingHost,
     recording_host: super::recording_overlay::RecordingHost,
@@ -46,6 +47,7 @@ impl Shell {
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self {
+            preferences_transfer: Default::default(),
             install_review: Default::default(),
             scrolling_host: Default::default(),
             recording_host: Default::default(),
@@ -98,6 +100,7 @@ impl eframe::App for Shell {
             self.submit(AppCommand::Show(Window::Settings));
         }
         self.view = self.client.snapshot();
+        self.preferences_transfer.reconcile();
         let install_commands =
             self.install_review
                 .show(ctx, self.view.install.as_ref(), self.view.settings.as_ref());
@@ -283,6 +286,12 @@ impl eframe::App for Shell {
                         .auto_shrink([false, false])
                         .show(ui, |ui| match (self.view.window, &self.view.settings) {
                             (Some(Window::Settings), Some(settings)) => {
+                                self.preferences_transfer.draw(
+                                    ui,
+                                    settings,
+                                    &self.client,
+                                    &self.picker_gate,
+                                );
                                 if ui.button("Import VectrCap config…").clicked() {
                                     crate::platform::windows::file_dialog::spawn_import_destination(
                                         self.client.clone(),

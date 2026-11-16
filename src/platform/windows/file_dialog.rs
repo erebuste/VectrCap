@@ -249,14 +249,14 @@ fn spawn_capture_dialog(
 /// can never leave the gate stuck busy forever.
 #[derive(Clone, Default)]
 pub struct PickerGate(Arc<AtomicBool>);
-struct PickerGuard(Arc<AtomicBool>);
+pub(crate) struct PickerGuard(Arc<AtomicBool>);
 impl Drop for PickerGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 impl PickerGate {
-    fn try_acquire(&self) -> Option<PickerGuard> {
+    pub(crate) fn try_acquire(&self) -> Option<PickerGuard> {
         self.0
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
@@ -563,6 +563,47 @@ pub fn spawn_import_destination(client: DesktopClient, gate: PickerGate) {
         });
     if result.is_err() {
         report.report_error(error());
+    }
+}
+
+/// Preferences selection is distinct from the token-bearing .vectrcap flow.
+/// Selection alone grants no registration, upload or cleanup capability.
+pub(crate) fn pick_preferences_file(export: bool) -> Result<Option<PathBuf>, AppError> {
+    use windows::{Win32::UI::Shell::Common::COMDLG_FILTERSPEC, core::w};
+    if export {
+        return pick_image_save("json");
+    }
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|_| error())?;
+        let _com = Com;
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FILE_OPEN_DIALOG, None, CLSCTX_INPROC_SERVER).map_err(|_| error())?;
+        dialog
+            .SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)
+            .map_err(|_| error())?;
+        dialog
+            .SetTitle(w!("Import VectrCap preferences"))
+            .map_err(|_| error())?;
+        dialog
+            .SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("Preferences backup (*.json)"),
+                pszSpec: w!("*.json"),
+            }])
+            .map_err(|_| error())?;
+        match dialog.Show(None) {
+            Ok(()) => {}
+            Err(e) if e.code().0 == ERROR_CANCELLED => return Ok(None),
+            Err(_) => return Err(error()),
+        }
+        let item = dialog.GetResult().map_err(|_| error())?;
+        let name = item
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|_| error())?;
+        let text = name.to_string().map_err(|_| error());
+        CoTaskMemFree(Some(name.0.cast()));
+        Ok(Some(PathBuf::from(text?)))
     }
 }
 

@@ -40,3 +40,5 @@ pub mod integrations;
 pub mod color_result;
 pub mod ruler_overlay;
 pub mod screen_sampler;
+
+pub mod settings_transfer;

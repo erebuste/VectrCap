@@ -115,6 +115,7 @@ impl AppController {
         session: Uuid,
         result: Result<CaptureSnapshot, AppError>,
     ) -> Vec<AppEffect> {
+        let preferences = self.settings().clone();
         let Some(capture) = self
             .capture
             .as_mut()
@@ -145,7 +146,8 @@ impl AppController {
                         x: snapshot.bounds().left(),
                         y: snapshot.bounds().top(),
                     });
-            let overlay = CaptureOverlay::from_snapshot(snapshot, pointer, (4, 4))?;
+            let mut overlay = CaptureOverlay::from_snapshot(snapshot, pointer, (4, 4))?;
+            overlay.initialize_preferences(&preferences)?;
             Ok(Arc::new(Mutex::new(CaptureSurface {
                 task_target: capture.context.destination.as_ref().map_or_else(
                     || "Upload destination needs setup".into(),
@@ -594,8 +596,9 @@ impl AppController {
         monitors: Vec<MonitorGeometry>,
         context: crate::workflow::runner::WorkflowContext,
     ) -> Result<Vec<AppEffect>, AppError> {
-        let (overlay, status) =
+        let (mut overlay, status) =
             crate::ui::scrolling_review::ScrollingReview::new(review)?.into_parts();
+        overlay.initialize_preferences(self.settings())?;
         let surface = Arc::new(Mutex::new(CaptureSurface {
             task_target: context.destination.as_ref().map_or_else(
                 || "Upload destination needs setup".into(),
@@ -663,8 +666,9 @@ impl AppController {
                         "finish the active capture before opening clipboard review",
                     ));
                 }
-                let overlay =
+                let mut overlay =
                     crate::ui::image_review::ImageReview::from_image(image)?.into_editor();
+                overlay.initialize_preferences(self.settings())?;
                 let context = self.task_context(ArtifactKind::Screenshot, action, selection);
                 let id = context.id;
                 let surface = Arc::new(Mutex::new(CaptureSurface {

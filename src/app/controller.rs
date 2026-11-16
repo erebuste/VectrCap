@@ -164,7 +164,13 @@ struct FileBatch {
     /// per-job grouped notice.
     completions: Vec<Option<JobCompletion>>,
 }
+struct DeferredImport {
+    preview: crate::persistence::settings_transfer::ImportPreview,
+    selection: crate::persistence::settings_transfer::ImportSelection,
+    reply: std::sync::mpsc::SyncSender<Result<(), AppError>>,
+}
 pub struct AppController {
+    deferred_import: Option<DeferredImport>,
     ingress: super::ingress::Ingress,
     install: Option<(Uuid, super::destination_install::DestinationInstallSession)>,
     task_runners: HashMap<Uuid, crate::workflow::runner::TaskRunner>,
@@ -248,6 +254,7 @@ impl AppController {
         let mut notifications = NotificationCenter::new();
         notifications.set_notifications_enabled(manager.settings().notifications_enabled);
         Ok(Self {
+            deferred_import: None,
             ingress,
             install: None,
             task_runners: recovered.into_iter().map(|r| (r.context().id, r)).collect(),
@@ -260,7 +267,7 @@ impl AppController {
             scrolling: None,
             recording: None,
             recording_origin: std::time::Instant::now(),
-            pins: crate::pin::PinManager::default(),
+            pins: crate::pin::PinManager::with_defaults(manager.settings().pin.clone())?,
             pin_load: None,
             manager,
             history,
@@ -289,6 +296,75 @@ impl AppController {
                 self.settings().filename.clone(),
             ),
         )]
+    }
+    /// Bootstrap through an injected registrar, shared by native startup and tests.
+    pub fn initialize_shortcuts(
+        &mut self,
+        registrar: Box<dyn super::shortcuts::ShortcutRegistrar>,
+    ) -> Vec<AppEffect> {
+        if self.shortcuts.is_some() {
+            return vec![];
+        }
+        let (manager, _) = ShortcutManager::new(registrar, self.settings().shortcuts.effective());
+        let statuses = super::shortcuts::ShortcutAction::all()
+            .iter()
+            .map(|&action| (action, manager.status(action)))
+            .collect();
+        self.shortcuts = Some(manager);
+        vec![AppEffect::ShortcutStatuses(statuses)]
+    }
+    fn finish_deferred_import(&mut self) -> Vec<AppEffect> {
+        if self.deferred_import.is_none() {
+            return vec![];
+        }
+        if self.lifecycle == Lifecycle::Running
+            && (self.capture.is_some()
+                || self.recording.is_some()
+                || self.scrolling.is_some()
+                || self.utility.is_some()
+                || !self.pending_acquisitions.is_empty())
+        {
+            return vec![];
+        }
+        let pending = self.deferred_import.take().expect("checked pending import");
+        let result = if self.lifecycle != Lifecycle::Running {
+            Err(AppError::Cancelled)
+        } else {
+            match &mut self.shortcuts {
+                Some(shortcuts) => crate::persistence::settings_transfer::SettingsTransfer::new(
+                    &mut self.manager,
+                    shortcuts,
+                    &crate::persistence::settings_transfer::NativeImportAudioResolver,
+                )
+                .apply_import(pending.preview, pending.selection),
+                None => Err(AppError::InUse(
+                    "hotkeys are still initializing; refresh and try again",
+                )),
+            }
+        };
+        // A closed feedback channel must never turn a committed import into failure.
+        let _ = pending.reply.try_send(result.clone());
+        match result {
+            Ok(()) => {
+                self.notifications
+                    .set_notifications_enabled(self.settings().notifications_enabled);
+                self.pins.set_defaults(self.settings().pin.clone());
+                let statuses = super::shortcuts::ShortcutAction::all()
+                    .iter()
+                    .map(|&action| {
+                        (
+                            action,
+                            self.shortcuts.as_ref().expect("initialized").status(action),
+                        )
+                    })
+                    .collect();
+                vec![
+                    AppEffect::ShortcutStatuses(statuses),
+                    AppEffect::SettingsSaved(self.settings().clone()),
+                ]
+            }
+            Err(error) => vec![AppEffect::Error(error)],
+        }
     }
     pub fn shortcuts(&self) -> Option<&ShortcutManager> {
         self.shortcuts.as_ref()
@@ -831,6 +907,11 @@ impl AppController {
         }
     }
     pub fn dispatch(&mut self, command: AppCommand) -> Vec<AppEffect> {
+        let mut effects = self.dispatch_inner(command);
+        effects.extend(self.finish_deferred_import());
+        effects
+    }
+    fn dispatch_inner(&mut self, command: AppCommand) -> Vec<AppEffect> {
         if matches!(command, AppCommand::Quit) && self.lifecycle != Lifecycle::Running {
             return vec![];
         }
@@ -991,6 +1072,30 @@ impl AppController {
     }
     fn apply(&mut self, command: AppCommand) -> Result<Vec<AppEffect>, AppError> {
         Ok(match command {
+            AppCommand::ApplySettingsImport {
+                preview,
+                selection,
+                reply,
+            } => {
+                let result = self.manager.ensure_revision(preview.base_revision());
+                if let Err(error) = result {
+                    let _ = reply.try_send(Err(error.clone()));
+                    return Err(error);
+                }
+                if self.deferred_import.is_some() {
+                    let error = AppError::InUse(
+                        "a preferences import is already waiting for the active session",
+                    );
+                    let _ = reply.try_send(Err(error.clone()));
+                    return Err(error);
+                }
+                self.deferred_import = Some(DeferredImport {
+                    preview: *preview,
+                    selection,
+                    reply,
+                });
+                vec![]
+            }
             AppCommand::StartUtility(kind) => self.start_utility(kind)?,
             AppCommand::Utility { session, input } => self.utility_input(session, input),
             AppCommand::InterruptUtility => {
@@ -1381,22 +1486,9 @@ impl AppController {
             AppCommand::AcceptFileSelectionFor { paths, selection } => {
                 self.accept_file_selection(paths, selection)?
             }
-            AppCommand::AttachHotkeyWindow(hwnd) => {
-                if self.shortcuts.is_none() {
-                    let backend = crate::platform::windows::hotkeys::Win32HotkeyBackend::new(hwnd);
-                    let (manager, _startup_conflicts) = ShortcutManager::new(
-                        Box::new(backend),
-                        self.manager.settings().shortcuts.effective(),
-                    );
-                    let statuses = super::shortcuts::ShortcutAction::all()
-                        .iter()
-                        .map(|&action| (action, manager.status(action)))
-                        .collect();
-                    self.shortcuts = Some(manager);
-                    return Ok(vec![AppEffect::ShortcutStatuses(statuses)]);
-                }
-                vec![]
-            }
+            AppCommand::AttachHotkeyWindow(hwnd) => self.initialize_shortcuts(Box::new(
+                crate::platform::windows::hotkeys::Win32HotkeyBackend::new(hwnd),
+            )),
             AppCommand::NativeHotkeyFired(id) => {
                 if self.capture.is_some() || self.utility.is_some() {
                     return Ok(vec![]);
@@ -1552,6 +1644,11 @@ impl AppController {
         })
     }
     pub fn on_event(&mut self, event: AppEvent) -> Vec<AppEffect> {
+        let mut effects = self.on_event_inner(event);
+        effects.extend(self.finish_deferred_import());
+        effects
+    }
+    fn on_event_inner(&mut self, event: AppEvent) -> Vec<AppEffect> {
         match event {
             AppEvent::UtilityAcquired { session, result } => self.utility_acquired(session, result),
             AppEvent::ScrollingAcquired { session, result } => {

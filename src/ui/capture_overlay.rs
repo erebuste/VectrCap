@@ -212,6 +212,27 @@ impl CaptureOverlay {
             chrome_focused: false,
         }
     }
+    pub fn initialize_preferences(
+        &mut self,
+        settings: &crate::persistence::settings::Settings,
+    ) -> Result<(), AppError> {
+        settings.tools.validate()?;
+        *self.output.options_mut() = settings.image.options()?;
+        let t = &settings.tools;
+        self.options = ToolOptions {
+            color: t.color,
+            fill_color: t.fill_color,
+            fill: t.fill,
+            width: f32::from(t.width_tenths) / 10.0,
+            text_size: f32::from(t.text_size),
+            step_radius: f32::from(t.step_radius),
+            highlight_color: t.highlight_color,
+            opacity: f32::from(t.opacity_percent) / 100.0,
+            dim: f32::from(t.dim_percent) / 100.0,
+            eraser_width: f32::from(t.eraser_width),
+        };
+        Ok(())
+    }
     pub fn from_snapshot(
         snapshot: CaptureSnapshot,
         pointer: PhysicalPoint,

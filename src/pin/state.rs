@@ -60,7 +60,8 @@ impl PinnedImage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinOptions {
     pub always_on_top: bool,
     pub smooth: bool,
@@ -81,6 +82,14 @@ impl Default for PinOptions {
     }
 }
 impl PinOptions {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.border_width > 16 {
+            return Err(AppError::InvalidInput(
+                "pin border width must be 0 to 16 pixels",
+            ));
+        }
+        Ok(())
+    }
     pub fn border_width(&self) -> u8 {
         self.border_width
     }
