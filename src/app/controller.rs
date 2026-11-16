@@ -1517,8 +1517,15 @@ impl AppController {
                 {
                     return self.quit_recording();
                 }
-                self.quit_recording()?;
+                // Release the utility's exclusive reservation before the
+                // fallible quit_recording call below. Otherwise a finalized
+                // recording review still awaiting Save/Discard returns Err
+                // via `?` on every Quit dispatch (including the cancelled-
+                // signal retry loop), permanently blocking the utility
+                // overlay's release and every later capture/recording/
+                // utility acquisition behind it.
                 let utility_effects = self.close_utility();
+                self.quit_recording()?;
                 let mut capture_effects = if let Some(capture) = &self.capture {
                     self.cancel_capture(capture.id)
                 } else {

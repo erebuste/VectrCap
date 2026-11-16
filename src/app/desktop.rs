@@ -124,12 +124,19 @@ impl Default for DesktopView {
 pub struct DesktopClient {
     tx: mpsc::Sender<AppCommand>,
     stop: CancellationToken,
+    interrupt_utility: Arc<tokio::sync::Notify>,
     view: Arc<Mutex<DesktopView>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 impl DesktopClient {
     pub(crate) fn wake(&self) {
         (self.wake)();
+    }
+    /// Delivered out-of-band like Quit, never through the bounded command
+    /// queue: a congested queue must never silently drop this and leave the
+    /// utility's exclusive acquisition reservation held forever.
+    pub fn request_utility_interrupt(&self) {
+        self.interrupt_utility.notify_one();
     }
     pub fn snapshot(&self) -> DesktopView {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -187,9 +194,11 @@ impl DesktopRuntime {
         let (tx, rx) = mpsc::channel(32);
         let view = Arc::new(Mutex::new(DesktopView::default()));
         let stop = CancellationToken::new();
+        let interrupt_utility = Arc::new(tokio::sync::Notify::new());
         let client = DesktopClient {
             tx,
             stop: stop.clone(),
+            interrupt_utility: interrupt_utility.clone(),
             view: view.clone(),
             wake: wake.clone(),
         };
@@ -209,7 +218,7 @@ impl DesktopRuntime {
                             rx,
                             view.clone(),
                             wake.clone(),
-                            shutdown,
+                            (shutdown, interrupt_utility),
                         ))
                     });
                 if let Err(error) = result {
@@ -775,8 +784,9 @@ async fn serve(
     mut commands: mpsc::Receiver<AppCommand>,
     view: Arc<Mutex<DesktopView>>,
     wake: Arc<dyn Fn() + Send + Sync>,
-    stop: CancellationToken,
+    shutdown: (CancellationToken, Arc<tokio::sync::Notify>),
 ) -> Result<(), AppError> {
+    let (stop, interrupt_utility) = shutdown;
     let history = Arc::new(History::open(&root.join("history.db"))?);
     let artifacts = Arc::new(ArtifactStore::new(root.join("spool"))?);
     let mut controller = AppController::open(
@@ -910,6 +920,7 @@ async fn serve(
                     }
                 }
                 _ = stop.cancelled(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::Quit),
+                _ = interrupt_utility.notified(), if controller.lifecycle == Lifecycle::Running => controller.dispatch(AppCommand::InterruptUtility),
                 command = commands.recv(), if controller.lifecycle == Lifecycle::Running => {
                     effects.state.error = None;
                     controller.dispatch(command.unwrap_or(AppCommand::Quit))
