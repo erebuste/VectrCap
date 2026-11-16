@@ -218,7 +218,17 @@ impl CaptureOverlay {
                 .as_mut()
                 .expect("region gesture has a selection model")
                 .handle(SelectionInput::PrimaryUp(p));
-            return self.selection_outcome(outcome, true);
+            let selected = matches!(
+                outcome,
+                SelectionOutcome::Selected(_) | SelectionOutcome::Changed(_)
+            );
+            self.selection_outcome(outcome, true)?;
+            // Releasing a successful screenshot selection is the confirmation.
+            // Recording/scrolling keep their explicit Start/countdown boundary.
+            if selected && !self.recording_selection {
+                self.handle(OverlayInput::Enter)?;
+            }
+            return Ok(());
         }
         if self.gesture.is_some() {
             self.pointer_move(p, shift)?;

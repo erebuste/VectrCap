@@ -157,7 +157,7 @@ impl CaptureOverlay {
                 });
                 if self.sampling { ui.label("Click a nearby background pixel to sample; the following gesture paints it."); }
                 if self.tool==AnnotationTool::SmartEraser && self.sampled.is_none() { ui.label("Sample a frozen source color before painting."); }
-                ui.label("Enter: commit text, then expose finish. Escape: cancel active edit first. Shift+Tab: focus tools; Tab/Shift+Tab: traverse focused controls.");
+                ui.label("Release left mouse: finish screenshot selection. Enter: commit text or show output options. Escape: cancel active edit first. Shift+Tab: focus tools; Tab/Shift+Tab: traverse focused controls.");
                 ui.label("Region arrows: move 1 physical pixel; Shift+arrows: resize 1 physical pixel.");
                 if self.preview.accepted!=Some(self.generation) { ui.label("Preparing annotation preview..."); }
                 if let Some(error)=&self.error { ui.colored_label(ui.visuals().error_fg_color,error.to_string()); }

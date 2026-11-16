@@ -447,3 +447,51 @@ fn canvas_tab_keeps_subsequent_tool_shortcuts_in_the_canvas_context() {
     }
     assert_eq!(overlay.tool(), Tool::Freehand);
 }
+
+#[test]
+fn screenshot_region_release_opens_finish_without_enter() {
+    let mut overlay = session();
+    overlay.set_tool(Tool::Region).unwrap();
+    overlay.pointer_down(point(-90, -40)).unwrap();
+    overlay.pointer_move(point(100, 100), false).unwrap();
+    assert!(!overlay.finish_visible());
+    overlay.pointer_up(point(100, 100), false).unwrap();
+    assert!(overlay.finish_visible());
+    assert_eq!(
+        overlay.document().crop(),
+        Some(PhysicalRect::new(-90, -40, 190, 140).unwrap())
+    );
+}
+
+#[test]
+fn window_click_release_opens_finish_without_enter() {
+    let mut overlay = session();
+    overlay.set_tool(Tool::Region).unwrap();
+    overlay.pointer_move(point(-50, 0), false).unwrap();
+    overlay.pointer_down(point(-50, 0)).unwrap();
+    overlay.pointer_up(point(-50, 0), false).unwrap();
+    assert!(overlay.finish_visible());
+    assert_eq!(
+        overlay.document().crop(),
+        Some(PhysicalRect::new(-80, -30, 100, 80).unwrap())
+    );
+}
+
+#[test]
+fn recording_region_release_still_requires_explicit_start() {
+    let mut overlay = session();
+    overlay.set_recording_selection();
+    drag(&mut overlay, point(-90, -40), point(100, 100));
+    assert!(!overlay.finish_visible());
+}
+
+#[test]
+fn cancelled_screenshot_drag_release_does_not_finish() {
+    let mut overlay = session();
+    overlay.set_tool(Tool::Region).unwrap();
+    overlay.pointer_down(point(-90, -40)).unwrap();
+    overlay.pointer_move(point(100, 100), false).unwrap();
+    overlay.handle(OverlayInput::Escape).unwrap();
+    overlay.pointer_up(point(100, 100), false).unwrap();
+    assert!(!overlay.finish_visible());
+}
