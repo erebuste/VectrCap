@@ -12,7 +12,9 @@ use std::{
 };
 
 pub const MAX_TILE_SIDE: u32 = 1024;
-pub const MAX_VISIBLE_TILES: usize = 16;
+// Enough native-resolution tiles for desktop layouts within the 64-megapixel
+// source limit. Texture dimensions and resident count remain independently bounded.
+pub const MAX_VISIBLE_TILES: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ImageTile {
     bounds: PhysicalRect,
@@ -37,22 +39,35 @@ pub fn tile_plan(
     height: u32,
     visible: PhysicalRect,
 ) -> Result<Vec<ImageTile>, AppError> {
+    tile_plan_with_budget(width, height, visible, MAX_VISIBLE_TILES)
+}
+fn tile_plan_with_budget(
+    width: u32,
+    height: u32,
+    visible: PhysicalRect,
+    budget: usize,
+) -> Result<Vec<ImageTile>, AppError> {
     let source = PhysicalRect::new(0, 0, width, height)?;
     source.rgba_len()?;
     let Some(visible) = source.intersection(visible) else {
         return Ok(vec![]);
     };
     let mut stride = 1u32;
-    while visible.width().div_ceil(stride) > MAX_TILE_SIDE
-        || visible.height().div_ceil(stride) > MAX_TILE_SIDE
-    {
+    let span = loop {
+        let span = MAX_TILE_SIDE
+            .checked_mul(stride)
+            .ok_or(AppError::InvalidInput("image tile span overflows"))?;
+        // Count the actual grid intersections, including partial edge tiles.
+        // A texture limit applies per tile, not to the whole visible desktop.
+        let columns = (visible.right() as u32 - 1) / span - visible.left() as u32 / span + 1;
+        let rows = (visible.bottom() as u32 - 1) / span - visible.top() as u32 / span + 1;
+        if u64::from(columns) * u64::from(rows) <= budget as u64 {
+            break span;
+        }
         stride = stride
             .checked_mul(2)
             .ok_or(AppError::InvalidInput("image tile stride overflows"))?;
-    }
-    let span = MAX_TILE_SIDE
-        .checked_mul(stride)
-        .ok_or(AppError::InvalidInput("image tile span overflows"))?;
+    };
     let mut tiles = vec![];
     for row in visible.top() as u32 / span..=(visible.bottom() as u32 - 1) / span {
         for col in visible.left() as u32 / span..=(visible.right() as u32 - 1) / span {
@@ -66,7 +81,7 @@ pub fn tile_plan(
                 )?,
                 stride,
             });
-            if tiles.len() > MAX_VISIBLE_TILES {
+            if tiles.len() > budget {
                 return Err(AppError::InvalidInput("image view exceeds tile budget"));
             }
         }
@@ -122,7 +137,15 @@ impl TiledImage {
             .max(1)
             .min(self.pixels.height() - top);
         let visible = PhysicalRect::new(left as i32, top as i32, width, height)?;
-        let tiles = tile_plan(self.pixels.width(), self.pixels.height(), visible)?;
+        // Zoomed-out long-image review keeps the original smaller cache budget.
+        // Frozen desktop overlays paint at one physical display pixel per source pixel.
+        let budget = if zoom * f64::from(painter.ctx().pixels_per_point()) >= 1.0 - 1e-6 {
+            MAX_VISIBLE_TILES
+        } else {
+            16
+        };
+        let tiles =
+            tile_plan_with_budget(self.pixels.width(), self.pixels.height(), visible, budget)?;
         let retained: HashSet<_> = tiles.iter().copied().collect();
         self.textures.retain(|tile, _| retained.contains(tile));
         let painter = painter.with_clip_rect(viewport.intersect(painter.clip_rect()));
