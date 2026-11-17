@@ -106,6 +106,9 @@ impl SettingsPane {
     pub fn category(&self) -> SettingsCategory {
         self.category
     }
+    pub fn select(&mut self, category: SettingsCategory) {
+        self.category = category;
+    }
     pub fn show_categories(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             for category in SettingsCategory::ALL {
@@ -997,6 +1000,12 @@ mod tests {
         output.textures_delta.clear();
     }
     #[test]
+    fn select_sets_the_shown_category() {
+        let mut pane = SettingsPane::default();
+        pane.select(SettingsCategory::Shortcuts);
+        assert_eq!(pane.category(), SettingsCategory::Shortcuts);
+    }
+    #[test]
     fn settings_open_on_connections() {
         assert_eq!(
             SettingsPane::default().category(),
@@ -1006,7 +1015,7 @@ mod tests {
     #[test]
     fn empty_destinations_reopen_selects_connections() {
         let mut pane = SettingsPane::default();
-        pane.category = SettingsCategory::Troubleshooting;
+        pane.select(SettingsCategory::Troubleshooting);
         pane.opened(&Settings::default());
         assert_eq!(pane.category(), SettingsCategory::Connections);
         assert!(pane.draft.is_some());

@@ -43,3 +43,6 @@ pub mod screen_sampler;
 
 pub mod settings_transfer;
 pub mod troubleshooting;
+
+#[doc(hidden)]
+pub mod fixtures;

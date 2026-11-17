@@ -248,6 +248,12 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .desk-note b { color: #fff; font-weight: 600; }
 
 .hidden { display: none !important; }
+/* Snapshot mode (#history, #settings-Connections, ...): one screen, no mockup chrome,
+   no native title bar, so it lines up with examples/ui_snapshot.rs. */
+body.snap .controls, body.snap .titlebar, body.snap .cap { display: none !important; }
+body.snap .stage { padding: 0; zoom: 1; }
+body.snap .window { max-width: none; border: 0; border-radius: 0; box-shadow: none; }
+body.snap .app { min-height: 100vh; }
 @container (max-width: 960px) {
   .app:not(.collapsed) { grid-template-columns: 56px minmax(0,1fr); }
   .app .label, .app .brand span, .app .nav-btn .badge { display: none; }
@@ -624,7 +630,23 @@ document.querySelectorAll('#tray-main .mi').forEach(mi => mi.addEventListener('m
 }));
 function openFirstSub(){ const first = document.querySelector('#tray-main [data-sub]'); if(first) first.dispatchEvent(new Event('mouseenter')); }
 
-renderHistory(); renderSettings(); show('all');
+renderHistory(); renderSettings();
+(function fromHash(){
+  const h = decodeURIComponent(location.hash.slice(1));
+  const setBox = (id, on) => { const box = $(id); if(box.checked !== on){ box.checked = on; box.dispatchEvent(new Event('change')); } };
+  if(h === 'history' || h === 'history-empty' || h === 'history-paused'){
+    document.body.classList.add('snap');
+    setBox('toggle-progress', h !== 'history-empty');
+    setBox('toggle-paused', h === 'history-paused');
+    show('history');
+  } else if(h.startsWith('settings-') && settings[h.slice(9)]){
+    document.body.classList.add('snap');
+    section = h.slice(9); renderSettings(); show('settings');
+  } else if(h === 'tray'){
+    document.body.classList.add('snap');
+    show('tray');
+  } else show('all');
+})();
 </script>
 </body>
 </html>

@@ -129,6 +129,19 @@ pub struct DesktopClient {
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 impl DesktopClient {
+    /// A client with no controller behind it, serving a fixed view. Used only to
+    /// render fixture screenshots; submitted commands fail as "stopped".
+    #[doc(hidden)]
+    pub fn detached(view: DesktopView) -> Self {
+        let (tx, _closed) = mpsc::channel(1);
+        Self {
+            tx,
+            stop: CancellationToken::new(),
+            interrupt_utility: Arc::new(tokio::sync::Notify::new()),
+            view: Arc::new(Mutex::new(view)),
+            wake: Arc::new(|| {}),
+        }
+    }
     pub(crate) fn wake(&self) {
         (self.wake)();
     }

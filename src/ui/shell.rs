@@ -28,7 +28,8 @@ pub struct Shell {
     thumbs: Arc<Mutex<super::completion_notification::NoticeThumbs>>,
     client: DesktopClient,
     view: DesktopView,
-    tray: Tray,
+    /// `None` only for fixture screenshots, which must not add a tray icon.
+    tray: Option<Tray>,
     pane: SettingsPane,
     history: super::history::HistoryPane,
     focus_revision: u64,
@@ -48,7 +49,35 @@ impl Shell {
         appearance::install_fonts(&context);
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
-        Ok(Self {
+        Ok(Self::assemble(
+            client,
+            Some(tray),
+            focus_requested,
+            picker_gate,
+        ))
+    }
+    /// Renders `view` with no controller, runtime or tray icon. Commands are dropped.
+    #[doc(hidden)]
+    pub fn from_fixture(view: DesktopView, context: egui::Context) -> Self {
+        appearance::install_fonts(&context);
+        Self::assemble(
+            DesktopClient::detached(view),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            PickerGate::default(),
+        )
+    }
+    #[doc(hidden)]
+    pub fn select_settings_category(&mut self, category: SettingsCategory) {
+        self.pane.select(category);
+    }
+    fn assemble(
+        client: DesktopClient,
+        tray: Option<Tray>,
+        focus_requested: Arc<AtomicBool>,
+        picker_gate: PickerGate,
+    ) -> Self {
+        Self {
             troubleshooting: Default::default(),
             preferences_transfer: Default::default(),
             install_review: Default::default(),
@@ -70,7 +99,7 @@ impl Shell {
             focus_requested,
             picker_gate,
             picker_requests: 0,
-        })
+        }
     }
     fn submit(&mut self, command: AppCommand) {
         if matches!(command, AppCommand::ChooseArchiveFolder) {
@@ -146,7 +175,11 @@ impl eframe::App for Shell {
         }
         self.pane.reconcile(&self.view, ctx);
         if let Some(settings) = &self.view.settings {
-            if let Err(error) = self.tray.update_settings(settings) {
+            if let Some(Err(error)) = self
+                .tray
+                .as_mut()
+                .map(|tray| tray.update_settings(settings))
+            {
                 self.client.report_error(error);
             }
             if self.current_window != self.view.window {
@@ -476,6 +509,16 @@ fn capture_entries() -> [(&'static str, crate::capture::request::CaptureMode); 4
 mod tests {
     use super::*;
     use crate::capture::request::CaptureMode;
+
+    #[test]
+    fn fixture_shell_shows_the_fixture_view_without_a_runtime_or_tray() {
+        use crate::ui::fixtures::{MockupVariant, mockup_view};
+        let view = mockup_view(MockupVariant::HistoryBusy);
+        let shell = Shell::from_fixture(view.clone(), egui::Context::default());
+        assert!(shell.tray.is_none());
+        assert_eq!(shell.view.window, view.window);
+        assert_eq!(shell.client.snapshot().jobs.len(), view.jobs.len());
+    }
 
     #[test]
     fn shell_capture_row_offers_the_tray_capture_modes() {
