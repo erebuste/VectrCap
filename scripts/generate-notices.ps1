@@ -93,8 +93,8 @@ try {
     foreach ($row in $rows) { [void]$out.AppendLine($row) }
     # Geist is embedded by the application, independently of Cargo packages.
     [void]$out.AppendLine()
-    [void]$out.AppendLine('## Application-bundled Geist Regular')
-    [void]$out.AppendLine('Unmodified Vercel Geist Regular. Source revision and font hash: assets/fonts/README.md. License: SIL OFL 1.1, retained verbatim below and in the release package.')
+    [void]$out.AppendLine('## Application-bundled Geist Regular, Medium and SemiBold')
+    [void]$out.AppendLine('Unmodified Vercel Geist Regular, Medium and SemiBold. Source revision and font hashes: assets/fonts/README.md. License: SIL OFL 1.1, retained verbatim below and in the release package.')
     [void]$out.AppendLine()
     [void]$out.AppendLine('~~~text')
     [void]$out.AppendLine([IO.File]::ReadAllText((Join-Path $taskRepoRoot 'assets/fonts/OFL.txt')).Replace("`r`n","`n").Trim())

@@ -272,8 +272,8 @@ Supplements retain sources for crates that omit repository-level licenses from t
 | zune-core 0.5.3 | MIT OR Apache-2.0 OR Zlib | [upstream](https://github.com/etemesi254/zune-image) | [text 283ea6cc2997a1a7](#license-283ea6cc2997a1a7), [text 4ae441972cdd6fe4](#license-4ae441972cdd6fe4), [text b8cba0284c86612b](#license-b8cba0284c86612b) |
 | zune-jpeg 0.5.15 | MIT OR Apache-2.0 OR Zlib | [upstream](https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg) | [text 283ea6cc2997a1a7](#license-283ea6cc2997a1a7), [text 4ae441972cdd6fe4](#license-4ae441972cdd6fe4), [text b8cba0284c86612b](#license-b8cba0284c86612b) |
 
-## Application-bundled Geist Regular
-Unmodified Vercel Geist Regular. Source revision and font hash: assets/fonts/README.md. License: SIL OFL 1.1, retained verbatim below and in the release package.
+## Application-bundled Geist Regular, Medium and SemiBold
+Unmodified Vercel Geist Regular, Medium and SemiBold. Source revision and font hashes: assets/fonts/README.md. License: SIL OFL 1.1, retained verbatim below and in the release package.
 
 ~~~text
 Copyright 2026 The Geist Project Authors (https://github.com/vercel/geist-font)

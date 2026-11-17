@@ -42,6 +42,16 @@ const VECTR_PRIMARY_FOREGROUND: Color32 = Color32::from_rgb(26, 17, 37);
 const VECTR_DESTRUCTIVE: Color32 = Color32::from_rgb(255, 100, 103);
 /// `--border` (`oklch(1 0 0 / 10%)`): translucent white over the background.
 const VECTR_BORDER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
+/// Mockup status green (no Vectr token; `docs/mockups/2026-11-17-main-window.html`).
+const VECTR_SUCCESS: Color32 = Color32::from_rgb(134, 209, 161);
+/// Mockup attention amber.
+const VECTR_WARNING: Color32 = Color32::from_rgb(242, 196, 109);
+/// Mockup thumbnail backdrop.
+const VECTR_THUMBNAIL: Color32 = Color32::from_rgb(18, 18, 18);
+/// `rgba(255,255,255,.18)` premultiplied.
+const VECTR_TOGGLED_BORDER: Color32 = Color32::from_rgba_premultiplied(46, 46, 46, 46);
+/// `rgba(255,255,255,.24)` premultiplied.
+const VECTR_CARD_HOVER_BORDER: Color32 = Color32::from_rgba_premultiplied(61, 61, 61, 61);
 /// `--radius: 0.625rem` scaled down, matching `--radius-sm`/`--radius-md`.
 const VECTR_RADIUS_CONTROL: u8 = 6;
 /// `--radius` itself, used for window/menu chrome.
@@ -226,5 +236,51 @@ pub fn install_fonts(context: &eframe::egui::Context) {
         .entry(FontFamily::Proportional)
         .or_default()
         .insert(0, "Geist".into());
+    // egui does not synthesise weights, so titles and labels need their own files.
+    let fallback = fonts.families[&FontFamily::Proportional].clone();
+    for (name, bytes) in [
+        (
+            "Geist Medium",
+            include_bytes!("../../../assets/fonts/Geist-Medium.ttf").as_slice(),
+        ),
+        (
+            "Geist SemiBold",
+            include_bytes!("../../../assets/fonts/Geist-SemiBold.ttf").as_slice(),
+        ),
+    ] {
+        fonts.font_data.insert(
+            name.into(),
+            std::sync::Arc::new(FontData::from_static(bytes)),
+        );
+        let mut family = vec![name.to_string()];
+        family.extend(fallback.iter().filter(|f| f.as_str() != "Geist").cloned());
+        fonts.families.insert(FontFamily::Name(name.into()), family);
+    }
     context.set_fonts(fonts);
+}
+
+/// Mockup colors that `Visuals` has no slot for. Under a Windows contrast theme
+/// (`override_text_color` set) each falls back to a system-derived color.
+pub fn success(visuals: &Visuals) -> Color32 {
+    visuals.override_text_color.unwrap_or(VECTR_SUCCESS)
+}
+pub fn warning(visuals: &Visuals) -> Color32 {
+    visuals.override_text_color.unwrap_or(VECTR_WARNING)
+}
+pub fn thumbnail_fill(visuals: &Visuals) -> Color32 {
+    if visuals.override_text_color.is_some() {
+        visuals.extreme_bg_color
+    } else {
+        VECTR_THUMBNAIL
+    }
+}
+/// Border of a toggled-on control (muted fill, slightly brighter edge).
+pub fn toggled_border(visuals: &Visuals) -> Color32 {
+    visuals.override_text_color.unwrap_or(VECTR_TOGGLED_BORDER)
+}
+/// Border of a hovered gallery card.
+pub fn card_hover_border(visuals: &Visuals) -> Color32 {
+    visuals
+        .override_text_color
+        .unwrap_or(VECTR_CARD_HOVER_BORDER)
 }

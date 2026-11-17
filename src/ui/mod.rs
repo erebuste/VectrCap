@@ -46,3 +46,7 @@ pub mod troubleshooting;
 
 #[doc(hidden)]
 pub mod fixtures;
+
+pub mod icons;
+pub mod tokens;
+pub mod widgets;
