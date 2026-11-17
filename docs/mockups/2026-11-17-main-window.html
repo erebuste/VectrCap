@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VectrCap window mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap">
+<style>
+/*
+ * Every surface maps to an egui 0.37 widget drawn with the app's real theme
+ * (src/platform/windows/appearance.rs, converted from vectr/web/src/index.css .dark):
+ *   Button          -> fill weak_bg_fill #171717, border, hover #262626 (widgets.inactive/hovered)
+ *   TextEdit        -> extreme_bg_color #171717 with border
+ *   ComboBox        -> button-styled closed state with a down chevron
+ *   ProgressBar     -> lavender fill on muted track
+ *   Switch          -> custom painted toggle (not built in; egui demo pattern)
+ *   Cards / rows    -> Frame with fill #171717, 1px border, radius 10 (surfaces) / 6 (controls)
+ *   Icons           -> bundled icon font or painter shapes (builder's call in the design)
+ * Font: Geist. Weights 500/600 assume Geist Medium + SemiBold are bundled alongside Regular.
+ */
+:root {
+  color-scheme: dark;
+  --background: #0a0a0a; --foreground: #fafafa;
+  --card: #171717; --muted: #262626; --muted-hover: #363636; --muted-foreground: #a1a1a1;
+  --primary: #c8a6f0; --primary-foreground: #1a1125;
+  --destructive: #ff6467; --success: #86d1a1; --warning: #f2c46d;
+  --border: rgba(255,255,255,.1); --input: rgba(255,255,255,.15); --ring: #c8a6f0;
+  --thumb: #121212;
+  --r-surface: 10px; --r-control: 6px;
+  --stage: #1d1d1f;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; color: var(--foreground); font-family: 'Geist', 'Segoe UI', system-ui, sans-serif; font-size: 13px; line-height: 1.45; }
+button { font: inherit; color: inherit; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.icon { width: 15px; height: 15px; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Mockup controls (not part of the app) */
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 6px 0 14px; color: var(--muted-foreground); font-size: 12px; }
+.controls strong { color: var(--foreground); font-weight: 600; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--r-control); overflow: hidden; }
+.seg button { border: 0; background: transparent; padding: 5px 11px; color: var(--muted-foreground); }
+.seg button[aria-pressed="true"] { background: var(--muted); color: var(--foreground); }
+.controls label { display: inline-flex; gap: 6px; align-items: center; }
+.controls input { accent-color: var(--primary); }
+.stage { padding: 0 0 12px; }
+/* In a narrow frame, show the desktop layout scaled down rather than the narrow-window layout. */
+@media (max-width: 1000px) { .stage { zoom: .6; } }
+
+/* Native Windows title bar (eframe uses native decorations) */
+.window { container-type: inline-size; max-width: 1180px; margin: 0 auto; background: var(--background); border: 1px solid rgba(255,255,255,.14); border-radius: 8px; overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,.45); }
+.titlebar { display: flex; align-items: center; height: 32px; padding-left: 12px; font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; color: #ccc; background: #202020; }
+.titlebar .grow { flex: 1; }
+.titlebar span.ctl { width: 46px; height: 32px; display: grid; place-items: center; }
+.app { display: grid; grid-template-columns: 208px minmax(0,1fr); min-height: 720px; }
+.app.collapsed { grid-template-columns: 56px minmax(0,1fr); }
+
+/* Sidebar: egui SidePanel, after Vectr's Layout.tsx */
+.sidebar { background: var(--card); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 10px 8px; gap: 2px; }
+.brand { display: flex; align-items: center; gap: 9px; height: 36px; padding: 0 8px; margin-bottom: 10px; font-weight: 600; font-size: 14px; }
+.brand svg { width: 20px; height: 20px; color: var(--primary); stroke-width: 2.4; }
+.nav-btn { display: flex; align-items: center; gap: 10px; width: 100%; height: 34px; padding: 0 10px; border: 0; border-radius: var(--r-control); background: transparent; color: var(--muted-foreground); text-align: left; font-weight: 500; }
+.nav-btn:hover { background: var(--muted); color: var(--foreground); }
+.nav-btn[aria-current="page"] { background: var(--muted); color: var(--foreground); }
+.nav-btn .badge { margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--primary); color: var(--primary-foreground); font-size: 11px; font-weight: 600; display: grid; place-items: center; }
+.sidebar .grow { flex: 1; }
+.app.collapsed .label, .app.collapsed .brand span, .app.collapsed .nav-btn .badge { display: none; }
+.app.collapsed .nav-btn, .app.collapsed .brand { justify-content: center; padding: 0; }
+
+/* Page: egui CentralPanel */
+.page { min-width: 0; padding: 22px 26px 18px; }
+.page-head { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 16px; }
+.page-head h1 { margin: 0; font-size: 20px; font-weight: 600; }
+.page-head p { margin: 2px 0 0; color: var(--muted-foreground); }
+.page-head .grow { flex: 1; }
+
+/* egui Button with the app theme */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; padding: 0 11px; border: 1px solid var(--border); border-radius: var(--r-control); background: var(--card); color: var(--foreground); white-space: nowrap; }
+.btn:hover { background: var(--muted); border-color: var(--primary); }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn:disabled:hover { background: var(--card); border-color: var(--border); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--muted-foreground); }
+.btn.ghost:hover { background: var(--muted); color: var(--foreground); border-color: transparent; }
+.btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); font-weight: 500; }
+.btn.sm { height: 26px; padding: 0 9px; font-size: 12px; }
+/* Toggled-on state uses Vectr's muted fill, not egui's default lavender selection.bg_fill;
+   painted per widget so lavender stays reserved for the primary action and live progress. */
+.btn[aria-pressed="true"], .chip[aria-pressed="true"] { background: var(--muted); border-color: rgba(255,255,255,.18); color: var(--foreground); }
+.cap { margin: 22px 0 10px; font-size: 13px; font-weight: 600; color: var(--muted-foreground); }
+.cap:first-child { margin-top: 0; }
+.btn-group { display: inline-flex; gap: 4px; }
+
+/* egui ComboBox (closed) */
+.combo { display: inline-flex; align-items: center; justify-content: space-between; gap: 8px; height: 30px; min-width: 128px; padding: 0 9px 0 11px; border: 1px solid var(--border); border-radius: var(--r-control); background: var(--card); color: var(--foreground); white-space: nowrap; }
+.combo:hover { background: var(--muted); border-color: var(--primary); }
+.combo .icon { width: 12px; height: 12px; color: var(--muted-foreground); }
+.combo.sm { height: 26px; min-width: 0; font-size: 12px; }
+/* egui TextEdit */
+.textedit { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-control); background: var(--card); color: var(--muted-foreground); font-size: 12px; overflow: hidden; white-space: nowrap; }
+.textedit.wide { flex: 1; min-width: 120px; }
+
+.banner { display: flex; align-items: center; gap: 10px; border: 1px solid var(--border); background: var(--card); border-radius: var(--r-surface); padding: 8px 12px; margin-bottom: 14px; }
+.banner .icon { color: var(--warning); }
+.banner .grow { flex: 1; }
+.banner b { font-weight: 600; }
+.banner span.muted { color: var(--muted-foreground); }
+
+/* In progress: Frame + rows + egui ProgressBar */
+.progress-card { border: 1px solid var(--border); background: var(--card); border-radius: var(--r-surface); margin-bottom: 18px; overflow: hidden; }
+.progress-head { display: flex; align-items: center; gap: 6px; padding: 9px 12px 9px 14px; border-bottom: 1px solid var(--border); }
+.progress-head h2 { margin: 0; font-size: 13px; font-weight: 600; }
+.progress-head .count { color: var(--muted-foreground); margin-left: 2px; }
+.progress-head .grow { flex: 1; }
+.job { display: grid; grid-template-columns: 26px minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 10px 12px 10px 14px; border-bottom: 1px solid var(--border); }
+.job:last-child { border-bottom: 0; }
+.job .glyph { width: 26px; height: 26px; border-radius: var(--r-control); background: var(--muted); display: grid; place-items: center; color: var(--muted-foreground); }
+.job.attention .glyph { color: var(--warning); }
+.job.failed .glyph { color: var(--destructive); }
+.job.active .glyph { color: var(--primary); }
+.job .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.job .detail { color: var(--muted-foreground); font-size: 12px; }
+.job.failed .detail { color: var(--destructive); }
+.job.attention .detail { color: var(--warning); }
+.bar { height: 6px; border-radius: 3px; background: var(--muted); margin-top: 6px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 62%; background: var(--primary); }
+.job .acts { display: flex; gap: 4px; }
+
+/* History workspace (2026-11-14 mockup structure) */
+.searchbar { display: flex; gap: 8px; margin-bottom: 10px; }
+.filters { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-bottom: 14px; }
+.chip { height: 26px; padding: 0 10px; border: 1px solid transparent; border-radius: var(--r-control); background: transparent; color: var(--muted-foreground); }
+.chip:hover { background: var(--muted); color: var(--foreground); }
+.chip small { margin-left: 5px; opacity: .75; }
+.filters .combo { margin-left: auto; }
+.workspace { display: grid; grid-template-columns: minmax(0,1fr) 288px; gap: 18px; align-items: start; }
+.workspace.no-preview { grid-template-columns: minmax(0,1fr); }
+.workspace.no-preview .inspector { display: none; }
+.lib-head { display: flex; justify-content: space-between; color: var(--muted-foreground); font-size: 12px; margin-bottom: 8px; }
+.lib-head b { color: var(--foreground); font-weight: 600; font-size: 13px; }
+.items { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; }
+.workspace.no-preview .items { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.entry { position: relative; border: 1px solid var(--border); border-radius: var(--r-surface); background: var(--card); overflow: hidden; cursor: pointer; }
+.entry:hover { border-color: rgba(255,255,255,.24); }
+.entry.current { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+.thumb { height: 104px; background: var(--thumb); display: grid; place-items: center; overflow: hidden; position: relative; color: var(--muted-foreground); }
+.thumb svg.art { width: 100%; height: 100%; }
+.thumb .tag { position: absolute; right: 6px; bottom: 6px; font-size: 10px; padding: 1px 5px; border-radius: 4px; background: var(--card); border: 1px solid var(--border); color: var(--foreground); }
+.thumb .icon { width: 28px; height: 28px; stroke-width: 1.5; }
+.star { position: absolute; top: 6px; right: 6px; color: var(--warning); }
+.star .icon { width: 13px; height: 13px; fill: currentColor; }
+.entry-body { padding: 8px 9px; }
+.filename { font-weight: 500; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
+.meta { display: flex; gap: 6px; font-size: 11px; color: var(--muted-foreground); }
+.meta .size { margin-left: auto; }
+.state { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.state::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.uploaded { color: var(--success); } .failed-t { color: var(--destructive); } .uploading { color: var(--primary); } .local { color: var(--muted-foreground); }
+.items.list { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--border); border-radius: var(--r-surface); overflow: hidden; }
+.items.list .entry { display: grid; grid-template-columns: 34px minmax(0,1fr) 110px 64px; gap: 10px; align-items: center; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 6px 10px; background: transparent; box-shadow: none; }
+.items.list .entry.current { background: rgba(200,166,240,.12); }
+.items.list .thumb { width: 34px; height: 34px; border-radius: 4px; }
+.items.list .thumb .tag, .items.list .star { display: none; }
+.items.list .thumb .icon { width: 16px; height: 16px; }
+.items.list .entry-body { padding: 0; min-width: 0; }
+.items.list .filename { margin: 0; }
+.items.list .meta { display: none; }
+.items .list-only { display: none; }
+.items.list .list-only { display: block; font-size: 11px; color: var(--muted-foreground); }
+.items.list .list-only.size { text-align: right; }
+
+.inspector { border-left: 1px solid var(--border); padding-left: 18px; min-width: 0; }
+.preview { height: 160px; border: 1px solid var(--border); border-radius: var(--r-surface); background: var(--thumb); display: grid; place-items: center; overflow: hidden; margin-bottom: 12px; color: var(--muted-foreground); }
+.preview svg.art { width: 100%; height: 100%; }
+.preview .icon { width: 40px; height: 40px; stroke-width: 1.4; }
+.d-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.d-sub { color: var(--muted-foreground); font-size: 12px; margin: 2px 0 10px; }
+.d-states { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.d-states .avail { color: var(--muted-foreground); }
+.linkbox { margin: 12px 0 8px; }
+.d-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 6px; }
+.d-actions.three { grid-template-columns: 1fr 1fr 1fr; }
+.d-section { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.d-section h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; }
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.steps li { display: flex; align-items: center; gap: 8px; }
+.steps li .icon { width: 14px; height: 14px; }
+.steps li.ok .icon { color: var(--success); }
+.steps li.bad { color: var(--destructive); }
+.steps li.skip { color: var(--muted-foreground); }
+.steps li .grow { flex: 1; }
+.batch-line { font-size: 12px; color: var(--muted-foreground); margin: 0 0 8px; }
+.batch-line b { color: var(--foreground); font-weight: 500; }
+.empty-note { color: var(--muted-foreground); padding: 40px 6px; text-align: center; }
+.footer { display: flex; align-items: center; gap: 10px; margin-top: 16px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--muted-foreground); font-size: 12px; }
+.footer .grow { flex: 1; }
+
+/* Settings, after Vectr's SectionLayout / SettingGroup / SettingRow */
+.settings { display: grid; grid-template-columns: 168px minmax(0,1fr); gap: 28px; }
+.sections { display: flex; flex-direction: column; gap: 2px; align-self: start; }
+.sec-btn { text-align: left; height: 32px; padding: 0 10px; border: 0; border-radius: var(--r-control); background: transparent; color: var(--muted-foreground); font-weight: 500; }
+.sec-btn:hover { background: var(--muted); color: var(--foreground); }
+.sec-btn[aria-current="page"] { background: var(--muted); color: var(--foreground); }
+.groups { display: flex; flex-direction: column; gap: 26px; max-width: 760px; }
+.group h2 { margin: 0; font-size: 13px; font-weight: 600; }
+.group > p { margin: 2px 0 10px; color: var(--muted-foreground); }
+.card { border: 1px solid var(--border); border-radius: var(--r-surface); background: var(--card); overflow: hidden; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 13px 16px; border-bottom: 1px solid var(--border); }
+.row:last-child { border-bottom: 0; }
+.row .txt { min-width: 0; flex: 1; }
+.row .txt b { display: block; font-weight: 500; }
+.row .txt span { color: var(--muted-foreground); }
+.row .ctl { width: 240px; flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 6px; align-items: center; }
+.row .ctl .combo, .row .ctl .textedit { width: 100%; }
+/* Custom painted toggle (egui has no built-in switch; demo pattern) */
+.switch { width: 36px; height: 20px; border-radius: 10px; background: var(--muted-hover); position: relative; border: 0; padding: 0; flex: 0 0 auto; }
+.switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--foreground); transition: left .12s; }
+.switch[aria-checked="true"] { background: var(--primary); }
+.switch[aria-checked="true"]::after { left: 18px; background: var(--primary-foreground); }
+.pill { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 10px; font-size: 11px; font-weight: 400; border: 1px solid var(--border); color: var(--muted-foreground); margin-left: 6px; vertical-align: 1px; }
+.pill.ok { color: var(--success); }
+.pill.warn { color: var(--warning); }
+.pill.def { color: var(--primary); border-color: rgba(200,166,240,.4); }
+.kbd { display: inline-flex; align-items: center; height: 26px; padding: 0 9px; border: 1px solid var(--input); border-radius: var(--r-control); background: var(--background); font-size: 12px; }
+.card-foot { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); }
+.card-foot .hint { color: var(--muted-foreground); font-size: 12px; margin-left: auto; }
+
+/* Tray screen: native Windows 11 menu, drawn by Windows */
+.desk { position: relative; max-width: 1180px; height: 470px; margin: 0 auto; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,.14); background: #2a2d33; }
+.taskbar { position: absolute; left: 0; right: 0; bottom: 0; height: 48px; background: #1c1c1c; border-top: 1px solid rgba(255,255,255,.08); display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding: 0 12px; font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; color: #fff; }
+.tray-icon { width: 32px; height: 32px; border-radius: 4px; display: grid; place-items: center; background: rgba(255,255,255,.1); }
+.tray-icon svg { width: 16px; height: 16px; color: var(--primary); stroke-width: 2.4; }
+.clock { text-align: right; line-height: 1.25; padding: 0 6px; }
+.winmenu { position: absolute; font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif; font-size: 13px; background: #2c2c2c; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.5); padding: 4px; min-width: 232px; color: #fff; }
+.winmenu .mi { display: flex; align-items: center; height: 30px; padding: 0 12px; border-radius: 4px; gap: 10px; cursor: default; }
+.winmenu .mi:hover, .winmenu .mi.open { background: rgba(255,255,255,.07); }
+.winmenu .mi .grow { flex: 1; }
+.winmenu .mi .chev { width: 12px; height: 12px; opacity: .8; }
+.winmenu .mi.disabled { color: rgba(255,255,255,.4); }
+.winmenu .mi .radio { width: 6px; height: 6px; border-radius: 50%; background: #fff; }
+.winmenu .mi .nor { width: 6px; }
+.winmenu hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: 4px 0; }
+.winmenu .mi b { font-weight: 600; }
+.main-menu { right: 70px; bottom: 56px; }
+.sub-menu { display: none; }
+.sub-menu.show { display: block; }
+.desk-note { position: absolute; left: 24px; top: 22px; max-width: 360px; color: rgba(255,255,255,.75); font-size: 12px; line-height: 1.55; margin: 0; }
+.desk-note b { color: #fff; font-weight: 600; }
+
+.hidden { display: none !important; }
+@container (max-width: 960px) {
+  .app:not(.collapsed) { grid-template-columns: 56px minmax(0,1fr); }
+  .app .label, .app .brand span, .app .nav-btn .badge { display: none; }
+  .app .nav-btn, .app .brand { justify-content: center; padding: 0; }
+  .workspace { grid-template-columns: minmax(0,1fr); }
+  .inspector { border-left: 0; padding: 14px 0 0; border-top: 1px solid var(--border); }
+  .settings { grid-template-columns: minmax(0,1fr); gap: 14px; }
+  .sections { flex-direction: row; overflow-x: auto; }
+  .sec-btn { white-space: nowrap; }
+}
+@container (max-width: 620px) {
+  .items, .workspace.no-preview .items { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .row { flex-direction: column; align-items: stretch; gap: 10px; }
+  .row .ctl { width: 100%; justify-content: flex-start; }
+  .page { padding: 16px 14px; }
+  .page-head { flex-wrap: wrap; }
+  .job { grid-template-columns: 26px minmax(0,1fr); }
+  .job .acts { grid-column: 2; }
+}
+@media (prefers-reduced-motion: reduce) { .switch::after { transition: none; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-brand" viewBox="0 0 24 24"><path d="m3 4 8 16 10-16M7 4l5 10 6-10"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></symbol>
+<symbol id="i-power" viewBox="0 0 24 24"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></symbol>
+<symbol id="i-panel-r" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="m6 3 14 9-14 9z"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+<symbol id="i-retry" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></symbol>
+<symbol id="i-hand" viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+<symbol id="i-ext" viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></symbol>
+<symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path d="M12 2l3.1 6.3 6.9 1-5 4.9 1.2 6.8L12 17.8 5.8 21l1.2-6.8-5-4.9 6.9-1z"/></symbol>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+<symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+</defs></svg>
+
+<div class="controls" aria-label="Mockup controls">
+  <strong>VectrCap redesign mockup</strong>
+  <div class="seg" role="group" aria-label="Screen">
+    <button type="button" data-screen="all" aria-pressed="true">All screens</button>
+    <button type="button" data-screen="history" aria-pressed="false">History</button>
+    <button type="button" data-screen="settings" aria-pressed="false">Settings</button>
+    <button type="button" data-screen="tray" aria-pressed="false">Tray menu</button>
+  </div>
+  <label id="ctl-progress"><input type="checkbox" id="toggle-progress" checked> Things in progress</label>
+  <label id="ctl-paused"><input type="checkbox" id="toggle-paused"> Uploads paused</label>
+  <label><input type="checkbox" id="toggle-collapse"> Narrow window</label>
+  <span>Drawn as egui widgets with the app's theme. Sample data; buttons are not wired.</span>
+</div>
+
+<div class="stage" id="stage">
+<h2 class="cap" data-cap="history">History, with things in progress</h2>
+<section id="screen-window" class="window" aria-label="VectrCap main window">
+  <div class="titlebar"><span>VectrCap</span><span class="grow"></span><span class="ctl">&#x2013;</span><span class="ctl">&#x25A1;</span><span class="ctl">&#x2715;</span></div>
+  <div class="app" id="app">
+    <nav class="sidebar" aria-label="Main">
+      <div class="brand"><svg class="icon"><use href="#i-brand"/></svg><span>VectrCap</span></div>
+      <button class="nav-btn" type="button" data-nav="history" aria-current="page" title="History"><svg class="icon"><use href="#i-history"/></svg><span class="label">History</span><span class="badge" id="nav-badge" title="4 things in progress">4</span></button>
+      <button class="nav-btn" type="button" data-nav="settings" title="Settings"><svg class="icon"><use href="#i-settings"/></svg><span class="label">Settings</span></button>
+      <div class="grow"></div>
+      <button class="nav-btn" type="button" title="Quit VectrCap"><svg class="icon"><use href="#i-power"/></svg><span class="label">Quit</span></button>
+    </nav>
+
+    <main class="page" id="page-history">
+      <header class="page-head">
+        <div><h1>History</h1><p>Everything you've captured or uploaded</p></div>
+        <span class="grow"></span>
+        <div class="btn-group" role="group" aria-label="View">
+          <button class="btn sm" type="button" id="v-gallery" aria-pressed="true"><svg class="icon"><use href="#i-grid"/></svg>Gallery</button>
+          <button class="btn sm" type="button" id="v-list" aria-pressed="false"><svg class="icon"><use href="#i-list"/></svg>List</button>
+        </div>
+        <button class="btn sm" type="button" id="v-preview" aria-pressed="true" title="Show or hide the preview"><svg class="icon"><use href="#i-panel-r"/></svg>Preview</button>
+        <button class="btn sm primary" type="button"><svg class="icon"><use href="#i-upload"/></svg>Upload file</button>
+      </header>
+
+      <div class="banner hidden" id="banner-paused" role="status"><svg class="icon"><use href="#i-pause"/></svg><span class="grow"><b>Uploads are paused.</b> <span class="muted">Waiting uploads stay queued until you resume.</span></span><button class="btn sm" type="button"><svg class="icon"><use href="#i-play"/></svg>Resume uploads</button></div>
+
+      <section class="progress-card" id="in-progress" aria-label="In progress">
+        <div class="progress-head"><h2>In progress</h2><span class="count">4</span><span class="grow"></span><button class="btn sm ghost" type="button"><svg class="icon"><use href="#i-retry"/></svg>Retry failed</button><button class="btn sm ghost" type="button" id="pause-all"><svg class="icon"><use href="#i-pause"/></svg>Pause all</button></div>
+        <div class="job attention"><span class="glyph"><svg class="icon"><use href="#i-hand"/></svg></span><div><div class="name">capture_2026-11-17_2310.png</div><div class="detail">Needs your attention: choose where to save it</div></div><div class="acts"><button class="btn sm primary" type="button">Choose folder…</button><button class="btn sm ghost" type="button">Skip</button></div></div>
+        <div class="job active"><span class="glyph"><svg class="icon"><use href="#i-upload"/></svg></span><div><div class="name">release_assets.zip</div><div class="detail">Uploading to Vectr (work), 15.3 of 24.6 MB, 2.1 MB/s</div><div class="bar"><i></i></div></div><div class="acts"><button class="btn sm ghost" type="button" title="Pause this upload"><svg class="icon"><use href="#i-pause"/></svg></button><button class="btn sm ghost" type="button" title="Cancel this upload"><svg class="icon"><use href="#i-x"/></svg></button></div></div>
+        <div class="job"><span class="glyph"><svg class="icon"><use href="#i-file"/></svg></span><div><div class="name">project_notes.pdf</div><div class="detail">Waiting, starts after the current upload</div></div><div class="acts"><button class="btn sm ghost" type="button" title="Cancel this upload"><svg class="icon"><use href="#i-x"/></svg></button></div></div>
+        <div class="job failed"><span class="glyph"><svg class="icon"><use href="#i-alert"/></svg></span><div><div class="name">scrolling_documentation.png</div><div class="detail">Upload failed: the connection was interrupted. The local file is safe.</div></div><div class="acts"><button class="btn sm" type="button"><svg class="icon"><use href="#i-retry"/></svg>Retry</button><button class="btn sm ghost" type="button">Remove</button></div></div>
+      </section>
+
+      <div class="searchbar">
+        <div class="textedit wide" role="searchbox" aria-label="Search history"><svg class="icon"><use href="#i-search"/></svg>Search captures, files, or links</div>
+        <button class="combo" type="button" aria-label="Upload status">All statuses<svg class="icon"><use href="#i-down"/></svg></button>
+        <button class="combo" type="button" aria-label="Date">Any date<svg class="icon"><use href="#i-down"/></svg></button>
+      </div>
+      <div class="filters" aria-label="Type filters">
+        <button class="chip" type="button" aria-pressed="true">All<small>9</small></button>
+        <button class="chip" type="button" aria-pressed="false">Images<small>5</small></button>
+        <button class="chip" type="button" aria-pressed="false">Recordings<small>2</small></button>
+        <button class="chip" type="button" aria-pressed="false">Files<small>2</small></button>
+        <button class="chip" type="button" aria-pressed="false">Favorites</button>
+        <button class="combo sm" type="button" aria-label="Sort">Newest first<svg class="icon"><use href="#i-down"/></svg></button>
+      </div>
+
+      <div class="workspace" id="workspace">
+        <section aria-label="Captures">
+          <div class="lib-head"><b>Today and yesterday</b><span>9 items</span></div>
+          <div class="items" id="items" role="list"></div>
+        </section>
+        <aside class="inspector" id="inspector" aria-label="Selected item"></aside>
+      </div>
+      <footer class="footer"><span>9 items, 1 uploading, 1 failed</span><span class="grow"></span><button class="btn sm ghost" type="button" disabled>Previous</button><span>Page 1 of 1</span><button class="btn sm ghost" type="button" disabled>Next</button></footer>
+    </main>
+
+    <main class="page hidden" id="page-settings">
+      <header class="page-head"><div><h1>Settings</h1><p>Connections, shortcuts, and what happens after you capture</p></div></header>
+      <div class="settings">
+        <nav class="sections" id="sections" aria-label="Settings sections"></nav>
+        <div class="groups" id="groups"></div>
+      </div>
+    </main>
+  </div>
+</section>
+
+<h2 class="cap" data-cap="settings">Settings, Connections section</h2>
+<div id="settings-slot"></div>
+<h2 class="cap" data-cap="tray">Tray menu, Capture submenu open</h2>
+<section id="screen-tray" class="desk" aria-label="Tray menu">
+  <p class="desk-note"><b>Tray menu.</b> This is a native Windows menu, so Windows draws it, not VectrCap or egui. Hover an item with an arrow to open its submenu. Left-clicking the tray icon opens History.</p>
+  <div class="winmenu main-menu" id="tray-main">
+    <div class="mi"><b>Capture region</b></div>
+    <div class="mi" data-sub="sub-capture">Capture<span class="grow"></span><svg class="icon chev"><use href="#i-chev"/></svg></div>
+    <div class="mi" data-sub="sub-record">Record<span class="grow"></span><svg class="icon chev"><use href="#i-chev"/></svg></div>
+    <div class="mi" data-sub="sub-upload">Upload<span class="grow"></span><svg class="icon chev"><use href="#i-chev"/></svg></div>
+    <div class="mi" data-sub="sub-tools">Tools<span class="grow"></span><svg class="icon chev"><use href="#i-chev"/></svg></div>
+    <hr>
+    <div class="mi">Open VectrCap</div>
+    <div class="mi">Settings</div>
+    <div class="mi" data-sub="sub-dest">Destination<span class="grow"></span><svg class="icon chev"><use href="#i-chev"/></svg></div>
+    <hr>
+    <div class="mi">Quit</div>
+  </div>
+  <div class="winmenu sub-menu" id="sub-capture"><div class="mi">Window under pointer</div><div class="mi">Fullscreen</div><div class="mi">Last region</div><div class="mi">Scrolling (manual)</div><hr><div class="mi disabled">Cancel capture / delay</div></div>
+  <div class="winmenu sub-menu" id="sub-record"><div class="mi">GIF</div><div class="mi">MP4</div><hr><div class="mi disabled">Pause / resume</div><div class="mi disabled">Stop</div><div class="mi disabled">Cancel</div></div>
+  <div class="winmenu sub-menu" id="sub-upload"><div class="mi">File…</div><div class="mi">From clipboard</div></div>
+  <div class="winmenu sub-menu" id="sub-tools"><div class="mi">Screen color picker</div><div class="mi">Ruler</div><hr><div class="mi">Pin to screen…</div><div class="mi disabled">Close all pins</div></div>
+  <div class="winmenu sub-menu" id="sub-dest"><div class="mi"><span class="radio"></span>Vectr (work)</div><div class="mi"><span class="nor"></span>Personal</div></div>
+  <div class="taskbar"><span>ENG</span><span class="tray-icon" title="VectrCap"><svg class="icon"><use href="#i-brand"/></svg></span><span class="clock">23:31<br>17.11.2026</span></div>
+</section>
+</div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const icon = name => `<svg class="icon"><use href="#i-${name}"/></svg>`;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const records = [
+  {id:1,name:'capture_2026-11-17_2304.png',type:'image',fmt:'PNG',size:'248 KB',when:'Today, 23:04',status:'uploaded',local:true,scene:'ui',dim:'1920 × 1080',fav:true,url:'https://files.vectr.example/i/q7a3.png',
+   steps:[['ok','Saved to Pictures\\VectrCap'],['ok','Uploaded to Vectr (work)'],['ok','Copied the link'],['bad','Open link: the browser did not respond']]},
+  {id:2,name:'terminal_build_output.png',type:'image',fmt:'PNG',size:'94 KB',when:'Today, 22:18',status:'uploaded',local:true,scene:'terminal',dim:'1280 × 720',url:'https://files.vectr.example/i/n4b8.png',
+   steps:[['ok','Saved to Pictures\\VectrCap'],['ok','Uploaded to Vectr (work)'],['ok','Copied the link']]},
+  {id:3,name:'annotated_navigation.png',type:'image',fmt:'PNG',size:'186 KB',when:'Today, 22:06',status:'local',local:true,scene:'annotation',dim:'1440 × 900',
+   steps:[['ok','Saved to Pictures\\VectrCap'],['ok','Copied the image'],['skip','Upload: off for this shortcut']]},
+  {id:4,name:'recording_2026-11-17.mp4',type:'recording',fmt:'MP4',size:'3.8 MB',when:'Today, 21:54',status:'uploaded',local:true,scene:'video',dim:'1280 × 720',dur:'00:18',url:'https://files.vectr.example/i/x6k2.mp4',
+   steps:[['ok','Saved to Videos\\VectrCap'],['ok','Uploaded to Vectr (work)']]},
+  {id:5,name:'release_assets.zip',type:'file',fmt:'ZIP',size:'24.6 MB',when:'Today, 21:41',status:'uploading',local:true,scene:'file',dim:'—',steps:[],
+   batch:{label:'3 files uploaded from Explorer',done:'1 uploaded, 1 uploading, 1 waiting'}},
+  {id:6,name:'scrolling_documentation.png',type:'image',fmt:'PNG',size:'1.2 MB',when:'Yesterday, 22:15',status:'failed',local:true,scene:'scroll',dim:'1180 × 4260',
+   steps:[['ok','Saved to Pictures\\VectrCap'],['bad','Upload failed: the connection was interrupted']]},
+  {id:7,name:'menu_walkthrough.gif',type:'recording',fmt:'GIF',size:'2.1 MB',when:'Yesterday, 21:48',status:'uploaded',local:true,scene:'gif',dim:'960 × 540',dur:'00:06',fav:true,url:'https://files.vectr.example/i/m2j9.gif',
+   steps:[['ok','Uploaded to Vectr (work)'],['ok','Copied the link']]},
+  {id:8,name:'project_notes.pdf',type:'file',fmt:'PDF',size:'412 KB',when:'Yesterday, 20:32',status:'uploaded',local:false,scene:'file',dim:'—',url:'https://files.vectr.example/i/p3d7.pdf',steps:[],
+   batch:{label:'3 files uploaded from Explorer',done:'1 uploaded, 1 uploading, 1 waiting'}},
+  {id:9,name:'capture_2026-11-16_1944.png',type:'image',fmt:'PNG',size:'172 KB',when:'Yesterday, 19:44',status:'uploaded',local:false,scene:'missing',dim:'1600 × 900',url:'https://files.vectr.example/i/v8r1.png',steps:[['ok','Uploaded to Vectr (work)']]}
+];
+const statusText = {uploaded:'Uploaded', local:'Local only', uploading:'Uploading, 62%', failed:'Upload failed'};
+const statusClass = {uploaded:'uploaded', local:'local', uploading:'uploading', failed:'failed-t'};
+const state = {selected:1, view:'gallery', preview:true};
+
+function art(scene){
+  const frame='<rect width="320" height="180" fill="#121212"/><rect x="16" y="13" width="288" height="154" rx="6" fill="#171717" stroke="rgba(255,255,255,.1)"/><path d="M16 32h288" stroke="rgba(255,255,255,.1)"/><circle cx="27" cy="23" r="2" fill="#a1a1a1"/><circle cx="35" cy="23" r="2" fill="#a1a1a1"/><circle cx="43" cy="23" r="2" fill="#a1a1a1"/>';
+  let c='';
+  if(scene==='terminal') c='<text x="30" y="56" font-size="10" fill="#86d1a1" font-family="monospace">cargo test</text><g stroke="#a1a1a1" stroke-width="3" opacity=".55"><path d="M30 73h155M30 84h214M30 95h184M30 106h198M30 117h161M30 128h193"/></g><text x="30" y="150" font-size="10" fill="#86d1a1" font-family="monospace">test result: ok.</text>';
+  else if(scene==='scroll') c='<rect x="40" y="43" width="240" height="113" fill="#262626"/><g stroke="#a1a1a1" opacity=".55"><path d="M56 58h125" stroke-width="5"/><path d="M56 72h204M56 80h187M56 88h201M56 102h140M56 111h198M56 120h179M56 130h204M56 140h159" stroke-width="3"/></g>';
+  else { c='<rect x="27" y="43" width="65" height="113" rx="3" fill="#262626"/><g stroke="#a1a1a1" stroke-width="3" opacity=".65"><path d="M37 57h39M37 73h31M37 89h42M37 105h34"/></g><text x="107" y="58" font-size="11" fill="#fafafa" font-family="sans-serif">'+(scene==='annotation'?'Navigation':'Dashboard')+'</text><g fill="none" stroke="rgba(255,255,255,.12)"><rect x="105" y="70" width="180" height="24" rx="3"/><rect x="105" y="100" width="180" height="24" rx="3"/></g><g stroke="#a1a1a1" stroke-width="3"><path d="M118 82h101M118 112h123"/></g><rect x="230" y="136" width="55" height="15" rx="3" fill="#c8a6f0"/>'; }
+  if(scene==='annotation') c+='<ellipse cx="64" cy="89" rx="34" ry="18" fill="none" stroke="#f2c46d" stroke-width="3"/><path d="m163 132-41-33 5 17m-5-17 18 2" stroke="#f2c46d" stroke-width="3" fill="none"/>';
+  if(scene==='video'||scene==='gif') c+='<circle cx="160" cy="96" r="23" fill="#171717" stroke="rgba(255,255,255,.15)"/><path d="m154 84 17 12-17 12z" fill="#fafafa"/>';
+  return '<svg class="art" viewBox="0 0 320 180" aria-hidden="true">'+frame+c+'</svg>';
+}
+function thumbHtml(r, large){
+  const inner = (r.scene==='file' || !r.local) ? icon('file') : art(r.scene);
+  let extra = '';
+  if(!large){
+    if(r.dur) extra += `<span class="tag">${r.fmt} ${r.dur}</span>`;
+    else if(r.scene==='file' || !r.local) extra += `<span class="tag">${r.local ? r.fmt : 'File missing'}</span>`;
+    if(r.fav) extra += `<span class="star" title="Favorite">${icon('star')}</span>`;
+  }
+  return `<div class="${large ? 'preview' : 'thumb'}">${inner}${extra}</div>`;
+}
+function renderItems(){
+  const items = $('items');
+  items.className = 'items' + (state.view === 'list' ? ' list' : '');
+  items.innerHTML = records.map(r => `
+    <article class="entry${r.id===state.selected?' current':''}" role="listitem" tabindex="0" data-id="${r.id}" aria-label="${esc(r.name)}, ${statusText[r.status]}">
+      ${thumbHtml(r,false)}
+      <div class="entry-body"><div class="filename" title="${esc(r.name)}">${esc(r.name)}</div>
+        <div class="meta"><span class="state ${statusClass[r.status]}">${statusText[r.status]}</span><span class="size">${r.size}</span></div>
+        <div class="list-only">${r.when}, ${r.fmt}</div></div>
+      <div class="list-only"><span class="state ${statusClass[r.status]}">${statusText[r.status]}</span></div>
+      <div class="list-only size">${r.size}</div>
+    </article>`).join('');
+  items.querySelectorAll('.entry').forEach(e => {
+    const pick = () => { state.selected = Number(e.dataset.id); renderHistory(); };
+    e.addEventListener('click', pick);
+    e.addEventListener('keydown', ev => { if(ev.key==='Enter'||ev.key===' '){ ev.preventDefault(); pick(); } });
+  });
+}
+function renderInspector(){
+  const r = records.find(x => x.id === state.selected);
+  const box = $('inspector');
+  if(!r){ box.innerHTML = '<p class="empty-note">Select a capture or file to see its preview and actions.</p>'; return; }
+  let linkBlock;
+  if(r.url) linkBlock = `<div class="textedit linkbox">${esc(r.url)}</div><div class="d-actions"><button class="btn sm primary" type="button">${icon('copy')}Copy link</button><button class="btn sm" type="button">${icon('ext')}Open link</button></div>`;
+  else if(r.status==='failed') linkBlock = `<div class="textedit linkbox">No link yet</div><div class="d-actions"><button class="btn sm primary" type="button">${icon('retry')}Retry upload</button><button class="btn sm" type="button">${icon('upload')}Upload elsewhere…</button></div>`;
+  else if(r.status==='local') linkBlock = `<div class="textedit linkbox">Not uploaded</div><div class="d-actions"><button class="btn sm primary" type="button">${icon('upload')}Upload</button></div>`;
+  else linkBlock = `<div class="textedit linkbox">The link appears when the upload finishes</div>`;
+  const localActs = `<div class="d-actions three"><button class="btn sm" type="button" ${r.local?'':'disabled'}>${icon('file')}Open</button><button class="btn sm" type="button" ${r.local?'':'disabled'}>${icon('folder')}Folder</button><button class="btn sm" type="button" ${r.local && r.type==='image'?'':'disabled'}>${icon('pin')}Pin</button></div>`;
+  const steps = r.steps.length ? `<div class="d-section"><h3>What ran after capture</h3><ul class="steps">${r.steps.map(([k,t]) =>
+      `<li class="${k}">${icon(k==='ok'?'check':k==='bad'?'alert':'x')}<span class="grow">${esc(t)}</span>${k==='bad'?'<button class="btn sm" type="button">Retry</button>':''}</li>`).join('')}</ul></div>` : '';
+  const batch = r.batch ? `<div class="d-section"><h3>Batch</h3><p class="batch-line"><b>${esc(r.batch.label)}</b><br>${esc(r.batch.done)}</p><button class="btn sm" type="button">${icon('copy')}Copy uploaded links</button></div>` : '';
+  box.innerHTML = `${thumbHtml(r,true)}
+    <div class="d-name">${esc(r.name)}</div>
+    <div class="d-sub">${r.when}, ${r.fmt}, ${r.size}${r.dim!=='—'?', '+r.dim:''}</div>
+    <div class="d-states"><span class="state ${statusClass[r.status]}">${statusText[r.status]}</span><span class="avail">${r.local?'Local file available':'Local file missing'}</span></div>
+    ${linkBlock}${localActs}${steps}${batch}`;
+}
+function renderHistory(){ renderItems(); renderInspector(); $('workspace').className = 'workspace' + (state.preview ? '' : ' no-preview'); }
+
+const sw = on => `<button class="switch" type="button" role="switch" aria-checked="${on}"></button>`;
+const combo = label => `<button class="combo" type="button">${label}${icon('down')}</button>`;
+const settings = {
+  Connections: [
+    {title:'Connections', desc:'Where your uploads go. VectrCap uses the default unless a shortcut or task picks another.', rows:[
+      ['Vectr (work) <span class="pill def">Default</span><span class="pill ok">Token verified</span>','files.vectr.example', '<button class="btn sm" type="button">Edit</button>'],
+      ['Personal <span class="pill warn">Needs a token</span>','vectr.home.example', '<button class="btn sm primary" type="button">Add token</button>']],
+     foot:'<button class="btn sm" type="button">'+icon('plus')+'Add connection</button><button class="btn sm" type="button">Import VectrCap config…</button><span class="hint">Or drop a .vectrcap file here</span>'}],
+  Capture: [
+    {title:'Screenshots', desc:'How region, window and fullscreen captures behave.', rows:[
+      ['Delay before capture','Counts down before the screen is captured.', combo('No delay')],
+      ['Include the mouse pointer','Draws the pointer into the captured image.', sw(false)],
+      ['Magnifier while selecting','Shows a zoomed view next to the pointer.', sw(true)]]},
+    {title:'Image output', rows:[
+      ['Format','PNG keeps every pixel. JPEG and WebP make smaller files.', combo('PNG')],
+      ['File names','Used for saved files and uploads.', '<span class="textedit">capture_%y-%mo-%d_%h%mi</span>']]}],
+  Recording: [
+    {title:'Recordings', rows:[
+      ['Frame rate','Higher is smoother and makes larger files.', combo('30 fps')],
+      ['Audio for MP4','GIFs never include sound.', combo('Off')],
+      ['Longest recording','Stops automatically at this length.', combo('5 minutes')],
+      ['Show a countdown','Waits three seconds before recording starts.', sw(true)]]}],
+  Shortcuts: [
+    {title:'Shortcuts', desc:'Press a shortcut anywhere in Windows to run its action.', rows:[
+      ['Capture region','', '<span class="kbd">Ctrl + Shift + 4</span><button class="btn sm ghost" type="button">Remove</button>'],
+      ['Capture fullscreen','', '<span class="kbd">Print Screen</span><button class="btn sm ghost" type="button">Remove</button>'],
+      ['Start / stop MP4 recording','', '<span class="kbd">Ctrl + Shift + R</span><button class="btn sm ghost" type="button">Remove</button>'],
+      ['Upload from clipboard','', '<span class="kbd">Ctrl + Shift + U</span><button class="btn sm ghost" type="button">Remove</button>']],
+     foot:'<button class="btn sm" type="button">'+icon('plus')+'Add shortcut</button><span class="hint">Changes apply when you save</span><button class="btn sm primary" type="button">Save shortcuts</button>'}],
+  Tasks: [
+    {title:'After capture', desc:'What happens to a screenshot or recording once you finish it.', rows:[
+      ['Save the file','Keeps a copy in your capture folder.', sw(true)],
+      ['Copy the image','Puts the image on the clipboard.', sw(false)],
+      ['Upload','Sends it to the destination below.', sw(true)],
+      ['Ask me first','Shows the quick menu so you can choose each time.', sw(false)],
+      ['Destination','Shortcuts can choose their own.', combo('Default connection')]]},
+    {title:'After upload', rows:[
+      ['Copy the link','', sw(true)],
+      ['Open the link in your browser','', sw(false)],
+      ['Show the result window','', sw(false)]]}],
+  Storage: [
+    {title:'Local copies', desc:'Files VectrCap saves on this computer.', rows:[
+      ['Keep a local copy','', combo('Always')],
+      ['Capture folder','', '<span class="textedit">C:\\Users\\you\\Pictures\\VectrCap</span><button class="btn sm" type="button">Browse…</button>'],
+      ['Delete old copies','Only files VectrCap saved and you have not changed.', combo('Never')]]}],
+  General: [
+    {title:'General', rows:[
+      ['Show a notification when an upload finishes','', sw(true)],
+      ['Start VectrCap when Windows starts','', sw(false)],
+      ['Interface size','', combo('100%')]]}],
+  Integrations: [
+    {title:'Windows integration', rows:[
+      ['"Upload with Vectr" in Explorer','Adds the action to the right-click menu for files.', sw(true)],
+      ['Open .vectrcap files with VectrCap','Lets you double-click a downloaded config to add a connection.', sw(true)]]}],
+  Backup: [
+    {title:'Back up your settings', desc:'Exports shortcuts, tasks and preferences. Tokens are never included.', rows:[
+      ['Export settings','Saves a file you can import on another computer.', '<button class="btn sm" type="button">Export…</button>'],
+      ['Import settings','You choose what to apply before anything changes.', '<button class="btn sm" type="button">Import…</button>']]}],
+  Troubleshooting: [
+    {title:'Connection check', rows:[
+      ['Test connection','Checks that Vectr (work) is reachable and the token works. Nothing is uploaded.', '<button class="btn sm" type="button">Run test</button>']]},
+    {title:'Diagnostic report', rows:[
+      ['Preview a report','Shows counts and error codes only. No file names, links or tokens.', '<button class="btn sm" type="button">Preview…</button>']]}]
+};
+let section = 'Connections';
+function renderSettings(){
+  $('sections').innerHTML = Object.keys(settings).map(s => `<button class="sec-btn" type="button" data-sec="${s}"${s===section?' aria-current="page"':''}>${s}</button>`).join('');
+  $('sections').querySelectorAll('.sec-btn').forEach(b => b.addEventListener('click', () => { section = b.dataset.sec; renderSettings(); }));
+  $('groups').innerHTML = settings[section].map(g => `
+    <section class="group"><h2>${g.title}</h2><p>${g.desc || ''}</p>
+      <div class="card">${g.rows.map(([l,d,c]) => `<div class="row"><div class="txt"><b>${l}</b>${d?`<span>${d}</span>`:''}</div><div class="ctl">${c}</div></div>`).join('')}
+      ${g.foot?`<div class="card-foot">${g.foot}</div>`:''}</div></section>`).join('');
+  $('groups').querySelectorAll('.switch').forEach(s => s.addEventListener('click', () => s.setAttribute('aria-checked', String(s.getAttribute('aria-checked') !== 'true'))));
+}
+
+/* "All screens": a static copy of the window on the Settings page, so every screen is visible at once. */
+function settingsCopy(){
+  const copy = $('screen-window').cloneNode(true);
+  copy.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+  copy.removeAttribute('id');
+  const pages = copy.querySelectorAll('main.page');
+  pages[0].classList.add('hidden'); pages[1].classList.remove('hidden');
+  copy.querySelectorAll('[data-nav]').forEach(b => { if(b.dataset.nav === 'settings') b.setAttribute('aria-current','page'); else b.removeAttribute('aria-current'); });
+  copy.inert = true;
+  $('settings-slot').replaceChildren(copy);
+}
+function show(screen){
+  document.querySelectorAll('[data-screen]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.screen === screen)));
+  const all = screen === 'all', tray = screen === 'tray';
+  document.querySelectorAll('.cap').forEach(c => c.classList.toggle('hidden', !all));
+  $('settings-slot').classList.toggle('hidden', !all);
+  $('screen-window').classList.toggle('hidden', tray);
+  $('screen-tray').classList.toggle('hidden', !(tray || all));
+  $('ctl-progress').classList.toggle('hidden', !(all || screen === 'history'));
+  $('ctl-paused').classList.toggle('hidden', !(all || screen === 'history'));
+  if(all) settingsCopy();
+  const page = all ? 'history' : screen;
+  if(!tray){
+    $('page-history').classList.toggle('hidden', page !== 'history');
+    $('page-settings').classList.toggle('hidden', page !== 'settings');
+    $('screen-window').querySelectorAll('[data-nav]').forEach(b => { if(b.dataset.nav === page) b.setAttribute('aria-current','page'); else b.removeAttribute('aria-current'); });
+  }
+  if(all || tray) requestAnimationFrame(openFirstSub);
+}
+document.querySelectorAll('[data-screen]').forEach(b => b.addEventListener('click', () => show(b.dataset.screen)));
+$('screen-window').querySelectorAll('[data-nav]').forEach(b => b.addEventListener('click', () => show(b.dataset.nav)));
+$('toggle-progress').addEventListener('change', e => { $('in-progress').classList.toggle('hidden', !e.target.checked); $('nav-badge').classList.toggle('hidden', !e.target.checked); });
+$('toggle-paused').addEventListener('change', e => { $('banner-paused').classList.toggle('hidden', !e.target.checked); $('pause-all').innerHTML = e.target.checked ? icon('play')+'Resume all' : icon('pause')+'Pause all'; });
+$('toggle-collapse').addEventListener('change', e => $('app').classList.toggle('collapsed', e.target.checked));
+$('v-gallery').addEventListener('click', () => { state.view='gallery'; $('v-gallery').setAttribute('aria-pressed','true'); $('v-list').setAttribute('aria-pressed','false'); renderHistory(); });
+$('v-list').addEventListener('click', () => { state.view='list'; $('v-list').setAttribute('aria-pressed','true'); $('v-gallery').setAttribute('aria-pressed','false'); renderHistory(); });
+$('v-preview').addEventListener('click', () => { state.preview = !state.preview; $('v-preview').setAttribute('aria-pressed', String(state.preview)); renderHistory(); });
+
+const desk = $('screen-tray');
+document.querySelectorAll('#tray-main .mi').forEach(mi => mi.addEventListener('mouseenter', () => {
+  document.querySelectorAll('.sub-menu').forEach(s => s.classList.remove('show'));
+  document.querySelectorAll('#tray-main .mi').forEach(x => x.classList.remove('open'));
+  const id = mi.dataset.sub; if(!id) return;
+  const sub = $(id); mi.classList.add('open'); sub.classList.add('show');
+  const d = desk.getBoundingClientRect(), m = mi.getBoundingClientRect();
+  const k = d.width / desk.offsetWidth || 1; // the stage may be zoomed in narrow frames
+  const left = (m.left - d.left) / k, top = (m.top - d.top) / k;
+  sub.style.left = (left - sub.offsetWidth - 4) + 'px';
+  sub.style.top = Math.max(8, Math.min(top - 5, desk.offsetHeight - 56 - sub.offsetHeight)) + 'px';
+}));
+function openFirstSub(){ const first = document.querySelector('#tray-main [data-sub]'); if(first) first.dispatchEvent(new Event('mouseenter')); }
+
+renderHistory(); renderSettings(); show('all');
+</script>
+</body>
+</html>
