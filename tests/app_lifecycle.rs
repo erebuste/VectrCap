@@ -217,7 +217,10 @@ fn actor_initializes_off_thread_and_quit_drains_without_ui_polling() {
         }
     }
     let history = History::open(&dir.path().join("history.db")).unwrap();
-    assert!(history.queue_paused().unwrap());
+    assert!(
+        !history.queue_paused().unwrap(),
+        "quit must not pause uploads for the next launch"
+    );
 }
 
 #[test]

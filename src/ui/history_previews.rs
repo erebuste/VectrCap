@@ -143,12 +143,21 @@ impl Drop for HistoryPreviews {
     }
 }
 pub fn decode(record: &HistoryRecord) -> Option<ColorImage> {
-    let extension = std::path::Path::new(&record.name)
+    decode_artifact(&record.name, &record.kind, &record.artifact)
+}
+
+/// Verified local preview. Callers must not run this on the UI thread.
+pub fn decode_artifact(
+    name: &str,
+    kind: &str,
+    artifact: &crate::app::types::Artifact,
+) -> Option<ColorImage> {
+    let extension = std::path::Path::new(name)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(record.kind.as_str(), "screenshot" | "gif" | "mp4")
+    if !matches!(kind, "screenshot" | "gif" | "mp4")
         && !matches!(
             extension.as_str(),
             "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "mp4"
@@ -156,8 +165,8 @@ pub fn decode(record: &HistoryRecord) -> Option<ColorImage> {
     {
         return None;
     }
-    let file = verified_local(&record.artifact, 64 * 1024 * 1024).ok()?;
-    if record.kind == "mp4" || record.name.to_ascii_lowercase().ends_with(".mp4") {
+    let file = verified_local(artifact, 64 * 1024 * 1024).ok()?;
+    if kind == "mp4" || name.to_ascii_lowercase().ends_with(".mp4") {
         return crate::platform::windows::poster::mp4_poster(file);
     }
     let mut reader = image::ImageReader::new(std::io::BufReader::new(file))

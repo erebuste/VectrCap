@@ -208,6 +208,203 @@ fn completion_surface_requests_no_activation_or_taskbar_entry() {
     let builder = vectrcap::ui::completion_notification::viewport_builder();
     assert_eq!(builder.active, Some(false));
     assert_eq!(builder.taskbar, Some(false));
+    assert_eq!(builder.decorations, Some(false));
+    assert_eq!(
+        builder.window_level,
+        Some(eframe::egui::WindowLevel::AlwaysOnTop)
+    );
+    let size = builder.inner_size.unwrap();
+    assert!(size.x <= 240.0 && size.y <= 180.0, "{size:?}");
+    let position = builder.position.expect("toast position");
+    let area =
+        vectrcap::platform::windows::monitors::primary_work_area().expect("primary work area");
+    let margin = 16.0;
+    let x = (area.right() as f32 - size.x - margin).max(area.left() as f32);
+    let y = (area.bottom() as f32 - size.y - margin).max(area.top() as f32);
+    assert!(
+        (position.x - x).abs() < 0.5 && (position.y - y).abs() < 0.5,
+        "position {position:?} expected ({x}, {y}) on {area:?}"
+    );
+}
+
+fn notice_display(
+    jobs: Vec<vectrcap::app::notifications::JobCompletion>,
+) -> vectrcap::app::controller::NoticeDisplay {
+    use vectrcap::app::notifications::{CompletionNotice, NotificationCenter};
+    let mut center = NotificationCenter::new();
+    let notice = if jobs.len() == 1 {
+        CompletionNotice::Job(jobs.into_iter().next().unwrap())
+    } else {
+        CompletionNotice::Batch(jobs)
+    };
+    center.record(notice).unwrap();
+    let view = center.visible().remove(0);
+    let actions = center.actions(view.id()).unwrap();
+    vectrcap::app::controller::NoticeDisplay { view, actions }
+}
+
+fn click_notice(
+    view: &vectrcap::app::desktop::DesktopView,
+) -> Vec<vectrcap::app::events::AppCommand> {
+    use eframe::egui::{Context, Event, Modifiers, PointerButton, RawInput, Rect, Vec2, pos2};
+    use std::collections::HashMap;
+    use vectrcap::ui::completion_notification::draw;
+    let ctx = Context::default();
+    let mut shown = HashMap::new();
+    let input = |events| RawInput {
+        screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0))),
+        events,
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(input(vec![]), |ui| {
+        let _ = draw(ui, view, &mut shown);
+    });
+    output.textures_delta.clear();
+    let at = pos2(106.0, 64.0);
+    let mut output = ctx.run_ui(
+        input(vec![
+            Event::PointerMoved(at),
+            Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ]),
+        |ui| {
+            let _ = draw(ui, view, &mut shown);
+        },
+    );
+    output.textures_delta.clear();
+    let mut commands = vec![];
+    let mut output = ctx.run_ui(
+        input(vec![Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }]),
+        |ui| {
+            commands = draw(ui, view, &mut shown);
+        },
+    );
+    output.textures_delta.clear();
+    commands
+}
+
+#[test]
+fn uploaded_thumbnail_click_opens_the_browser_link() {
+    use vectrcap::app::{
+        desktop::DesktopView,
+        events::AppCommand,
+        notifications::{CompletionStatus, JobCompletion, RequestedCompletionAction},
+        types::{JobId, UploadReceipt},
+    };
+    let job = JobId(uuid::Uuid::new_v4());
+    let receipt = UploadReceipt::new("https://example.com/capture.png", "capture.png").unwrap();
+    let view = DesktopView {
+        notices: vec![notice_display(vec![
+            JobCompletion::try_new(
+                job,
+                "capture.png",
+                true,
+                true,
+                Some(receipt),
+                CompletionStatus::uploaded(),
+            )
+            .unwrap(),
+        ])],
+        ..Default::default()
+    };
+    assert!(matches!(
+        vectrcap::ui::completion_notification::primary_action(&view.notices[0]),
+        Some(RequestedCompletionAction::OpenLink(id)) if id == job
+    ));
+    let commands = click_notice(&view);
+    assert!(
+        matches!(
+            commands.as_slice(),
+            [
+                AppCommand::ExecuteCompletionAction {
+                    action: RequestedCompletionAction::OpenLink(opened),
+                    ..
+                },
+                AppCommand::DismissNotice(_),
+            ] if *opened == job
+        ),
+        "expected open-link then dismiss, got {} commands",
+        commands.len()
+    );
+}
+
+#[test]
+fn local_only_thumbnail_click_does_not_open_a_browser() {
+    use vectrcap::app::events::AppCommand;
+    let view = completion_view();
+    assert!(vectrcap::ui::completion_notification::primary_action(&view.notices[0]).is_none());
+    let commands = click_notice(&view);
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command, AppCommand::ExecuteCompletionAction { .. })),
+        "local-only click ran {} commands",
+        commands.len()
+    );
+}
+
+#[test]
+fn batch_thumbnail_click_opens_the_summary() {
+    use vectrcap::app::{
+        desktop::DesktopView,
+        events::AppCommand,
+        notifications::{CompletionStatus, JobCompletion, RequestedCompletionAction},
+        types::{JobId, UploadReceipt},
+    };
+    let uploaded = JobId(uuid::Uuid::new_v4());
+    let failed = JobId(uuid::Uuid::new_v4());
+    let receipt = UploadReceipt::new("https://example.com/one.png", "one.png").unwrap();
+    let view = DesktopView {
+        notices: vec![notice_display(vec![
+            JobCompletion::try_new(
+                uploaded,
+                "one.png",
+                true,
+                true,
+                Some(receipt),
+                CompletionStatus::uploaded(),
+            )
+            .unwrap(),
+            JobCompletion::try_new(
+                failed,
+                "two.png",
+                true,
+                true,
+                None,
+                CompletionStatus::failed("transient").unwrap(),
+            )
+            .unwrap(),
+        ])],
+        ..Default::default()
+    };
+    assert!(matches!(
+        vectrcap::ui::completion_notification::primary_action(&view.notices[0]),
+        Some(RequestedCompletionAction::OpenBatchSummary { .. })
+    ));
+    let commands = click_notice(&view);
+    assert!(
+        matches!(
+            commands.as_slice(),
+            [
+                AppCommand::ExecuteCompletionAction {
+                    action: RequestedCompletionAction::OpenBatchSummary { .. },
+                    ..
+                },
+                AppCommand::DismissNotice(_),
+            ]
+        ),
+        "expected batch summary then dismiss, got {} commands",
+        commands.len()
+    );
 }
 
 #[test]

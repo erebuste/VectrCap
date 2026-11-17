@@ -59,7 +59,7 @@ impl eframe::App for Smoke {
         let expired = self.expired.clone();
         ctx.show_viewport_deferred(
             egui::ViewportId::from_hash_of("smoke-notice"),
-            completion_notification::viewport_builder(),
+            completion_notification::viewport_builder_for(1, ctx.pixels_per_point()),
             move |ui, _| {
                 let title: Vec<u16> = "VectrCap notifications\0".encode_utf16().collect();
                 unsafe {

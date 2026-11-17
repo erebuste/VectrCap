@@ -19,7 +19,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -76,6 +76,9 @@ pub struct Uploader {
     worker: Mutex<()>,
     pub(crate) controls: Notify,
     pub(crate) speed_epoch: AtomicU64,
+    /// Set when the queue command channel closes. Checkpoints settle the
+    /// current request without recording a durable queue pause.
+    pub(crate) stopping: AtomicBool,
 }
 impl Uploader {
     pub fn new(
@@ -90,6 +93,7 @@ impl Uploader {
             worker: Mutex::new(()),
             controls: Notify::new(),
             speed_epoch: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
         }
     }
     pub fn notify_controls(&self) {
@@ -180,7 +184,7 @@ impl Uploader {
         {
             return Err(AppError::Cancelled);
         }
-        if job.paused || self.history.queue_paused()? {
+        if job.paused || self.stopping.load(Ordering::Relaxed) || self.history.queue_paused()? {
             return Err(AppError::Paused);
         }
         Ok(())

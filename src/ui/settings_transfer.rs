@@ -106,26 +106,39 @@ impl SettingsTransferPane {
         client: &DesktopClient,
         gate: &PickerGate,
     ) {
-        ui.collapsing("Preferences backup (JSON)", |ui| {
-            ui.label("Back up preferences and destination links. Tokens, history and device identifiers are excluded. Install destinations with the separate .vectrcap action.");
-            let busy = self.worker.is_some() || self.applying.is_some();
-            ui.add_enabled_ui(!busy && self.replace.is_none(), |ui| self.draw_file_actions(ui, settings, gate));
-            if self.replace.is_some() {
-                ui.label("Replace the selected backup file?");
-                if let Some((path, _)) = &self.replace { ui.label(path.display().to_string()); }
-                if ui.button("Confirm replacement").clicked() && let Some((path, settings)) = self.replace.take() {
-                    self.start(ui.ctx(), move || { write_export(&path, &settings, true)?; Ok(FileResult::Exported) });
-                }
-                if ui.button("Cancel export").clicked() { self.replace = None; }
-            }
-            if let Some(message) = &self.status { ui.label(message); }
-            if busy {
-                ui.spinner();
-                ui.label("Waiting for the file operation or active capture session to end...");
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            self.draw_preview(ui, settings, client, busy);
+        ui.heading("Backup");
+        ui.label("Back up preferences and destination links. Tokens, history and device identifiers are excluded. Install destinations with the separate .vectrcap action.");
+        let busy = self.worker.is_some() || self.applying.is_some();
+        ui.add_enabled_ui(!busy && self.replace.is_none(), |ui| {
+            self.draw_file_actions(ui, settings, gate)
         });
+        if self.replace.is_some() {
+            ui.label("Replace the selected backup file?");
+            if let Some((path, _)) = &self.replace {
+                ui.label(path.display().to_string());
+            }
+            if ui.button("Confirm replacement").clicked()
+                && let Some((path, settings)) = self.replace.take()
+            {
+                self.start(ui.ctx(), move || {
+                    write_export(&path, &settings, true)?;
+                    Ok(FileResult::Exported)
+                });
+            }
+            if ui.button("Cancel export").clicked() {
+                self.replace = None;
+            }
+        }
+        if let Some(message) = &self.status {
+            ui.label(message);
+        }
+        if busy {
+            ui.spinner();
+            ui.label("Waiting for the file operation or active capture session to end...");
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        self.draw_preview(ui, settings, client, busy);
     }
     fn draw_file_actions(&mut self, ui: &mut egui::Ui, settings: &Settings, gate: &PickerGate) {
         ui.horizontal(|ui| {

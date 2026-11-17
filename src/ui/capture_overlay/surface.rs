@@ -95,73 +95,10 @@ impl CaptureOverlay {
                 b.height() as f32 / native_pixels_per_point,
             ]))
     }
-    fn note(&mut self, result: Result<(), AppError>) {
+    pub(super) fn note(&mut self, result: Result<(), AppError>) {
         if let Err(error) = result {
             self.error = Some(error);
         }
-    }
-    fn toolbar(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
-        if self.recording_selection {
-            egui::Window::new(self.selection_title).default_pos(viewport.min+egui::vec2(12.0,12.0)).show(ctx,|ui|{
-                ui.label("Select and resize a fixed rectangle on one monitor. Enter starts the countdown.");ui.label(&self.recording_summary);
-                if ui.button("Start countdown").clicked(){let r=self.handle(OverlayInput::Enter).map(|_|());self.note(r);}
-                if ui.button("Cancel").clicked(){let r=self.handle(OverlayInput::Escape).map(|_|());self.note(r);}
-                if let Some(e)=&self.error{ui.label(e.to_string());}
-            });
-            return;
-        }
-
-        egui::Window::new("Capture tools").id(egui::Id::unique(("capture-tools",self.document.id())))
-            .default_pos(viewport.min+egui::vec2(12.0,12.0))
-            .default_width((viewport.width()-24.0).clamp(180.0,850.0))
-            .max_height((viewport.height()*0.45).max(100.0))
-            .vscroll(true).resizable(true).collapsible(true).show(ctx, |ui| {
-                ui.add_enabled_ui(!self.finishing, |ui| {
-                    ui.add_enabled_ui(!self.has_active_edit(), |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            for &tool in AnnotationTool::all() {
-                                if ui.selectable_label(self.tool==tool,tool.label()).clicked() {
-                                    let result = self.set_tool(tool); self.note(result);
-                                }
-                            }
-                        });
-                        self.options.draw(ui,self.tool);
-                        ui.horizontal_wrapped(|ui| {
-                            for (label,vk) in [("Undo",0x5A),("Redo",0x59)] {
-                                if ui.button(label).clicked() {
-                                    let result = self.handle_chord(&ShortcutSettings::default(), KeyChord {ctrl:true,alt:false,shift:false,win:false,key:crate::app::shortcuts::KeyCode::from_vk(vk).expect("history key is supported")},ShortcutFocus::Normal,false).map(|_|());
-                                    self.note(result);
-                                }
-                            }
-                            if ui.button("Clear crop").clicked() { let r=self.clear_crop(); self.note(r); }
-                            if self.tool==AnnotationTool::SmartEraser && ui.button("Sample source on next click").clicked() { self.sampling = true; }
-                            if self.tool==AnnotationTool::Select && let Some(id)=self.selected {
-                                if ui.button("Delete selected").clicked() {
-                                    let r=self.apply(EditorCommand::Erase(vec![id])); self.note(r); self.selected=None;
-                                }
-                                if let Some(text @ Annotation::Text {..}) = self.document.annotations().iter().find(|a| a.id()==id)
-                                    && ui.button("Edit selected text").clicked() {
-                                    self.text=Some(text.clone()); self.text_is_modification=true; self.text_focus_requested=true;
-                                }
-                            }
-                            if ui.button("Finish / output options").clicked() { let r=self.handle(OverlayInput::Enter).map(|_|()); self.note(r); }
-                        });
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Cancel active edit").clicked() && self.has_active_edit() { let r=self.handle(OverlayInput::Escape).map(|_|()); self.note(r); }
-                        if ui.button("Cancel capture").clicked() {
-                            // A visible cancel obeys the same active-edit unwind.
-                            let r=self.handle(OverlayInput::Escape).map(|_|()); self.note(r);
-                        }
-                    });
-                });
-                if self.sampling { ui.label("Click a nearby background pixel to sample; the following gesture paints it."); }
-                if self.tool==AnnotationTool::SmartEraser && self.sampled.is_none() { ui.label("Sample a frozen source color before painting."); }
-                ui.label("Release left mouse: run configured capture tasks. Enter: commit text or show output options. Escape: cancel active edit first. Shift+Tab: focus tools; Tab/Shift+Tab: traverse focused controls.");
-                ui.label("Region arrows: move 1 physical pixel; Shift+arrows: resize 1 physical pixel.");
-                if self.preview.accepted!=Some(self.generation) { ui.label("Preparing annotation preview..."); }
-                if let Some(error)=&self.error { ui.colored_label(ui.visuals().error_fg_color,error.to_string()); }
-            });
     }
     fn text_editor(&mut self, ctx: &egui::Context) {
         let mut commit = false;
@@ -285,7 +222,7 @@ impl CaptureOverlay {
                 });
             });
         }
-        self.toolbar(&ctx, viewport);
+        self.toolbar(&ctx, transform);
         let editing_text = self.text.is_some();
         self.text_editor(&ctx);
         // Let TextEdit first process Text/Paste/IME; then Enter commits the

@@ -22,14 +22,7 @@ pub fn draw(ui: &mut Ui, view: &DesktopView) {
                     .color(ui.visuals().text_color()),
             );
             ui.label(&job.destination.label);
-            ui.label(match &job.status {
-                JobStatus::Completed(_) => "Uploaded",
-                JobStatus::Failed { .. } => "Failed",
-                JobStatus::Cancelled => "Cancelled",
-                JobStatus::Uncertain => "Outcome uncertain",
-                JobStatus::Running => "Uploading",
-                _ => "Waiting",
-            });
+            ui.label(outcome(&job.status, job.paused, view.queue_paused));
             if let JobStatus::Failed { code } = &job.status {
                 ui.label(format!("Failure: {code}"));
             }
@@ -41,5 +34,45 @@ pub fn draw(ui: &mut Ui, view: &DesktopView) {
             }
             ui.separator();
         });
+    }
+}
+
+fn outcome(status: &JobStatus, paused: bool, queue_paused: bool) -> &'static str {
+    match status {
+        JobStatus::Completed(_) => "Uploaded",
+        JobStatus::Failed { .. } => "Failed",
+        JobStatus::Cancelled => "Cancelled",
+        JobStatus::Uncertain => "Outcome uncertain",
+        JobStatus::Running if paused || queue_paused => "Pausing",
+        JobStatus::Running => "Uploading",
+        _ if paused && queue_paused => "Paused by job and queue",
+        _ if paused => "Paused by job",
+        _ if queue_paused => "Paused by queue",
+        _ => "Waiting",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_batch_rows_are_not_labeled_waiting() {
+        assert_eq!(outcome(&JobStatus::Pending, false, true), "Paused by queue");
+        assert_eq!(
+            outcome(&JobStatus::Interrupted, true, false),
+            "Paused by job"
+        );
+        assert_eq!(
+            outcome(&JobStatus::Pending, true, true),
+            "Paused by job and queue"
+        );
+        assert_eq!(outcome(&JobStatus::Running, true, false), "Pausing");
+        assert_eq!(outcome(&JobStatus::Interrupted, false, false), "Waiting");
+        assert_eq!(
+            outcome(&JobStatus::Uncertain, false, true),
+            "Outcome uncertain"
+        );
+        assert_eq!(outcome(&JobStatus::Cancelled, true, true), "Cancelled");
     }
 }

@@ -153,12 +153,39 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorGeometry>, AppError> {
     validate_layout(&state.monitors)?;
     Ok(state.monitors)
 }
+struct WorkArea {
+    rect: PhysicalRect,
+    primary: bool,
+}
+
 /// Pin placement uses work areas, excluding taskbars and reserved app bars.
 #[allow(unsafe_code)]
 pub fn enumerate_work_areas() -> Result<Vec<PhysicalRect>, AppError> {
+    Ok(collect_work_areas()?
+        .into_iter()
+        .map(|area| area.rect)
+        .collect())
+}
+
+/// Work area of the monitor Windows uses for native toasts.
+/// `rcWork` already stops above the taskbar when the taskbar is on that monitor.
+#[allow(unsafe_code)]
+pub fn primary_work_area() -> Result<PhysicalRect, AppError> {
+    let areas = collect_work_areas()?;
+    let area = areas.iter().find(|area| area.primary).or_else(|| {
+        areas.iter().max_by_key(|area| {
+            u64::from(area.rect.width()).saturating_mul(u64::from(area.rect.height()))
+        })
+    });
+    area.map(|area| area.rect)
+        .ok_or(AppError::Capture("pin monitor enumeration failed"))
+}
+
+#[allow(unsafe_code)]
+fn collect_work_areas() -> Result<Vec<WorkArea>, AppError> {
     let _dpi = DpiContext::enter()?;
     struct Areas {
-        rects: Vec<PhysicalRect>,
+        rects: Vec<WorkArea>,
         error: Option<AppError>,
     }
     unsafe extern "system" fn collect(handle: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> i32 {
@@ -174,11 +201,13 @@ pub fn enumerate_work_areas() -> Result<Vec<PhysicalRect>, AppError> {
             if unsafe { GetMonitorInfoW(handle, &mut info) } == 0 {
                 return Err(AppError::Capture("pin monitor work area is unavailable"));
             }
-            rect_from_win32(info.rcWork)
+            let rect = rect_from_win32(info.rcWork)?;
+            let primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            Ok(WorkArea { rect, primary })
         })();
         match result {
-            Ok(rect) => {
-                state.rects.push(rect);
+            Ok(area) => {
+                state.rects.push(area);
                 1
             }
             Err(error) => {

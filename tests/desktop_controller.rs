@@ -517,7 +517,7 @@ async fn quit_drains_real_private_tls_request_and_preserves_confirmed_receipt() 
     release.add_permits(1);
     let state = wait(&runtime.client, &rx, |s| s.lifecycle == Lifecycle::Exited);
     assert!(matches!(state.jobs[0].status, JobStatus::Completed(_)));
-    assert!(state.queue_paused);
+    assert!(!state.queue_paused);
     assert_eq!(server.requests.lock().unwrap().len(), 1);
     assert_eq!(server.requests.lock().unwrap()[0].path, "/api/upload");
 }

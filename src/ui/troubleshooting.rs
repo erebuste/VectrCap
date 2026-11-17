@@ -236,6 +236,9 @@ impl TroubleshootingPane {
         }
         actions
     }
+    pub(crate) fn poll(&mut self, settings: &Settings) {
+        self.reconcile(settings);
+    }
     fn reconcile(&mut self, settings: &Settings) {
         if let Some(rx) = &self.refresh {
             match rx.try_recv() {
@@ -321,98 +324,97 @@ impl TroubleshootingPane {
         gate: &PickerGate,
     ) {
         self.reconcile(settings);
-        ui.collapsing("Troubleshooting", |ui| {
-            for action in self.controls(ui, settings) {
-                match action {
-                    TroubleshootingAction::Refresh => {
-                        let (tx, rx) = mpsc::sync_channel(1);
-                        match client.submit(AppCommand::RefreshDiagnostics { reply: tx }) {
-                            Ok(()) => {
-                                self.refresh = Some(rx);
-                                self.error = None;
-                            }
-                            Err(e) => self.error = Some(error_code(&e)),
+        ui.heading("Troubleshooting");
+        for action in self.controls(ui, settings) {
+            match action {
+                TroubleshootingAction::Refresh => {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    match client.submit(AppCommand::RefreshDiagnostics { reply: tx }) {
+                        Ok(()) => {
+                            self.refresh = Some(rx);
+                            self.error = None;
                         }
-                    }
-                    TroubleshootingAction::TestConnection(id) => {
-                        let (tx, rx) = mpsc::sync_channel(1);
-                        let cancel = tokio_util::sync::CancellationToken::new();
-                        match client.submit(AppCommand::TestDiagnosticConnection {
-                            id,
-                            revision: settings.revision,
-                            cancel: cancel.clone(),
-                            reply: tx,
-                        }) {
-                            Ok(()) => {
-                                self.connection = Some((id, settings.revision, rx));
-                                self.connection_cancel = Some(cancel);
-                                self.snapshot.connection = Default::default();
-                                self.error = None;
-                            }
-                            Err(e) => self.error = Some(error_code(&e)),
-                        }
-                    }
-                    TroubleshootingAction::CancelConnection => self.cancel_connection(),
-                    TroubleshootingAction::Preview => match self.freeze_preview() {
-                        Ok(()) => {}
                         Err(e) => self.error = Some(error_code(&e)),
-                    },
-                    TroubleshootingAction::Copy => {
-                        if let Some(preview) = self.preview.clone() {
-                            self.start_file(ui.ctx(), move || {
-                                preview.copy(&WindowsClipboard)?;
-                                Ok(FileResult::Copied)
-                            });
-                        }
-                    }
-                    TroubleshootingAction::Save => {
-                        if let Some(preview) = self.preview.clone()
-                            && let Some(guard) = gate.try_acquire()
-                        {
-                            self.start_file(ui.ctx(), move || {
-                                let _guard = guard;
-                                let Some(path) = file_dialog::pick_preferences_file(true)? else {
-                                    return Ok(FileResult::Cancelled);
-                                };
-                                if path
-                                    .try_exists()
-                                    .map_err(|e| AppError::io("checking diagnostic report", &e))?
-                                {
-                                    return Ok(FileResult::Replace(path, preview));
-                                }
-                                preview.save(&path, false)?;
-                                Ok(FileResult::Saved)
-                            });
-                        }
                     }
                 }
-            }
-            if self.replace.is_some() && self.file.is_none() {
-                ui.label("Replace the selected diagnostic report with the frozen preview?");
-                if ui.button("Confirm diagnostic report replacement").clicked()
-                    && let Some((path, preview)) = self.replace.take()
-                {
-                    self.start_file(ui.ctx(), move || {
-                        preview.save(&path, true)?;
-                        Ok(FileResult::Saved)
-                    });
+                TroubleshootingAction::TestConnection(id) => {
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    match client.submit(AppCommand::TestDiagnosticConnection {
+                        id,
+                        revision: settings.revision,
+                        cancel: cancel.clone(),
+                        reply: tx,
+                    }) {
+                        Ok(()) => {
+                            self.connection = Some((id, settings.revision, rx));
+                            self.connection_cancel = Some(cancel);
+                            self.snapshot.connection = Default::default();
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(error_code(&e)),
+                    }
                 }
-                if ui.button("Cancel diagnostic export").clicked() {
-                    self.replace = None;
+                TroubleshootingAction::CancelConnection => self.cancel_connection(),
+                TroubleshootingAction::Preview => match self.freeze_preview() {
+                    Ok(()) => {}
+                    Err(e) => self.error = Some(error_code(&e)),
+                },
+                TroubleshootingAction::Copy => {
+                    if let Some(preview) = self.preview.clone() {
+                        self.start_file(ui.ctx(), move || {
+                            preview.copy(&WindowsClipboard)?;
+                            Ok(FileResult::Copied)
+                        });
+                    }
+                }
+                TroubleshootingAction::Save => {
+                    if let Some(preview) = self.preview.clone()
+                        && let Some(guard) = gate.try_acquire()
+                    {
+                        self.start_file(ui.ctx(), move || {
+                            let _guard = guard;
+                            let Some(path) = file_dialog::pick_preferences_file(true)? else {
+                                return Ok(FileResult::Cancelled);
+                            };
+                            if path
+                                .try_exists()
+                                .map_err(|e| AppError::io("checking diagnostic report", &e))?
+                            {
+                                return Ok(FileResult::Replace(path, preview));
+                            }
+                            preview.save(&path, false)?;
+                            Ok(FileResult::Saved)
+                        });
+                    }
                 }
             }
-            if let Some(status) = self.status {
-                ui.label(status);
+        }
+        if self.replace.is_some() && self.file.is_none() {
+            ui.label("Replace the selected diagnostic report with the frozen preview?");
+            if ui.button("Confirm diagnostic report replacement").clicked()
+                && let Some((path, preview)) = self.replace.take()
+            {
+                self.start_file(ui.ctx(), move || {
+                    preview.save(&path, true)?;
+                    Ok(FileResult::Saved)
+                });
             }
-            if let Some(code) = self.error {
-                ui.label(format!(
-                    "Diagnostic operation: {code:?}. Capture remains available."
-                ));
+            if ui.button("Cancel diagnostic export").clicked() {
+                self.replace = None;
             }
-            if self.refresh.is_some() || self.connection.is_some() || self.file.is_some() {
-                ui.spinner();
-            }
-        });
+        }
+        if let Some(status) = self.status {
+            ui.label(status);
+        }
+        if let Some(code) = self.error {
+            ui.label(format!(
+                "Diagnostic operation: {code:?}. Capture remains available."
+            ));
+        }
+        if self.refresh.is_some() || self.connection.is_some() || self.file.is_some() {
+            ui.spinner();
+        }
         if self.refresh.is_some() || self.connection.is_some() || self.file.is_some() {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));

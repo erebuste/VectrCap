@@ -765,8 +765,8 @@ impl Effects {
                     self.local_cancel.cancel();
                     self.state.exit_requested = true;
                     self.state.lifecycle = Lifecycle::Draining;
-                    // Closing the sole command sender invokes the approved driver's
-                    // durable PauseAll and settlement path; never abort its request.
+                    // Closing the sole command sender drains the current request.
+                    // It does not record a queue pause; only Pause uploads does.
                     self.queue.take();
                     if let Some(task) = self.metadata.take() {
                         task.abort();

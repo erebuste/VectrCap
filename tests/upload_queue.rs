@@ -134,6 +134,49 @@ fn paused_intents_survive_restart() {
     );
 }
 #[tokio::test]
+async fn closing_the_queue_does_not_pause_the_next_launch() {
+    let (_t, h, s, j) = setup();
+    h.set_job_paused(j.id, true).unwrap();
+    let uploader = Arc::new(vectrcap::vectr::uploader::Uploader::new(
+        h.clone(),
+        s,
+        Arc::new(|_: &vectrcap::app::destinations::DestinationSnapshot| {
+            Err(AppError::InvalidInput("exit must not upload"))
+        }),
+    ));
+    let drive = |history: Arc<History>, worker: Arc<vectrcap::vectr::uploader::Uploader>| async move {
+        let q = QueueController::new(history).unwrap();
+        let (tx, rx) = command_channel();
+        let (nt, _nr) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(q.serve(worker, rx, nt));
+        drop(tx);
+        task.await.unwrap().unwrap();
+    };
+    drive(h.clone(), uploader.clone()).await;
+    assert!(!h.queue_paused().unwrap());
+    let saved = h.job(j.id).unwrap().unwrap();
+    assert!(saved.paused);
+    assert_eq!(saved.status, JobStatus::Pending);
+
+    h.set_queue_paused(true).unwrap();
+    drive(h.clone(), uploader).await;
+    assert!(h.queue_paused().unwrap());
+
+    let mut q = QueueController::new(h.clone()).unwrap();
+    h.set_job_paused(j.id, false).unwrap();
+    assert!(
+        !q.handle(C::Admit(j.id))
+            .iter()
+            .any(|e| matches!(e, E::Start(_)))
+    );
+    assert!(
+        q.handle(C::ResumeAll)
+            .iter()
+            .any(|e| matches!(e, E::Start(_)))
+    );
+    assert!(!h.queue_paused().unwrap());
+}
+#[tokio::test]
 async fn acknowledged_active_cancel_survives_reopen_without_settlement() {
     let f = Fixture::new(vec![]).await;
     let (t, h, s, j) = setup_origin(f.origin.clone());

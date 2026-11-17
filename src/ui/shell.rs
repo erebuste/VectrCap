@@ -1,15 +1,15 @@
-use super::settings::SettingsPane;
+use super::settings::{SettingsCategory, SettingsPane};
 use crate::{
     app::{
         desktop::{DesktopClient, DesktopView},
         error::AppError,
-        events::{AppCommand, Lifecycle, Window},
+        events::{AppCommand, Lifecycle, QueueAction, Window},
     },
     platform::windows::{appearance, file_dialog::PickerGate, tray::Tray},
 };
 use eframe::egui;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 pub struct Shell {
@@ -25,6 +25,7 @@ pub struct Shell {
             std::collections::HashMap<crate::app::notifications::NoticeId, std::time::Instant>,
         >,
     >,
+    thumbs: Arc<Mutex<super::completion_notification::NoticeThumbs>>,
     client: DesktopClient,
     view: DesktopView,
     tray: Tray,
@@ -61,6 +62,9 @@ impl Shell {
             pane: SettingsPane::default(),
             history: Default::default(),
             shown_since: Default::default(),
+            thumbs: Arc::new(Mutex::new(
+                super::completion_notification::NoticeThumbs::new(),
+            )),
             focus_revision: 0,
             current_window: None,
             focus_requested,
@@ -106,6 +110,9 @@ impl eframe::App for Shell {
             self.troubleshooting.cancel_connection();
         }
         self.preferences_transfer.reconcile();
+        if let Some(settings) = &self.view.settings {
+            self.troubleshooting.poll(settings);
+        }
         let install_commands =
             self.install_review
                 .show(ctx, self.view.install.as_ref(), self.view.settings.as_ref());
@@ -175,9 +182,13 @@ impl eframe::App for Shell {
         if super::completion_notification::surface_visible(&self.view) {
             let client = self.client.clone();
             let shown = self.shown_since.clone();
+            let thumbs = self.thumbs.clone();
             ctx.show_viewport_deferred(
                 egui::ViewportId::from_hash_of("completion-notices"),
-                super::completion_notification::viewport_builder(),
+                super::completion_notification::viewport_builder_for(
+                    self.view.notices.len(),
+                    ctx.pixels_per_point(),
+                ),
                 move |ui, _class| {
                     // Read the live snapshot: a disabled preference or dismissed
                     // notice must not survive in a deferred callback's clone.
@@ -187,18 +198,21 @@ impl eframe::App for Shell {
                         return;
                     }
                     let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut thumbs = thumbs.lock().unwrap_or_else(|e| e.into_inner());
                     let commands = if ui.ctx().input(|i| i.viewport().close_requested()) {
                         view.notices
                             .iter()
                             .map(|n| AppCommand::DismissNotice(n.view.id()))
                             .collect()
                     } else {
-                        egui::ScrollArea::vertical()
-                            .show(ui, |ui| {
-                                super::completion_notification::draw(ui, &view, &mut shown)
-                            })
-                            .inner
+                        super::completion_notification::draw_with_thumbs(
+                            ui,
+                            &view,
+                            &mut shown,
+                            &mut thumbs,
+                        )
                     };
+                    drop(thumbs);
                     drop(shown);
                     for command in commands {
                         if let Err(error) = client.submit(command) {
@@ -213,6 +227,10 @@ impl eframe::App for Shell {
             );
         } else {
             self.shown_since
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            self.thumbs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
@@ -287,51 +305,120 @@ impl eframe::App for Shell {
                     ui.colored_label(ui.visuals().error_fg_color, error.to_string());
                 }
                 ui.add_enabled_ui(self.view.lifecycle == Lifecycle::Running, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            eframe::egui::RichText::new("Capture")
+                                .strong()
+                                .color(ui.visuals().text_color()),
+                        );
+                        for (label, mode) in capture_entries() {
+                            if ui.button(label).clicked() {
+                                commands.push(AppCommand::StartCapture {
+                                    mode,
+                                    selection: Default::default(),
+                                });
+                            }
+                        }
+                        if ui.button("Upload from clipboard").clicked() {
+                            commands.push(AppCommand::UploadClipboard);
+                        }
+                        if ui.button("Upload file…").clicked() {
+                            crate::platform::windows::file_dialog::spawn_pick_and_upload(
+                                self.client.clone(),
+                                self.picker_gate.clone(),
+                            );
+                        }
+                    });
+                    if self.view.queue_paused && self.view.window != Some(Window::Uploads) {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                eframe::egui::RichText::new("Uploads are paused.")
+                                    .strong()
+                                    .color(ui.visuals().text_color()),
+                            );
+                            ui.label("Waiting jobs stay queued until you resume.");
+                            if ui.button("Resume uploads").clicked() {
+                                commands.push(AppCommand::Queue(QueueAction::ResumeAll));
+                            }
+                        });
+                    } else if !self.view.queue_paused
+                        && self.view.window != Some(Window::Uploads)
+                        && self
+                            .view
+                            .jobs
+                            .iter()
+                            .any(|job| job.paused && !job.status.is_terminal())
+                    {
+                        ui.label(
+                            "Some uploads are paused individually. Resume each one from Uploads.",
+                        );
+                    }
+                    ui.add_space(8.0);
+                    if self.view.window == Some(Window::Settings) && self.view.settings.is_some()
+                    {
+                        self.pane.show_categories(ui);
+                        ui.separator();
+                    }
+                    if self.view.window == Some(Window::History) {
+                        if self.view.settings.is_some() {
+                            commands.extend(self.history.draw(ui, &self.view));
+                        } else {
+                            ui.label("Opening local settings…");
+                        }
+                        return;
+                    }
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match (self.view.window, &self.view.settings) {
                             (Some(Window::Settings), Some(settings)) => {
-                                self.troubleshooting.draw(
-                                    ui,
-                                    settings,
-                                    &self.client,
-                                    &self.picker_gate,
-                                );
-                                self.preferences_transfer.draw(
-                                    ui,
-                                    settings,
-                                    &self.client,
-                                    &self.picker_gate,
-                                );
-                                if ui.button("Import VectrCap config…").clicked() {
-                                    crate::platform::windows::file_dialog::spawn_import_destination(
-                                        self.client.clone(),
-                                        self.picker_gate.clone(),
-                                    );
-                                }
-
-                                let zone = ui.add(
-                                    egui::Label::new(
-                                        "Drop one .vectrcap config here to review installation",
-                                    )
-                                    .sense(egui::Sense::click()),
-                                );
-
-                                if zone.hovered() {
-                                    let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
-                                    if files.len() == 1 {
-                                        match crate::app::cli::LaunchRequest::import(
-                                            files[0].path().to_path_buf().into_os_string(),
-                                        ) {
-                                            Ok(request) => commands.push(AppCommand::Launch {
-                                                request,
-                                                reply: None,
-                                            }),
-                                            Err(error) => self.client.report_error(error),
+                                match self.pane.category() {
+                                    SettingsCategory::Troubleshooting => {
+                                        self.troubleshooting.draw(
+                                            ui,
+                                            settings,
+                                            &self.client,
+                                            &self.picker_gate,
+                                        );
+                                    }
+                                    SettingsCategory::Backup => {
+                                        self.preferences_transfer.draw(
+                                            ui,
+                                            settings,
+                                            &self.client,
+                                            &self.picker_gate,
+                                        );
+                                        if ui.button("Import VectrCap config…").clicked() {
+                                            crate::platform::windows::file_dialog::spawn_import_destination(
+                                                self.client.clone(),
+                                                self.picker_gate.clone(),
+                                            );
+                                        }
+                                        let zone = ui.add(
+                                            egui::Label::new(
+                                                "Drop one .vectrcap config here to review installation",
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        if zone.hovered() {
+                                            let files =
+                                                ui.ctx().input(|i| i.raw.dropped_files.clone());
+                                            if files.len() == 1 {
+                                                match crate::app::cli::LaunchRequest::import(
+                                                    files[0].path().to_path_buf().into_os_string(),
+                                                ) {
+                                                    Ok(request) => {
+                                                        commands.push(AppCommand::Launch {
+                                                            request,
+                                                            reply: None,
+                                                        });
+                                                    }
+                                                    Err(error) => self.client.report_error(error),
+                                                }
+                                            }
                                         }
                                     }
+                                    _ => {}
                                 }
-
                                 commands.extend(self.pane.draw(
                                     ui,
                                     settings,
@@ -347,9 +434,6 @@ impl eframe::App for Shell {
                                     &self.client,
                                     &self.picker_gate,
                                 ))
-                            }
-                            (Some(Window::History), Some(_)) => {
-                                commands.extend(self.history.draw(ui, &self.view))
                             }
                             (Some(Window::BatchSummary), Some(_)) => {
                                 super::batch_summary::draw(ui, &self.view);
@@ -375,5 +459,35 @@ impl eframe::App for Shell {
     }
     fn persist_egui_memory(&self) -> bool {
         false
+    }
+}
+
+fn capture_entries() -> [(&'static str, crate::capture::request::CaptureMode); 4] {
+    use crate::capture::request::CaptureMode;
+    [
+        ("Capture region", CaptureMode::Region),
+        ("Capture window under pointer", CaptureMode::Window),
+        ("Capture fullscreen", CaptureMode::Fullscreen),
+        ("Capture last region", CaptureMode::LastRegion),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::request::CaptureMode;
+
+    #[test]
+    fn shell_capture_row_offers_the_tray_capture_modes() {
+        let entries = capture_entries();
+        assert_eq!(
+            entries.map(|(_, mode)| mode),
+            [
+                CaptureMode::Region,
+                CaptureMode::Window,
+                CaptureMode::Fullscreen,
+                CaptureMode::LastRegion,
+            ]
+        );
     }
 }

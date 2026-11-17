@@ -79,29 +79,42 @@ fn profile(ui: &mut Ui, p: &mut TaskProfile, s: &Settings) {
 pub fn draw(ui: &mut Ui, s: &Settings) -> Vec<AppCommand> {
     let mut tasks = s.tasks.clone();
     let mut archive = s.archive.clone();
-    ui.collapsing("Tasks", |ui| {
-        ui.label("Run selected tasks confirms the configured chain. Enter in the editor exposes finish actions. Direct Upload, Copy, Save and Pin run that action and the local-save policy.");
-        let mut save=tasks.save_final(&archive);
-        if ui.checkbox(&mut save,"Save final output (Always save archive policy)").changed() {
-            tasks.set_save_final(&mut archive,save);
-        }
-        ui.label("Archive storage mode is the single Save final output setting; Pending or failed follows upload intent.");
-        ui.collapsing("Global profile", |ui| profile(ui,&mut tasks.global,s));
-        ui.collapsing("Per-action / hotkey overrides", |ui| {
-            for &action in ShortcutAction::all().iter().filter(|a|a.supports_task_profile()) {
-                ui.push_id(action, |ui| {
-                    ui.collapsing(action.label(), |ui| {
-                        let mut custom=tasks.overrides.contains_key(&action);
-                        if ui.checkbox(&mut custom,"Override global task profile").changed() {
-                            if custom {tasks.overrides.insert(action,tasks.global.clone());}
-                            else {tasks.overrides.remove(&action);}
+    ui.label("Run selected tasks confirms the configured chain. Enter in the editor exposes finish actions. Direct Upload, Copy, Save and Pin run that action and the local-save policy.");
+    let mut save = tasks.save_final(&archive);
+    if ui
+        .checkbox(&mut save, "Save final output (Always save archive policy)")
+        .changed()
+    {
+        tasks.set_save_final(&mut archive, save);
+    }
+    ui.label("Archive storage mode is the single Save final output setting; Pending or failed follows upload intent.");
+    ui.collapsing("Global profile", |ui| profile(ui, &mut tasks.global, s));
+    ui.collapsing("Per-action / hotkey overrides", |ui| {
+        for &action in ShortcutAction::all()
+            .iter()
+            .filter(|a| a.supports_task_profile())
+        {
+            ui.push_id(action, |ui| {
+                ui.collapsing(action.label(), |ui| {
+                    let mut custom = tasks.overrides.contains_key(&action);
+                    if ui
+                        .checkbox(&mut custom, "Override global task profile")
+                        .changed()
+                    {
+                        if custom {
+                            tasks.overrides.insert(action, tasks.global.clone());
+                        } else {
+                            tasks.overrides.remove(&action);
                         }
-                        if let Some(p)=tasks.overrides.get_mut(&action) {profile(ui,p,s);}
-                        else {ui.label("Inherits the global task profile");}
-                    });
+                    }
+                    if let Some(p) = tasks.overrides.get_mut(&action) {
+                        profile(ui, p, s);
+                    } else {
+                        ui.label("Inherits the global task profile");
+                    }
                 });
-            }
-        });
+            });
+        }
     });
     if tasks != s.tasks || archive != s.archive {
         vec![AppCommand::SetTaskProfiles {

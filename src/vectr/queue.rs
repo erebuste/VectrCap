@@ -72,6 +72,9 @@ pub struct QueueController {
     active: Option<Active>,
     stats: HashMap<JobId, TransferStats>,
     speed_epoch: u64,
+    /// Command senders are gone. Finish the current request and do not start
+    /// another. This is not the durable Pause uploads gate.
+    closing: bool,
 }
 impl QueueController {
     pub fn new(history: Arc<History>) -> Result<Self, AppError> {
@@ -81,6 +84,7 @@ impl QueueController {
             active: None,
             stats: HashMap::new(),
             speed_epoch: 0,
+            closing: false,
         })
     }
     pub fn handle(&mut self, command: QueueCommand) -> Vec<QueueEffect> {
@@ -245,7 +249,7 @@ impl QueueController {
         Ok(())
     }
     fn schedule(&mut self, effects: &mut Vec<QueueEffect>) -> Result<(), AppError> {
-        if self.active.is_some() || self.history.queue_paused()? {
+        if self.closing || self.active.is_some() || self.history.queue_paused()? {
             return Ok(());
         }
         if let Some(job) = self.history.next_upload()? {
@@ -336,7 +340,8 @@ impl QueueController {
     }
     /// Single-worker driver. Commands and payload events have bounded channels;
     /// a paused request settles through Uploader before its lease can be reused.
-    /// Dropping command senders durably pauses the queue and drains the request.
+    /// Dropping command senders drains the current request and leaves the
+    /// durable pause unchanged, so the next launch keeps uploading.
     pub async fn serve(
         mut self,
         uploader: Arc<Uploader>,
@@ -420,7 +425,19 @@ impl QueueController {
                         self.handle(command)
                     } else {
                         closed = true;
-                        self.handle(QueueCommand::PauseAll)
+                        self.closing = true;
+                        self.speed_epoch = self.speed_epoch.wrapping_add(1);
+                        for stats in self.stats.values_mut() {
+                            stats.pause();
+                        }
+                        uploader
+                            .stopping
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(active) = &self.active {
+                            vec![QueueEffect::Pausing(active.job)]
+                        } else {
+                            Vec::new()
+                        }
                     };
                     effects.push(QueueEffect::StateChanged);
                     uploader.notify_controls();

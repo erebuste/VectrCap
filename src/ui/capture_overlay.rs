@@ -2,6 +2,7 @@
 //! networking remain with the controller. Each completed gesture is one command.
 mod gesture;
 mod surface;
+mod toolbar;
 
 use super::{
     annotation_toolbar::{AnnotationTool, ToolOptions},
@@ -154,6 +155,7 @@ pub enum CaptureOverlayEvent {
 pub struct CaptureOverlay {
     recording_selection: bool,
     recording_summary: String,
+    toolbar_monitor: Option<PhysicalRect>,
     selection_title: &'static str,
     tool: AnnotationTool,
     last_drawing_tool: AnnotationTool,
@@ -188,6 +190,7 @@ impl CaptureOverlay {
         Self {
             recording_selection: false,
             recording_summary: String::new(),
+            toolbar_monitor: None,
             selection_title: "Select recording area",
             tool: Default::default(),
             last_drawing_tool: AnnotationTool::Freehand,
@@ -245,10 +248,16 @@ impl CaptureOverlay {
         threshold: (u32, u32),
     ) -> Result<Self, AppError> {
         let preferences = snapshot.preferences().clone();
+        let toolbar_monitor = snapshot
+            .monitors()
+            .iter()
+            .find(|m| m.bounds().contains(pointer))
+            .and_then(|m| m.bounds().intersection(snapshot.bounds()));
         // Freeze the inventory first, then transfer the original pixel Vec.
         let selection = SelectionModel::new(&snapshot, preferences.clone(), pointer, threshold)?;
         let mut overlay = Self::new(EditorDocument::new(snapshot)?);
         overlay.selection = Some(selection);
+        overlay.toolbar_monitor = toolbar_monitor;
         overlay.preferences = preferences;
         overlay.pointer = Some(pointer);
         Ok(overlay)

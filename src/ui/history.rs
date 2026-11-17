@@ -29,6 +29,7 @@ pub struct HistoryPane {
     last_layout: Option<HistoryLayout>,
     last_columns: Option<usize>,
     scroll_anchor: usize,
+    queue_paused: bool,
 }
 impl HistoryPane {
     pub fn suspend(&mut self) {
@@ -36,6 +37,7 @@ impl HistoryPane {
         self.previews.suspend();
     }
     pub fn draw(&mut self, ui: &mut Ui, view: &DesktopView) -> Vec<AppCommand> {
+        self.queue_paused = view.queue_paused;
         let mut commands = vec![];
         let preferences = view
             .settings
@@ -43,42 +45,45 @@ impl HistoryPane {
             .map(|s| s.history.clone())
             .unwrap_or_default();
         let mut prefs = preferences.clone();
-        ui.horizontal_wrapped(|ui| {
+        let muted = ui.visuals().weak_text_color();
+        ui.horizontal(|ui| {
             ui.heading("History");
-            ui.selectable_value(&mut prefs.layout, HistoryLayout::Gallery, "Gallery");
-            ui.selectable_value(&mut prefs.layout, HistoryLayout::List, "List");
-            ui.checkbox(&mut prefs.preview, "Preview");
+            if ui.available_width() > 280.0 {
+                ui.label(
+                    egui::RichText::new("All your captures and files")
+                        .small()
+                        .color(muted),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(prefs.preview, "Preview").clicked() {
+                    prefs.preview = !prefs.preview;
+                }
+                ui.selectable_value(&mut prefs.layout, HistoryLayout::List, "List");
+                ui.selectable_value(&mut prefs.layout, HistoryLayout::Gallery, "Gallery");
+            });
         });
         if prefs != preferences {
             commands.push(AppCommand::SetHistoryPreferences(prefs.clone()));
         }
-        let search = ui.add(
-            egui::TextEdit::singleline(&mut self.query.search)
-                .hint_text("Search filename, type, or sharing link")
-                .char_limit(64),
-        );
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
-            search.request_focus();
-        }
-        self.query.search.retain(|c| !c.is_control());
-        let mut changed = search.changed();
+        let mut changed = false;
+        let mut dates_changed = false;
+        let mut search_focused = false;
         ui.horizontal_wrapped(|ui| {
-            for (label, kind) in [
-                ("All", HistoryType::All),
-                ("Images", HistoryType::Images),
-                ("Recordings", HistoryType::Recordings),
-                ("Files", HistoryType::Files),
-            ] {
-                changed |= ui
-                    .selectable_value(&mut self.query.kind, kind, label)
-                    .changed();
+            let search_width = (ui.available_width() - 360.0).clamp(140.0, 520.0);
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.query.search)
+                    .hint_text("Search captures, files, or links")
+                    .desired_width(search_width)
+                    .char_limit(64),
+            );
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+                search.request_focus();
             }
-            changed |= ui
-                .checkbox(&mut self.query.favorites_only, "Favorites")
-                .changed();
-        });
-        ui.horizontal_wrapped(|ui| {
+            changed = search.changed();
+            search_focused = search.has_focus();
             egui::ComboBox::from_id_salt("history-status")
+                .width(132.0)
                 .selected_text(status_filter(self.query.status))
                 .show_ui(ui, |ui| {
                     for value in [
@@ -95,6 +100,48 @@ impl HistoryPane {
                             .changed();
                     }
                 });
+            ui.label(egui::RichText::new("From").small().color(muted));
+            dates_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.since)
+                        .id(egui::Id::unique("history-since"))
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(96.0)
+                        .char_limit(10),
+                )
+                .changed();
+            ui.label(egui::RichText::new("Through").small().color(muted));
+            dates_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.until)
+                        .id(egui::Id::unique("history-until"))
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(96.0)
+                        .char_limit(10),
+                )
+                .changed();
+        });
+        self.query.search.retain(|c| !c.is_control());
+        ui.horizontal_wrapped(|ui| {
+            for (label, kind) in [
+                ("All", HistoryType::All),
+                ("Images", HistoryType::Images),
+                ("Recordings", HistoryType::Recordings),
+                ("Files", HistoryType::Files),
+            ] {
+                changed |= ui
+                    .selectable_value(&mut self.query.kind, kind, label)
+                    .changed();
+            }
+            let favorites = ui
+                .selectable_label(self.query.favorites_only, "Favorites")
+                .on_hover_text(
+                    "Favorites bookmark records. They do not prevent cleanup or change retention.",
+                );
+            if favorites.clicked() {
+                self.query.favorites_only = !self.query.favorites_only;
+                changed = true;
+            }
             egui::ComboBox::from_id_salt("history-sort")
                 .selected_text(sort_label(self.query.sort))
                 .show_ui(ui, |ui| {
@@ -110,29 +157,6 @@ impl HistoryPane {
                     }
                 });
         });
-        let mut dates_changed = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("From");
-            dates_changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.since)
-                        .id(egui::Id::unique("history-since"))
-                        .hint_text("YYYY-MM-DD")
-                        .desired_width(100.0)
-                        .char_limit(10),
-                )
-                .changed();
-            ui.label("Through");
-            dates_changed |= ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.until)
-                        .id(egui::Id::unique("history-until"))
-                        .hint_text("YYYY-MM-DD")
-                        .desired_width(100.0)
-                        .char_limit(10),
-                )
-                .changed();
-        });
         if dates_changed {
             match date_range(&self.since, &self.until) {
                 Ok((since, until)) => {
@@ -144,7 +168,6 @@ impl HistoryPane {
                 Err(error) => self.date_error = Some(error),
             }
         }
-        ui.small("Favorites bookmark records; they do not prevent cleanup or change retention.");
         if let Some(error) = self.date_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
             return commands;
@@ -171,7 +194,7 @@ impl HistoryPane {
         }
         let records = &view.history_page.records;
         self.previews.update(ui.ctx(), records);
-        let editing = search.has_focus()
+        let editing = search_focused
             || ui.memory(|m| {
                 m.has_focus(egui::Id::unique("history-since"))
                     || m.has_focus(egui::Id::unique("history-until"))
@@ -186,49 +209,6 @@ impl HistoryPane {
                 self.remove = Some(self.selection.clone());
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} selected", self.selection.len()));
-            if ui
-                .add_enabled(
-                    !self.selection.is_empty(),
-                    egui::Button::new("Copy successful links"),
-                )
-                .clicked()
-            {
-                commands.push(action(self.selection.clone(), HistoryAction::CopyLinks));
-            }
-            if ui
-                .add_enabled(
-                    !self.selection.is_empty(),
-                    egui::Button::new("Retry failed uploads"),
-                )
-                .clicked()
-            {
-                commands.push(action(self.selection.clone(), HistoryAction::RetryFailed));
-            }
-            if ui
-                .add_enabled(
-                    !self.selection.is_empty(),
-                    egui::Button::new("Remove from history"),
-                )
-                .clicked()
-            {
-                self.remove = Some(self.selection.clone());
-            }
-            if ui
-                .add_enabled(
-                    self.selection.len() == 1,
-                    egui::Button::new("Delete local copy..."),
-                )
-                .clicked()
-            {
-                self.delete_local = Some(self.selection.clone());
-            }
-            if ui.button("Clear selection").clicked() {
-                self.selection.clear();
-                self.active = None;
-            }
-        });
         if self
             .delete_local
             .as_ref()
@@ -265,47 +245,55 @@ impl HistoryPane {
                 });
             });
         }
-        if records.is_empty() {
-            ui.label("No matching history items.");
-        }
         let selected = records.iter().find(|r| Some(r.id) == self.active);
-        if prefs.preview && ui.available_width() >= 900.0 && selected.is_some() {
-            let width = ui.available_width();
+        let available = ui.available_height();
+        let workspace = if available.is_finite() {
+            (available - 108.0).max(140.0)
+        } else {
+            480.0
+        };
+        if prefs.preview && ui.available_width() >= 720.0 {
+            let total = ui.available_width();
+            let inspector_width = (total * 0.34).clamp(220.0, 270.0);
+            let results_width = (total - inspector_width - 12.0).max(160.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(width - 350.0, 560.0),
+                    egui::vec2(results_width, workspace),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| self.results(ui, records, &prefs, &mut commands),
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inspector_width, workspace),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        self.results(
-                            ui,
-                            records,
-                            &prefs,
-                            view.history_page.has_more,
-                            &mut commands,
-                        )
+                        egui::ScrollArea::vertical()
+                            .id_salt("history-inspector")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.inspector(ui, selected, &mut commands));
                     },
-                );
-                ui.separator();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(320.0, 560.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.inspector(ui, selected.unwrap(), &mut commands),
                 );
             });
         } else {
-            self.results(
-                ui,
-                records,
-                &prefs,
-                view.history_page.has_more,
-                &mut commands,
+            let results_height = if prefs.preview {
+                (workspace * 0.58).max(120.0)
+            } else {
+                workspace
+            };
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), results_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| self.results(ui, records, &prefs, &mut commands),
             );
-            if prefs.preview
-                && let Some(record) = records.iter().find(|r| Some(r.id) == self.active)
-            {
-                self.inspector(ui, record, &mut commands);
+            if prefs.preview {
+                ui.separator();
+                let inspector_height = (workspace - results_height).max(120.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("history-inspector")
+                    .max_height(inspector_height)
+                    .show(ui, |ui| self.inspector(ui, selected, &mut commands));
             }
         }
+        self.footer(ui, records, view.history_page.has_more, &mut commands);
 
         commands
     }
@@ -314,22 +302,40 @@ impl HistoryPane {
         ui: &mut Ui,
         records: &[HistoryRecord],
         prefs: &crate::persistence::settings::HistoryPreferences,
-        has_more: bool,
         commands: &mut Vec<AppCommand>,
     ) {
-        let columns = if prefs.layout == HistoryLayout::Gallery {
-            ((ui.available_width() / 160.0).floor() as usize).clamp(1, 6)
+        let muted = ui.visuals().weak_text_color();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Recent activity").small().color(muted));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} items", records.len()))
+                        .small()
+                        .color(muted),
+                );
+            });
+        });
+        if records.is_empty() {
+            ui.label("No matching items. Try another search or clear your filters.");
+        }
+        let gallery = prefs.layout == HistoryLayout::Gallery;
+        let columns = if gallery {
+            ((ui.available_width() / 168.0).floor() as usize).clamp(1, 6)
         } else {
             1
         };
-        let row_height = if prefs.layout == HistoryLayout::Gallery {
-            210.0
+        let row_height = if gallery { 184.0 } else { 52.0 };
+        let card_height = if gallery { 172.0 } else { row_height };
+        let available = ui.available_height();
+        let max_height = if available.is_finite() && available > 48.0 {
+            available
         } else {
-            82.0
+            480.0
         };
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt("history-results")
-            .max_height(if prefs.preview { 340.0 } else { 520.0 });
+            .max_height(max_height)
+            .auto_shrink([false, false]);
         if self.last_layout != Some(prefs.layout) || self.last_columns != Some(columns) {
             scroll =
                 scroll.vertical_scroll_offset((self.scroll_anchor / columns) as f32 * row_height);
@@ -343,12 +349,12 @@ impl HistoryPane {
             |ui, range| {
                 self.scroll_anchor = range.start * columns;
                 for row in range {
-                    if prefs.layout == HistoryLayout::Gallery {
+                    if gallery {
                         let width = (ui.available_width() / columns as f32 - 8.0).max(120.0);
                         ui.horizontal(|ui| {
                             for index in row * columns..((row + 1) * columns).min(records.len()) {
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(width, 200.0),
+                                    egui::vec2(width, card_height),
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
                                         self.item(
@@ -369,56 +375,82 @@ impl HistoryPane {
                 }
             },
         );
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.previous.is_empty(), egui::Button::new("Previous"))
-                .clicked()
-            {
-                self.query.after = self.previous.pop().unwrap();
-                commands.push(AppCommand::QueryHistory(self.query.clone()));
-                self.scroll_anchor = 0;
-                self.anchor = 0;
-                self.last_layout = None;
-            }
-            if ui
-                .add_enabled(has_more, egui::Button::new("Next"))
-                .clicked()
-                && let Some(last) = records.last()
-            {
-                self.previous.push(self.query.after.clone());
-                self.query.after = Some(HistoryCursor::at(last));
-                commands.push(AppCommand::QueryHistory(self.query.clone()));
-                self.scroll_anchor = 0;
-                self.anchor = 0;
-                self.last_layout = None;
-            }
-        });
     }
-    fn inspector(&mut self, ui: &mut Ui, record: &HistoryRecord, commands: &mut Vec<AppCommand>) {
-        ui.separator();
-        ui.heading(&record.name);
-        if let Some(m) = &record.recording {
-            ui.label(super::recording_review::metadata_label(m));
+    fn inspector(
+        &mut self,
+        ui: &mut Ui,
+        record: Option<&HistoryRecord>,
+        commands: &mut Vec<AppCommand>,
+    ) {
+        ui.label(egui::RichText::new("Preview & details").strong());
+        let Some(record) = record else {
+            ui.label("Select a capture or file to see its preview and actions.");
+            return;
+        };
+        ui.add_space(4.0);
+        let _preview = self.picture(ui, record, ui.available_width(), 140.0);
+        ui.label(egui::RichText::new(&record.name).strong());
+        let when = created_label(record.created_ms);
+        if !when.is_empty() {
+            ui.label(when);
         }
-        self.picture(ui, record, ui.available_width().min(640.0), 360.0);
-        if let Some(date) = chrono::DateTime::from_timestamp_millis(record.created_ms) {
-            ui.label(
-                date.with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string(),
-            );
-        }
-        ui.label(format!(
-            "{} | {} bytes | {}",
-            record.kind,
-            record.size,
-            status(record.job.as_ref().map(|j| &j.status))
-        ));
+        ui.label(&record.kind);
+        let status = self.status_line(record);
+        ui.colored_label(status_color(ui, status), status);
         ui.label(if record.local_available {
             "Local file available"
         } else {
-            "Local file unavailable"
+            "Local file missing"
         });
+        let confirmed = record
+            .job
+            .as_ref()
+            .is_some_and(|job| matches!(job.status, JobStatus::Completed(_)));
+        if let Some(url) = share_url(record) {
+            ui.add(egui::Label::new(url).selectable(true).wrap());
+        } else {
+            ui.label(
+                egui::RichText::new("No share link yet")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+        if record.retryable {
+            if wide_button(ui, "Retry upload", true, true) {
+                commands.push(action(vec![record.id], HistoryAction::RetryFailed));
+            }
+        } else if wide_button(ui, "Copy link", confirmed, true) {
+            commands.push(action(vec![record.id], HistoryAction::CopyLinks));
+        }
+        if wide_button(ui, "Open link", confirmed, false) {
+            commands.push(action(vec![record.id], HistoryAction::OpenLink));
+        }
+        let open_file =
+            record.local_available && AppController::viewer_extension(&record.artifact).is_some();
+        if wide_button(ui, "Open file", open_file, false) {
+            commands.push(action(vec![record.id], HistoryAction::OpenLocal));
+        }
+        if wide_button(ui, "Show folder", record.local_available, false) {
+            commands.push(action(vec![record.id], HistoryAction::ShowFolder));
+        }
+        let pin = record.local_available && crate::pin::source::is_raster_name(&record.name);
+        if wide_button(ui, "Pin", pin, false) {
+            commands.push(action(vec![record.id], HistoryAction::Pin));
+        }
+        if wide_button(ui, "Remove from history...", true, false) {
+            self.remove = Some(vec![record.id]);
+        }
+        ui.separator();
+        ui.label(format!("Size  {}", format_size(record.size)));
+        ui.label(format!("Kind  {}", record.kind));
+        if let Some(meta) = &record.recording {
+            ui.label(format!(
+                "{} x {}  ·  {:.1}s",
+                meta.width,
+                meta.height,
+                meta.active_millis as f64 / 1000.0
+            ));
+        }
         if record.local_available {
             ui.add(
                 egui::Label::new(record.artifact.path.to_string_lossy())
@@ -428,45 +460,51 @@ impl HistoryPane {
         }
         if let Some(job) = &record.job {
             ui.label(&job.destination.label);
-            ui.label(
-                job.destination
-                    .link_domain
-                    .as_ref()
-                    .map(|o| o.as_str())
-                    .unwrap_or("uploader default"),
-            );
-            if let JobStatus::Completed(receipt) = &job.status {
-                ui.add(egui::Label::new(receipt.url()).selectable(true).wrap());
-            }
             if let JobStatus::Failed { code } = &job.status {
                 ui.label(format!("Failure: {code}"));
             }
         }
-        ui.horizontal_wrapped(|ui| item_actions(ui, record, commands, &mut self.remove));
     }
-    fn picture(&self, ui: &mut Ui, record: &HistoryRecord, width: f32, height: f32) {
+    fn picture(
+        &self,
+        ui: &mut Ui,
+        record: &HistoryRecord,
+        width: f32,
+        height: f32,
+    ) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
         if let Some(Some(texture)) = self.previews.images.get(&record.id) {
             let original = texture.size_vec2();
-            let size = original * ((width / original.x).min(height / original.y));
-            ui.image((texture.id(), size));
+            if original.x > 0.0 && original.y > 0.0 {
+                let size = original * ((width / original.x).min(height / original.y));
+                let image_rect = egui::Rect::from_center_size(rect.center(), size);
+                ui.painter().image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
         } else {
-            ui.allocate_ui(egui::vec2(width, height.min(105.0)), |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(if !record.local_available {
-                        "Local preview unavailable"
-                    } else if self.previews.images.contains_key(&record.id) {
-                        match record.kind.as_str() {
-                            "mp4" => "MP4 recording",
-                            "gif" => "GIF recording",
-                            "screenshot" => "Image preview unavailable",
-                            _ => "File",
-                        }
-                    } else {
-                        "Loading preview..."
-                    });
-                });
-            });
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(4),
+                ui.visuals().faint_bg_color,
+            );
+            if height > 36.0 {
+                let font = egui::TextStyle::Small.resolve(ui.style());
+                let color = ui.visuals().weak_text_color();
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    preview_placeholder(self, record),
+                    font,
+                    color,
+                );
+            }
         }
+        response
     }
     fn item(
         &mut self,
@@ -478,83 +516,413 @@ impl HistoryPane {
         commands: &mut Vec<AppCommand>,
     ) {
         ui.push_id(record.id, |ui| {
-            if gallery {
-                self.picture(ui, record, ui.available_width(), 105.0);
-            }
-            let response = ui
-                .add(
-                    egui::Button::selectable(self.selection.contains(&record.id), &record.name)
-                        .truncate(),
-                )
-                .on_hover_text(&record.name);
-            if response.clicked() {
-                let modifiers = ui.input(|i| i.modifiers);
-                if modifiers.shift {
-                    for row in &records
-                        [self.anchor.min(index)..=self.anchor.max(index).min(records.len() - 1)]
-                    {
-                        if !self.selection.contains(&row.id) && self.selection.len() < 100 {
-                            self.selection.push(row.id);
-                        }
-                    }
-                } else if modifiers.command {
-                    if let Some(position) = self.selection.iter().position(|id| *id == record.id) {
-                        self.selection.remove(position);
-                    } else if self.selection.len() < 100 {
-                        self.selection.push(record.id);
-                    }
-                } else {
-                    self.selection = vec![record.id];
-                }
-                self.active = Some(record.id);
-                self.anchor = index;
-            }
-            if response.double_clicked()
-                || (response.has_focus()
-                    && ui.input(|i| {
-                        i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)
-                    }))
-            {
-                self.active = Some(record.id);
-                self.selection = vec![record.id];
-                commands.push(AppCommand::SetHistoryPreferences(
-                    crate::persistence::settings::HistoryPreferences {
-                        layout: self.last_layout.unwrap_or(HistoryLayout::Gallery),
-                        preview: true,
-                    },
-                ));
-            }
-            response.context_menu(|ui| item_actions(ui, record, commands, &mut self.remove));
-            let date = if gallery {
-                String::new()
+            let active = self.active == Some(record.id);
+            let stroke = if gallery && active {
+                egui::Stroke::new(1.5, ui.visuals().selection.bg_fill)
+            } else if gallery {
+                ui.visuals().widgets.noninteractive.bg_stroke
             } else {
-                chrono::DateTime::from_timestamp_millis(record.created_ms)
-                    .map(|d| {
-                        d.with_timezone(&chrono::Local)
-                            .format(" | %Y-%m-%d %H:%M")
-                            .to_string()
-                    })
-                    .unwrap_or_default()
+                egui::Stroke::NONE
             };
-            let metadata = format!(
-                "{} | {} bytes | {}{date}",
-                record.kind,
-                record.size,
-                status(record.job.as_ref().map(|j| &j.status))
-            );
-            ui.add(egui::Label::new(egui::RichText::new(&metadata).small()).truncate())
-                .on_hover_text(metadata);
+            let fill = if gallery {
+                ui.visuals().extreme_bg_color
+            } else if active {
+                active_fill(ui)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            egui::Frame::new()
+                .fill(fill)
+                .stroke(stroke)
+                .corner_radius(egui::CornerRadius::same(5))
+                .inner_margin(egui::Margin::symmetric(6, 4))
+                .show(ui, |ui| {
+                    if gallery {
+                        self.gallery_card(ui, record, index, records, commands);
+                    } else {
+                        self.list_row(ui, record, index, records, commands);
+                    }
+                })
+                .response
+                .context_menu(|ui| item_actions(ui, record, commands, &mut self.remove));
+        });
+    }
+    fn gallery_card(
+        &mut self,
+        ui: &mut Ui,
+        record: &HistoryRecord,
+        index: usize,
+        records: &[HistoryRecord],
+        commands: &mut Vec<AppCommand>,
+    ) {
+        ui.horizontal(|ui| {
+            self.selection_box(ui, record.id);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.star(ui, record, commands);
+            });
+        });
+        let thumb = self.picture(ui, record, ui.available_width(), 84.0);
+        self.use_hit(ui, &thumb, record, index, records, commands);
+        let name = self.name_button(ui, record);
+        self.use_hit(ui, &name, record, index, records, commands);
+        self.status_row(ui, record);
+    }
+    fn list_row(
+        &mut self,
+        ui: &mut Ui,
+        record: &HistoryRecord,
+        index: usize,
+        records: &[HistoryRecord],
+        commands: &mut Vec<AppCommand>,
+    ) {
+        let status = self.status_line(record);
+        let meta = self.meta_line(record);
+        let (thumb, name) = ui
+            .horizontal(|ui| {
+                self.selection_box(ui, record.id);
+                let thumb = self.picture(ui, record, 28.0, 28.0);
+                let name = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.star(ui, record, commands);
+                        ui.label(
+                            egui::RichText::new(format_size(record.size))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.colored_label(status_color(ui, status), status);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(ui.available_width());
+                            let name = self.name_button(ui, record);
+                            ui.label(
+                                egui::RichText::new(&meta)
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                            name
+                        })
+                        .inner
+                    })
+                    .inner;
+                (thumb, name)
+            })
+            .inner;
+        self.use_hit(ui, &thumb, record, index, records, commands);
+        self.use_hit(ui, &name, record, index, records, commands);
+    }
+    fn footer(
+        &mut self,
+        ui: &mut Ui,
+        records: &[HistoryRecord],
+        has_more: bool,
+        commands: &mut Vec<AppCommand>,
+    ) {
+        ui.separator();
+        let muted = ui.visuals().weak_text_color();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} on this page", records.len()));
+            let failed = page_failed(records);
+            if failed > 0 {
+                ui.colored_label(ui.visuals().error_fg_color, format!("{failed} failed"));
+            }
+            let busy = page_in_progress(records, self.queue_paused);
+            if busy > 0 {
+                ui.label(format!("{busy} in progress"));
+            }
+            if self.selection.is_empty() {
+                ui.label(egui::RichText::new("Ctrl+F to search").small().color(muted));
+            }
+        });
+        if !self.selection.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} selected", self.selection.len()));
+                if ui.button("Copy successful links").clicked() {
+                    commands.push(action(self.selection.clone(), HistoryAction::CopyLinks));
+                }
+                if ui.button("Retry failed uploads").clicked() {
+                    commands.push(action(self.selection.clone(), HistoryAction::RetryFailed));
+                }
+                if ui.button("Remove from history").clicked() {
+                    self.remove = Some(self.selection.clone());
+                }
+                if self.selection.len() == 1 && ui.button("Delete local copy...").clicked() {
+                    self.delete_local = Some(self.selection.clone());
+                }
+                if ui.button("Clear selection").clicked() {
+                    self.selection.clear();
+                    self.active = None;
+                }
+            });
+        }
+        ui.horizontal(|ui| {
             if ui
-                .small_button(if record.favorite { "Unstar" } else { "Star" })
+                .add_enabled(!self.previous.is_empty(), egui::Button::new("Previous"))
                 .clicked()
             {
-                commands.push(AppCommand::SetHistoryFavorite {
-                    id: record.id,
-                    favorite: !record.favorite,
-                });
+                self.show_previous(commands);
+            }
+            if ui
+                .add_enabled(has_more, egui::Button::new("Next"))
+                .clicked()
+            {
+                self.show_next(records, commands);
             }
         });
     }
+    fn show_previous(&mut self, commands: &mut Vec<AppCommand>) {
+        self.query.after = self.previous.pop().unwrap();
+        commands.push(AppCommand::QueryHistory(self.query.clone()));
+        self.scroll_anchor = 0;
+        self.anchor = 0;
+        self.last_layout = None;
+    }
+    fn show_next(&mut self, records: &[HistoryRecord], commands: &mut Vec<AppCommand>) {
+        let Some(last) = records.last() else {
+            return;
+        };
+        self.previous.push(self.query.after.clone());
+        self.query.after = Some(HistoryCursor::at(last));
+        commands.push(AppCommand::QueryHistory(self.query.clone()));
+        self.scroll_anchor = 0;
+        self.anchor = 0;
+        self.last_layout = None;
+    }
+    fn selection_box(&mut self, ui: &mut Ui, id: Uuid) {
+        let mut checked = self.selection.contains(&id);
+        if ui.checkbox(&mut checked, "").changed() {
+            self.set_checked(id, checked);
+        }
+    }
+    fn set_checked(&mut self, id: Uuid, selected: bool) {
+        let present = self.selection.contains(&id);
+        if selected && !present && self.selection.len() < 100 {
+            self.selection.push(id);
+            self.active = Some(id);
+        } else if !selected && present {
+            self.selection.retain(|existing| *existing != id);
+            if self.active == Some(id) {
+                self.active = self.selection.last().copied();
+            }
+        }
+    }
+    fn choose(
+        &mut self,
+        id: Uuid,
+        index: usize,
+        records: &[HistoryRecord],
+        modifiers: egui::Modifiers,
+    ) {
+        if modifiers.shift && !records.is_empty() {
+            let end = self.anchor.max(index).min(records.len() - 1);
+            let start = self.anchor.min(index).min(end);
+            for row in &records[start..=end] {
+                if !self.selection.contains(&row.id) && self.selection.len() < 100 {
+                    self.selection.push(row.id);
+                }
+            }
+        } else if modifiers.command {
+            self.set_checked(id, !self.selection.contains(&id));
+        } else {
+            self.selection = vec![id];
+        }
+        self.active = Some(id);
+        self.anchor = index;
+    }
+    fn use_hit(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        record: &HistoryRecord,
+        index: usize,
+        records: &[HistoryRecord],
+        commands: &mut Vec<AppCommand>,
+    ) {
+        if response.clicked() {
+            self.choose(record.id, index, records, ui.input(|i| i.modifiers));
+        }
+        if response.double_clicked()
+            || (response.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space)))
+        {
+            self.active = Some(record.id);
+            self.selection = vec![record.id];
+            commands.push(AppCommand::SetHistoryPreferences(
+                crate::persistence::settings::HistoryPreferences {
+                    layout: self.last_layout.unwrap_or(HistoryLayout::Gallery),
+                    preview: true,
+                },
+            ));
+        }
+        response.context_menu(|ui| item_actions(ui, record, commands, &mut self.remove));
+    }
+    fn name_button(&self, ui: &mut Ui, record: &HistoryRecord) -> egui::Response {
+        ui.add_sized(
+            [ui.available_width(), 18.0],
+            egui::Button::new(&record.name).truncate().frame(false),
+        )
+        .on_hover_text(&record.name)
+    }
+    fn star(&mut self, ui: &mut Ui, record: &HistoryRecord, commands: &mut Vec<AppCommand>) {
+        let mark = if record.favorite { "★" } else { "☆" };
+        if ui
+            .add(egui::Button::new(mark).frame(false))
+            .on_hover_text(
+                "Favorites bookmark records. They do not prevent cleanup or change retention.",
+            )
+            .clicked()
+        {
+            commands.push(AppCommand::SetHistoryFavorite {
+                id: record.id,
+                favorite: !record.favorite,
+            });
+        }
+    }
+    fn status_row(&self, ui: &mut Ui, record: &HistoryRecord) {
+        let status = self.status_line(record);
+        let color = status_color(ui, status);
+        let muted = ui.visuals().weak_text_color();
+        ui.horizontal(|ui| {
+            ui.colored_label(color, "●");
+            ui.label(egui::RichText::new(status).small().color(color));
+            ui.label(
+                egui::RichText::new(format_size(record.size))
+                    .small()
+                    .color(muted),
+            );
+        });
+        if !record.local_available {
+            ui.label(
+                egui::RichText::new("Local file missing")
+                    .small()
+                    .color(warn_color(ui)),
+            );
+        }
+    }
+    fn status_line(&self, record: &HistoryRecord) -> &'static str {
+        job_status(
+            record.job.as_ref().map(|job| &job.status),
+            record.job.as_ref().is_some_and(|job| job.paused),
+            self.queue_paused,
+        )
+    }
+    fn meta_line(&self, record: &HistoryRecord) -> String {
+        let when = created_label(record.created_ms);
+        let missing = if record.local_available {
+            ""
+        } else {
+            " · Local file missing"
+        };
+        format!("{when} · {}{missing}", record.kind)
+    }
+}
+fn preview_placeholder(pane: &HistoryPane, record: &HistoryRecord) -> &'static str {
+    if !record.local_available {
+        "Local preview unavailable"
+    } else if pane.previews.images.contains_key(&record.id) {
+        match record.kind.as_str() {
+            "mp4" => "MP4 recording",
+            "gif" => "GIF recording",
+            "screenshot" => "Image preview unavailable",
+            _ => "File",
+        }
+    } else {
+        "Loading preview..."
+    }
+}
+fn created_label(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|date| {
+            date.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+fn format_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if size >= GB {
+        format!("{:.1} GB", size as f64 / GB as f64)
+    } else if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{:.1} KB", size as f64 / KB as f64)
+    } else {
+        format!("{size} B")
+    }
+}
+fn warn_color(ui: &Ui) -> egui::Color32 {
+    if ui.visuals().override_text_color.is_some() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().warn_fg_color
+    }
+}
+fn status_color(ui: &Ui, label: &str) -> egui::Color32 {
+    if ui.visuals().override_text_color.is_some() {
+        return ui.visuals().text_color();
+    }
+    let visuals = ui.visuals();
+    match label {
+        "Failed" | "Cancelled" => visuals.error_fg_color,
+        "Uncertain" => visuals.warn_fg_color,
+        "Uploading" | "Pausing" | "Waiting" => visuals.selection.bg_fill,
+        _ if label.starts_with("Paused") => visuals.warn_fg_color,
+        _ => visuals.weak_text_color(),
+    }
+}
+fn active_fill(ui: &Ui) -> egui::Color32 {
+    let color = ui.visuals().selection.bg_fill;
+    if ui.visuals().override_text_color.is_some() {
+        color.linear_multiply(0.55)
+    } else {
+        color.linear_multiply(0.28)
+    }
+}
+fn wide_button(ui: &mut Ui, label: &str, enabled: bool, primary: bool) -> bool {
+    let button = if primary {
+        egui::Button::new(egui::RichText::new(label).color(ui.visuals().selection.stroke.color))
+            .fill(ui.visuals().selection.bg_fill)
+    } else {
+        egui::Button::new(label)
+    };
+    ui.add_enabled(
+        enabled,
+        button.min_size(egui::vec2(ui.available_width(), 22.0)),
+    )
+    .clicked()
+}
+fn share_url(record: &HistoryRecord) -> Option<String> {
+    record.job.as_ref().and_then(|job| match &job.status {
+        JobStatus::Completed(receipt) => Some(receipt.url().to_string()),
+        _ => None,
+    })
+}
+fn page_failed(records: &[HistoryRecord]) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.job.as_ref().map(|job| &job.status),
+                Some(JobStatus::Failed { .. })
+            )
+        })
+        .count()
+}
+fn page_in_progress(records: &[HistoryRecord], queue_paused: bool) -> usize {
+    records
+        .iter()
+        .filter(|record| {
+            let Some(job) = &record.job else {
+                return false;
+            };
+            match &job.status {
+                JobStatus::Running => true,
+                JobStatus::Pending | JobStatus::Interrupted => !job.paused && !queue_paused,
+                _ => false,
+            }
+        })
+        .count()
 }
 fn action(ids: Vec<Uuid>, action: HistoryAction) -> AppCommand {
     AppCommand::HistoryAction { ids, action }
@@ -595,15 +963,19 @@ fn item_actions(
     }
 }
 
-fn status(status: Option<&JobStatus>) -> &'static str {
+fn job_status(status: Option<&JobStatus>, paused: bool, queue_paused: bool) -> &'static str {
     match status {
         None => "Local only",
         Some(JobStatus::Completed(_)) => "Uploaded",
         Some(JobStatus::Failed { .. }) => "Failed",
         Some(JobStatus::Cancelled) => "Cancelled",
         Some(JobStatus::Uncertain) => "Uncertain",
+        Some(JobStatus::Running) if paused || queue_paused => "Pausing",
         Some(JobStatus::Running) => "Uploading",
-        _ => "Waiting",
+        Some(_) if paused && queue_paused => "Paused by job and queue",
+        Some(_) if paused => "Paused by job",
+        Some(_) if queue_paused => "Paused by queue",
+        Some(_) => "Waiting",
     }
 }
 fn status_filter(s: HistoryStatus) -> &'static str {
@@ -734,5 +1106,56 @@ mod tests {
             }
         }
         pane.suspend();
+    }
+
+    #[test]
+    fn paused_uploads_are_not_labeled_waiting() {
+        assert_eq!(
+            job_status(Some(&JobStatus::Pending), false, true),
+            "Paused by queue"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Interrupted), true, false),
+            "Paused by job"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Pending), true, true),
+            "Paused by job and queue"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Running), false, true),
+            "Pausing"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Running), false, false),
+            "Uploading"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Pending), false, false),
+            "Waiting"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Interrupted), false, false),
+            "Waiting"
+        );
+        assert_eq!(job_status(None, false, true), "Local only");
+        assert_eq!(
+            job_status(
+                Some(&JobStatus::Failed {
+                    code: "network".into()
+                }),
+                false,
+                true
+            ),
+            "Failed"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Cancelled), true, true),
+            "Cancelled"
+        );
+        assert_eq!(
+            job_status(Some(&JobStatus::Uncertain), false, true),
+            "Uncertain"
+        );
     }
 }

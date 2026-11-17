@@ -542,3 +542,37 @@ fn pin_selection_preserves_explicit_output_choices() {
     output.textures_delta.clear();
     assert!(overlay.finish_visible());
 }
+
+#[test]
+fn clicking_the_pinned_toolbar_does_not_select_screen_pixels() {
+    let mut overlay = session();
+    overlay.set_tool(Tool::Region).unwrap();
+    let ctx = eframe::egui::Context::default();
+    let raw = eframe::egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+        ..Default::default()
+    };
+    let mut output = ctx.run_ui(raw.clone(), |ui| {
+        assert!(overlay.show(ui, &Default::default()).is_none());
+    });
+    output.textures_delta.clear();
+    for pressed in [true, false] {
+        let mut input = raw.clone();
+        input.events = vec![
+            Event::PointerMoved(Pos2::new(20.0, 18.0)),
+            Event::PointerButton {
+                pos: Pos2::new(20.0, 18.0),
+                button: eframe::egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            },
+        ];
+        let mut output = ctx.run_ui(input, |ui| {
+            assert!(overlay.show(ui, &Default::default()).is_none());
+        });
+        output.textures_delta.clear();
+    }
+    assert!(overlay.document().crop().is_none());
+    assert!(!overlay.has_active_edit());
+    assert!(!overlay.finish_visible());
+}
