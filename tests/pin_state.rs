@@ -341,6 +341,59 @@ fn dragging_uses_screen_pixels_without_feedback_from_window_movement() {
     );
 }
 #[test]
+fn a_dragged_pin_holds_its_new_place_until_the_app_catches_up() {
+    use eframe::egui::{Context, Event, Modifiers, PointerButton, pos2};
+    let ctx = Context::default();
+    let mut m = manager();
+    let id = m.open(image(400, 300), None).unwrap();
+    let pin = m.get(id).unwrap().clone();
+    let origin = pin.state.position();
+    let mut window = vectrcap::ui::pin_window::PinWindow::default();
+    let start = PhysicalPoint { x: 1000, y: 1000 };
+    let press = |pressed| {
+        vec![Event::PointerButton {
+            pos: pos2(250.0, 150.0),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }]
+    };
+    let hover = vec![Event::PointerMoved(pos2(250.0, 150.0))];
+    pin_frame_with_pointer(&ctx, &mut window, &pin, 0.0, hover, Some(start));
+    pin_frame_with_pointer(&ctx, &mut window, &pin, 1.0, press(true), Some(start));
+    let moved = PhysicalPoint { x: 1025, y: 1015 };
+    let drag = vec![Event::PointerMoved(pos2(275.0, 165.0))];
+    pin_frame_with_pointer(&ctx, &mut window, &pin, 1.1, drag, Some(moved));
+    let ahead = PhysicalPoint {
+        x: origin.x + 25,
+        y: origin.y + 15,
+    };
+    assert_eq!(window.held(), Some((ahead, 100)));
+    pin_frame_with_pointer(&ctx, &mut window, &pin, 1.2, press(false), Some(moved));
+    assert_eq!(window.held(), Some((ahead, 100)), "app state still behind");
+    m.handle(id, PinInput::Move { dx: 25, dy: 15 }).unwrap();
+    let caught_up = m.get(id).unwrap().clone();
+    pin_frame_with_pointer(&ctx, &mut window, &caught_up, 1.3, vec![], Some(moved));
+    assert_eq!(window.held(), None);
+}
+#[test]
+fn set_zoom_is_clamped_to_the_zoom_range() {
+    let mut m = manager();
+    let id = m.open(image(40, 30), None).unwrap();
+    m.handle(id, PinInput::SetZoom(1000)).unwrap();
+    assert_eq!(m.get(id).unwrap().state.zoom_percent(), 500);
+    m.handle(id, PinInput::SetZoom(5)).unwrap();
+    assert_eq!(m.get(id).unwrap().state.zoom_percent(), 20);
+}
+#[test]
+fn the_corner_grip_scales_by_the_larger_stretch() {
+    use vectrcap::ui::pin_window::grip_zoom;
+    assert_eq!(grip_zoom(100, (400, 300), (40, 0)), 110);
+    assert_eq!(grip_zoom(100, (400, 300), (0, 60)), 120);
+    assert_eq!(grip_zoom(100, (400, 300), (-1000, -1000)), 20);
+    assert_eq!(grip_zoom(400, (1600, 1200), (2000, 0)), 500);
+}
+#[test]
 fn pin_pointer_controls_work_with_options_open() {
     use eframe::egui::{Context, Event, Modifiers, PointerButton, pos2};
     let ctx = Context::default();

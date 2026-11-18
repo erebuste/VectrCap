@@ -108,6 +108,32 @@ pub fn keyboard_inputs(ctx: &egui::Context, focused: bool, editing: bool) -> Vec
     })
 }
 
+/// Zoom after dragging the corner grip by `delta` physical pixels, starting
+/// from a pin `start` pixels big at `start_zoom`. The larger stretch wins, so
+/// the picture keeps its shape.
+pub fn grip_zoom(start_zoom: u16, start: (u32, u32), delta: (i32, i32)) -> u16 {
+    let ratio = |len: u32, d: i32| (f64::from(len) + f64::from(d)) / f64::from(len.max(1));
+    let ratio = ratio(start.0, delta.0).max(ratio(start.1, delta.1));
+    (f64::from(start_zoom) * ratio).round().clamp(20.0, 500.0) as u16
+}
+
+/// The pin's size at `zoom`, whatever zoom the app state has now.
+fn size_at(pin: &PinSnapshot, zoom: u16) -> (u32, u32) {
+    let mut state = pin.state.clone();
+    state.zoom = zoom;
+    state.display_size(&pin.image)
+}
+
+/// Where the pin is shown while it is moved or resized. Moves reach the app
+/// state through the controller queue a little later; the window follows the
+/// pointer at once and keeps this place until the state has caught up.
+#[derive(Clone, Copy)]
+struct Hold {
+    position: crate::capture::geometry::PhysicalPoint,
+    zoom: u16,
+    released: Option<f64>,
+}
+
 pub struct PinWindow {
     texture: Option<egui::TextureHandle>,
     smooth: Option<bool>,
@@ -117,6 +143,9 @@ pub struct PinWindow {
     drag_pointer: Option<crate::capture::geometry::PhysicalPoint>,
     wheel_remainder: f32,
     wheel_ctrl: bool,
+    hold: Option<Hold>,
+    /// Pointer, pin size and zoom when the corner grip was grabbed.
+    grip: Option<(crate::capture::geometry::PhysicalPoint, (u32, u32), u16)>,
 }
 impl Default for PinWindow {
     fn default() -> Self {
@@ -129,10 +158,17 @@ impl Default for PinWindow {
             drag_pointer: None,
             wheel_remainder: 0.0,
             wheel_ctrl: false,
+            hold: None,
+            grip: None,
         }
     }
 }
 impl PinWindow {
+    /// Position and zoom the window shows ahead of the app state, while the
+    /// pin is being moved or resized.
+    pub fn held(&self) -> Option<(crate::capture::geometry::PhysicalPoint, u16)> {
+        self.hold.map(|h| (h.position, h.zoom))
+    }
     pub fn show_at_pointer(
         &mut self,
         ui: &mut egui::Ui,
@@ -184,8 +220,17 @@ impl PinWindow {
             );
         }
         self.smooth = Some(options.smooth);
+        let now = ui.input(|i| i.time);
+        if let Some(h) = self.hold
+            && let Some(released) = h.released
+            && ((pin.state.position() == h.position && pin.state.zoom_percent() == h.zoom)
+                || now - released > 1.0)
+        {
+            self.hold = None;
+        }
+        let zoom = self.hold.map_or(pin.state.zoom_percent(), |h| h.zoom);
         let scale = ui.ctx().pixels_per_point();
-        let (w, h) = pin.display_size();
+        let (w, h) = size_at(pin, zoom);
         let size = egui::vec2(w as f32 / scale, h as f32 / scale);
         let rect = if pin.state.minimized() {
             Rect::from_center_size(ui.max_rect().center(), size)
@@ -333,6 +378,16 @@ impl PinWindow {
                 };
                 if dx != 0 || dy != 0 {
                     inputs.push(PinInput::Move { dx, dy });
+                    if pointer.is_some() {
+                        let hold = self.hold.get_or_insert(Hold {
+                            position: pin.state.position(),
+                            zoom,
+                            released: None,
+                        });
+                        hold.position.x = hold.position.x.saturating_add(dx);
+                        hold.position.y = hold.position.y.saturating_add(dy);
+                        hold.released = None;
+                    }
                 }
             }
             if response.clicked_by(PointerButton::Middle) {
@@ -374,6 +429,66 @@ impl PinWindow {
                     }
                 });
             }
+        }
+        // Corner grip: drag to resize (the zoom follows, the shape is kept).
+        let mut gripping = false;
+        if let Some(pointer) = pointer
+            && !pin.state.minimized()
+        {
+            let side = 16.0;
+            let grip_rect = Rect::from_min_size(rect.max - Vec2::splat(side), Vec2::splat(side))
+                .intersect(ui.max_rect());
+            let grip = ui.interact(
+                grip_rect,
+                ui.scope_id().with("pin-grip"),
+                egui::Sense::drag(),
+            );
+            grip.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "Resize (drag)")
+            });
+            gripping = grip.dragged();
+            if gripping {
+                let (start, size, from) = *self.grip.get_or_insert((pointer, (w, h), zoom));
+                let next = grip_zoom(
+                    from,
+                    size,
+                    (
+                        pointer.x.saturating_sub(start.x),
+                        pointer.y.saturating_sub(start.y),
+                    ),
+                );
+                let hold = self.hold.get_or_insert(Hold {
+                    position: pin.state.position(),
+                    zoom,
+                    released: None,
+                });
+                hold.released = None;
+                if hold.zoom != next {
+                    hold.zoom = next;
+                    inputs.push(PinInput::SetZoom(next));
+                }
+            } else {
+                self.grip = None;
+            }
+            if hover || gripping {
+                let stroke = egui::Stroke::new(1.5, Color32::from_white_alpha(220));
+                let shadow = egui::Stroke::new(3.0, Color32::from_black_alpha(140));
+                for inset in [4.0, 8.0, 12.0] {
+                    let a = egui::pos2(grip_rect.max.x - 2.0, grip_rect.max.y - inset);
+                    let b = egui::pos2(grip_rect.max.x - inset, grip_rect.max.y - 2.0);
+                    ui.painter().line_segment([a, b], shadow);
+                    ui.painter().line_segment([a, b], stroke);
+                }
+            }
+            if grip.hovered() || gripping {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+            }
+        }
+        if let Some(h) = &mut self.hold {
+            if !dragging && !gripping && h.released.is_none() {
+                h.released = Some(now);
+            }
+            ui.ctx().request_repaint();
         }
         inputs
     }
@@ -432,6 +547,15 @@ impl PinHost {
         }
         for pin in &view.pins {
             let state = self.views.entry(pin.id).or_default().clone();
+            // While the pin is moved or resized, its window leads the app
+            // state; build and place it where the window says, not behind it.
+            let held = state.lock().ok().and_then(|w| w.held());
+            let mut shown = pin.clone();
+            if let Some((position, zoom)) = held {
+                shown.state.position = position;
+                shown.state.zoom = zoom;
+            }
+            let pin = &shown;
             let native_scale = native::pin_window_scale(pin.id).unwrap_or_else(|| {
                 ctx.input(|i| i.viewport().native_pixels_per_point.unwrap_or(1.0))
             });
@@ -487,6 +611,20 @@ impl PinHost {
                             live_client.report_error(error);
                         }
                     }
+                    // Follow the pointer now, not when the main window next
+                    // repaints (up to 100 ms later).
+                    if let Some((position, zoom)) = window.held() {
+                        let (w, h) = size_at(pin, zoom);
+                        if let Err(error) = native::sync_pin_window(
+                            id,
+                            position,
+                            (w.max(96), h.max(96)),
+                            true,
+                            pin.state.options().always_on_top,
+                        ) {
+                            live_client.report_error(error);
+                        }
+                    }
                     if let Some(error) = &live.error
                         && ui.ctx().input(|i| i.viewport().focused.unwrap_or(false))
                     {
@@ -529,7 +667,7 @@ impl PinHost {
                     if let Some(label) = pin.image.source_label() { ui.label(label); }
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         if let Some(input) = super::pin_options::draw(ui, pin.state.options()) && let Err(error) = client.submit(AppCommand::Pin { id, input }) { client.report_error(error); }
-                        ui.small("Wheel / + / −: zoom; Ctrl: opacity. Arrows: move 1 px; Shift: 10 px. Middle click: reset. Double click: preview.");
+                        ui.small("Drag the corner or use wheel / + / −: zoom; Ctrl: opacity. Arrows: move 1 px; Shift: 10 px. Middle click: reset. Double click: preview.");
                         ui.small("Copy uses the original full-resolution image, including its alpha.");
                     });
                     if ui.button("Done").clicked() || ui.ctx().input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape)) {

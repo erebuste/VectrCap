@@ -22,8 +22,13 @@ impl PinSnapshot {
     }
 }
 pub enum PinInput {
-    Move { dx: i32, dy: i32 },
+    Move {
+        dx: i32,
+        dy: i32,
+    },
     Zoom(i32),
+    /// An exact zoom percent, from resizing the pin by its corner.
+    SetZoom(u16),
     Opacity(i32),
     ToggleMinimized,
     Reset,
@@ -152,6 +157,7 @@ impl PinManager {
                 pin.state.zoom =
                     (i64::from(pin.state.zoom) + i64::from(steps) * 10).clamp(20, 500) as u16
             }
+            PinInput::SetZoom(zoom) => pin.state.zoom = zoom.clamp(20, 500),
             PinInput::Opacity(steps) => {
                 pin.state.opacity =
                     (i64::from(pin.state.opacity) + i64::from(steps) * 5).clamp(10, 100) as u8
