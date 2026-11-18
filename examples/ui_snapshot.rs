@@ -54,8 +54,8 @@ impl eframe::App for Snapshot {
         }
         self.shell.logic(ctx, frame);
         self.frames += 1;
-        // A few frames let fonts, layout and previews settle before capturing.
-        if self.frames == 6 {
+        // ~1.5 s at 60 Hz lets fonts, layout and the preview worker settle.
+        if self.frames == 90 {
             let out = self.out.clone();
             let saved = self.saved.clone();
             let repaint = ctx.clone();

@@ -1,4 +1,8 @@
-use super::settings::{SettingsCategory, SettingsPane};
+use super::{
+    icons::{self, Icon},
+    settings::{SettingsCategory, SettingsPane},
+    tokens, widgets,
+};
 use crate::{
     app::{
         desktop::{DesktopClient, DesktopView},
@@ -102,6 +106,10 @@ impl Shell {
         }
     }
     fn submit(&mut self, command: AppCommand) {
+        // A fixture shell (no tray) has no controller: drop, don't report a failure.
+        if self.tray.is_none() {
+            return;
+        }
         if matches!(command, AppCommand::ChooseArchiveFolder) {
             if let Some(settings) = &self.view.settings {
                 crate::platform::windows::file_dialog::spawn_pick_archive_folder(
@@ -274,236 +282,427 @@ impl eframe::App for Shell {
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut commands = vec![];
-        egui::Frame::central_panel(ui.style())
-            .inner_margin(18.0)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        eframe::egui::RichText::new("VectrCap")
-                            .strong()
-                            .color(ui.visuals().text_color()),
-                    );
-                    if ui
-                        .selectable_label(self.view.window == Some(Window::Settings), "Settings")
-                        .clicked()
-                    {
-                        commands.push(AppCommand::Show(Window::Settings));
-                    }
-                    if ui
-                        .selectable_label(self.view.window == Some(Window::History), "History")
-                        .clicked()
-                    {
-                        commands.push(AppCommand::Show(Window::History));
-                    }
-                    if ui.button("Return to tray").clicked() {
-                        commands.push(AppCommand::CloseWindow);
-                    }
-                    if ui.button("Quit").clicked() {
-                        if self.view.lifecycle == Lifecycle::Exited {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        } else {
-                            commands.push(AppCommand::Quit);
-                        }
-                    }
-                });
-                ui.separator();
-                ui.add_space(10.0);
-                if self.view.lifecycle == Lifecycle::Draining {
-                    ui.label("Quitting — settling the upload worker safely…");
-                }
-                if let Some(error) = &self.view.error {
-                    ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                }
-                ui.add_enabled_ui(self.view.lifecycle == Lifecycle::Running, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            eframe::egui::RichText::new("Capture")
-                                .strong()
-                                .color(ui.visuals().text_color()),
-                        );
-                        for (label, mode) in capture_entries() {
-                            if ui.button(label).clicked() {
-                                commands.push(AppCommand::StartCapture {
-                                    mode,
-                                    selection: Default::default(),
-                                });
-                            }
-                        }
-                        if ui.button("Upload from clipboard").clicked() {
-                            commands.push(AppCommand::UploadClipboard);
-                        }
-                        if ui.button("Upload file…").clicked() {
-                            crate::platform::windows::file_dialog::spawn_pick_and_upload(
-                                self.client.clone(),
-                                self.picker_gate.clone(),
-                            );
-                        }
-                    });
-                    if self.view.queue_paused {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                eframe::egui::RichText::new("Uploads are paused.")
-                                    .strong()
-                                    .color(ui.visuals().text_color()),
-                            );
-                            ui.label("Waiting jobs stay queued until you resume.");
-                            if ui.button("Resume uploads").clicked() {
-                                commands.push(AppCommand::Queue(QueueAction::ResumeAll));
-                            }
-                        });
-                    } else if !self.view.queue_paused
-                        && self
-                            .view
-                            .jobs
-                            .iter()
-                            .any(|job| job.paused && !job.status.is_terminal())
-                    {
-                        ui.label(
-                            "Some uploads are paused individually. Resume each one from Uploads.",
-                        );
-                    }
-                    ui.add_space(8.0);
-                    if self.view.window == Some(Window::Settings) && self.view.settings.is_some()
-                    {
-                        self.pane.show_categories(ui);
-                        ui.separator();
-                    }
-                    if self.view.window == Some(Window::History) {
-                        if self.view.settings.is_some() {
-                            // Interim until the In progress section and inspector
-                            // (redesign Tasks 5-6) replace these three old pages.
-                            egui::CollapsingHeader::new("Uploads")
-                                .default_open(
-                                    self.view.history_focus == Some(HistoryFocus::InProgress),
-                                )
-                                .show(ui, |ui| {
-                                    commands.extend(super::uploads::draw(
-                                        ui,
-                                        &self.view,
-                                        &self.client,
-                                        &self.picker_gate,
-                                    ))
-                                });
-                            if !self.view.task_workflows.is_empty() {
-                                egui::CollapsingHeader::new("Task results")
-                                    .default_open(matches!(
-                                        self.view.history_focus,
-                                        Some(HistoryFocus::Workflow(_))
-                                    ))
-                                    .show(ui, |ui| {
-                                        commands.extend(super::task_results::draw(
-                                            ui,
-                                            &self.view.task_workflows,
-                                            &self.client,
-                                            &self.picker_gate,
-                                        ))
-                                    });
-                            }
-                            if !self.view.batch_summary.is_empty() {
-                                egui::CollapsingHeader::new("Batch summary")
-                                    .default_open(matches!(
-                                        self.view.history_focus,
-                                        Some(HistoryFocus::Batch(_))
-                                    ))
-                                    .show(ui, |ui| super::batch_summary::draw(ui, &self.view));
-                            }
-                            commands.extend(self.history.draw(ui, &self.view));
-                        } else {
-                            ui.label("Opening local settings…");
-                        }
-                        return;
-                    }
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| match (self.view.window, &self.view.settings) {
-                            (Some(Window::Settings), Some(settings)) => {
-                                match self.pane.category() {
-                                    SettingsCategory::Troubleshooting => {
-                                        self.troubleshooting.draw(
-                                            ui,
-                                            settings,
-                                            &self.client,
-                                            &self.picker_gate,
-                                        );
-                                    }
-                                    SettingsCategory::Backup => {
-                                        self.preferences_transfer.draw(
-                                            ui,
-                                            settings,
-                                            &self.client,
-                                            &self.picker_gate,
-                                        );
-                                        if ui.button("Import VectrCap config…").clicked() {
-                                            crate::platform::windows::file_dialog::spawn_import_destination(
-                                                self.client.clone(),
-                                                self.picker_gate.clone(),
-                                            );
-                                        }
-                                        let zone = ui.add(
-                                            egui::Label::new(
-                                                "Drop one .vectrcap config here to review installation",
-                                            )
-                                            .sense(egui::Sense::click()),
-                                        );
-                                        if zone.hovered() {
-                                            let files =
-                                                ui.ctx().input(|i| i.raw.dropped_files.clone());
-                                            if files.len() == 1 {
-                                                match crate::app::cli::LaunchRequest::import(
-                                                    files[0].path().to_path_buf().into_os_string(),
-                                                ) {
-                                                    Ok(request) => {
-                                                        commands.push(AppCommand::Launch {
-                                                            request,
-                                                            reply: None,
-                                                        });
-                                                    }
-                                                    Err(error) => self.client.report_error(error),
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                commands.extend(self.pane.draw(
-                                    ui,
-                                    settings,
-                                    self.view.notifications_enabled,
-                                    &self.view.shortcut_statuses,
-                                    self.view.recorded_shortcut,
-                                ))
-                            }
-                            (_, None) => {
-                                ui.label("Opening local settings…");
-                            }
-                            _ => {}
-                        });
-                });
-            });
-        for command in commands {
-            self.submit(command);
-        }
+        self.draw(ui);
     }
     fn persist_egui_memory(&self) -> bool {
         false
     }
 }
 
-fn capture_entries() -> [(&'static str, crate::capture::request::CaptureMode); 4] {
-    use crate::capture::request::CaptureMode;
-    [
-        ("Capture region", CaptureMode::Region),
-        ("Capture window under pointer", CaptureMode::Window),
-        ("Capture fullscreen", CaptureMode::Fullscreen),
-        ("Capture last region", CaptureMode::LastRegion),
-    ]
+impl Shell {
+    /// Sidebar plus the current page; submits whatever the user clicked.
+    fn draw(&mut self, ui: &mut egui::Ui) {
+        let mut commands = vec![];
+        let window_width = ui.max_rect().width();
+        let collapsed = window_width < tokens::COLLAPSE_BELOW;
+        let sidebar_width = if collapsed {
+            tokens::SIDEBAR_COLLAPSED
+        } else {
+            tokens::SIDEBAR_WIDTH
+        };
+        let visuals = ui.visuals().clone();
+        let sidebar = egui::Panel::left("sidebar")
+            .exact_size(sidebar_width)
+            .resizable(false)
+            // egui's separator ignores the border token; draw our own edge below.
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(visuals.extreme_bg_color)
+                    .inner_margin(egui::Margin::symmetric(
+                        tokens::SIDEBAR_PAD_X as i8,
+                        tokens::SIDEBAR_PAD_Y as i8,
+                    )),
+            )
+            .show(ui, |ui| {
+                commands.extend(draw_sidebar(ui, &self.view, collapsed));
+            })
+            .response
+            .rect;
+        ui.painter().vline(
+            sidebar.right() - 0.5,
+            sidebar.y_range(),
+            visuals.widgets.noninteractive.bg_stroke,
+        );
+        let stacked = window_width - sidebar_width < tokens::STACK_BELOW;
+        let margin = if stacked {
+            egui::Margin::symmetric(14, 16)
+        } else {
+            egui::Margin {
+                left: tokens::PAGE_PAD_X as i8,
+                right: tokens::PAGE_PAD_X as i8,
+                top: tokens::PAGE_PAD_TOP as i8,
+                bottom: tokens::PAGE_PAD_BOTTOM as i8,
+            }
+        };
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(visuals.panel_fill)
+                    .inner_margin(margin),
+            )
+            .show(ui, |ui| {
+                commands.extend(draw_status_banner(ui, &self.view));
+                ui.add_enabled_ui(self.view.lifecycle == Lifecycle::Running, |ui| {
+                    self.draw_page(ui, &mut commands);
+                });
+            });
+        for command in commands {
+            if matches!(command, AppCommand::Quit) && self.view.lifecycle == Lifecycle::Exited {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.submit(command);
+            }
+        }
+    }
+
+    fn draw_page(&mut self, ui: &mut egui::Ui, commands: &mut Vec<AppCommand>) {
+        if self.view.window == Some(Window::Settings) && self.view.settings.is_some() {
+            self.pane.show_categories(ui);
+            ui.separator();
+        }
+        if self.view.window == Some(Window::History) {
+            if self.view.settings.is_some() {
+                // Interim until the In progress section and inspector
+                // (redesign Tasks 5-6) replace these three old pages.
+                egui::CollapsingHeader::new("Uploads")
+                    .default_open(self.view.history_focus == Some(HistoryFocus::InProgress))
+                    .show(ui, |ui| {
+                        commands.extend(super::uploads::draw(
+                            ui,
+                            &self.view,
+                            &self.client,
+                            &self.picker_gate,
+                        ))
+                    });
+                if !self.view.task_workflows.is_empty() {
+                    egui::CollapsingHeader::new("Task results")
+                        .default_open(matches!(
+                            self.view.history_focus,
+                            Some(HistoryFocus::Workflow(_))
+                        ))
+                        .show(ui, |ui| {
+                            commands.extend(super::task_results::draw(
+                                ui,
+                                &self.view.task_workflows,
+                                &self.client,
+                                &self.picker_gate,
+                            ))
+                        });
+                }
+                if !self.view.batch_summary.is_empty() {
+                    egui::CollapsingHeader::new("Batch summary")
+                        .default_open(matches!(
+                            self.view.history_focus,
+                            Some(HistoryFocus::Batch(_))
+                        ))
+                        .show(ui, |ui| super::batch_summary::draw(ui, &self.view));
+                }
+                commands.extend(self.history.draw(ui, &self.view));
+            } else {
+                ui.label("Opening local settings…");
+            }
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| match (self.view.window, &self.view.settings) {
+                (Some(Window::Settings), Some(settings)) => {
+                    match self.pane.category() {
+                        SettingsCategory::Troubleshooting => {
+                            self.troubleshooting.draw(
+                                ui,
+                                settings,
+                                &self.client,
+                                &self.picker_gate,
+                            );
+                        }
+                        SettingsCategory::Backup => {
+                            self.preferences_transfer.draw(
+                                ui,
+                                settings,
+                                &self.client,
+                                &self.picker_gate,
+                            );
+                            if ui.button("Import VectrCap config…").clicked() {
+                                crate::platform::windows::file_dialog::spawn_import_destination(
+                                    self.client.clone(),
+                                    self.picker_gate.clone(),
+                                );
+                            }
+                            let zone = ui.add(
+                                egui::Label::new(
+                                    "Drop one .vectrcap config here to review installation",
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if zone.hovered() {
+                                let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+                                if files.len() == 1 {
+                                    match crate::app::cli::LaunchRequest::import(
+                                        files[0].path().to_path_buf().into_os_string(),
+                                    ) {
+                                        Ok(request) => {
+                                            commands.push(AppCommand::Launch {
+                                                request,
+                                                reply: None,
+                                            });
+                                        }
+                                        Err(error) => self.client.report_error(error),
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    commands.extend(self.pane.draw(
+                        ui,
+                        settings,
+                        self.view.notifications_enabled,
+                        &self.view.shortcut_statuses,
+                        self.view.recorded_shortcut,
+                    ))
+                }
+                (_, None) => {
+                    ui.label("Opening local settings…");
+                }
+                _ => {}
+            });
+    }
+}
+
+/// The left navigation: brand, History, Settings and, at the bottom, Quit.
+/// `collapsed` keeps only the icons; names stay on hover and for screen readers.
+pub fn draw_sidebar(ui: &mut egui::Ui, view: &DesktopView, collapsed: bool) -> Vec<AppCommand> {
+    let mut commands = vec![];
+    ui.spacing_mut().item_spacing.y = 2.0;
+    brand(ui, collapsed);
+    ui.add_space(tokens::NAV_GAP - 2.0);
+    // ponytail: badge stays 0 until Task 5's in_progress_count lands.
+    let in_progress = 0;
+    for (icon, label, window, badge) in [
+        (Icon::History, "History", Window::History, in_progress),
+        (Icon::Settings, "Settings", Window::Settings, 0),
+    ] {
+        let current = view.window == Some(window);
+        if nav_item(ui, icon, label, current, badge, collapsed).clicked() {
+            commands.push(AppCommand::Show(window));
+        }
+    }
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        if nav_item(ui, Icon::Power, "Quit", false, 0, collapsed)
+            .on_hover_text("Quit VectrCap")
+            .clicked()
+        {
+            commands.push(AppCommand::Quit);
+        }
+    });
+    commands
+}
+
+fn brand(ui: &mut egui::Ui, collapsed: bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), tokens::BRAND_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let visuals = ui.visuals();
+    let size = egui::Vec2::splat(20.0);
+    let mark = if collapsed {
+        egui::Rect::from_center_size(rect.center(), size)
+    } else {
+        egui::Rect::from_min_size(egui::pos2(rect.left() + 8.0, rect.center().y - 10.0), size)
+    };
+    icons::paint(ui.painter(), mark, Icon::Brand, visuals.selection.bg_fill);
+    if !collapsed {
+        ui.painter().text(
+            egui::pos2(mark.right() + 9.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            "VectrCap",
+            tokens::semibold(14.0),
+            visuals.text_color(),
+        );
+    }
+}
+
+fn nav_item(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    current: bool,
+    badge: usize,
+    collapsed: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), tokens::NAV_ITEM_HEIGHT),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), current, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let painter = ui.painter();
+        let lit = current || response.hovered();
+        if lit {
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(tokens::RADIUS_CONTROL),
+                visuals.widgets.inactive.bg_fill,
+            );
+        }
+        let color = if lit {
+            visuals.text_color()
+        } else {
+            visuals.weak_text_color()
+        };
+        let size = egui::Vec2::splat(tokens::ICON_SIZE);
+        let glyph = if collapsed {
+            egui::Rect::from_center_size(rect.center(), size)
+        } else {
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + 10.0,
+                    rect.center().y - tokens::ICON_SIZE / 2.0,
+                ),
+                size,
+            )
+        };
+        icons::paint(painter, glyph, icon, color);
+        if !collapsed {
+            painter.text(
+                egui::pos2(glyph.right() + 10.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                tokens::medium(tokens::BODY_SIZE),
+                color,
+            );
+            if badge > 0 {
+                let galley = painter.layout_no_wrap(
+                    badge.to_string(),
+                    tokens::semibold(tokens::META_SIZE),
+                    visuals.selection.stroke.color,
+                );
+                let width = (galley.size().x + 10.0).max(18.0);
+                let pill = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - 10.0 - width, rect.center().y - 9.0),
+                    egui::vec2(width, 18.0),
+                );
+                painter.rect_filled(pill, egui::CornerRadius::same(9), visuals.selection.bg_fill);
+                painter.galley(
+                    pill.center() - galley.size() / 2.0,
+                    galley,
+                    visuals.selection.stroke.color,
+                );
+            }
+        }
+    }
+    if collapsed {
+        response.on_hover_text(label)
+    } else {
+        response
+    }
+}
+
+/// Window-wide notices under the page header: quitting, the last error, and a
+/// paused upload queue with its Resume action.
+pub fn draw_status_banner(ui: &mut egui::Ui, view: &DesktopView) -> Vec<AppCommand> {
+    let mut commands = vec![];
+    let visuals = ui.visuals().clone();
+    if view.lifecycle == Lifecycle::Draining {
+        banner(
+            ui,
+            Icon::Pause,
+            visuals.weak_text_color(),
+            "Quitting.",
+            "Settling the upload worker safely…",
+            None,
+        );
+    }
+    if let Some(error) = &view.error {
+        banner(
+            ui,
+            Icon::Alert,
+            visuals.error_fg_color,
+            "Something went wrong.",
+            &error.to_string(),
+            None,
+        );
+    }
+    if view.queue_paused
+        && banner(
+            ui,
+            Icon::Pause,
+            appearance::warning(&visuals),
+            "Uploads are paused.",
+            "Waiting uploads stay queued until you resume.",
+            Some((Icon::Play, "Resume uploads")),
+        )
+    {
+        commands.push(AppCommand::Queue(QueueAction::ResumeAll));
+    }
+    commands
+}
+
+/// Returns whether the action button was clicked.
+fn banner(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    icon_color: egui::Color32,
+    bold: &str,
+    muted: &str,
+    action: Option<(Icon, &str)>,
+) -> bool {
+    let visuals = ui.visuals().clone();
+    let mut clicked = false;
+    egui::Frame::NONE
+        .fill(visuals.extreme_bg_color)
+        .stroke(visuals.widgets.noninteractive.bg_stroke)
+        .corner_radius(egui::CornerRadius::same(tokens::RADIUS_SURFACE))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let (slot, _) = ui.allocate_exact_size(
+                    egui::Vec2::splat(tokens::ICON_SIZE),
+                    egui::Sense::hover(),
+                );
+                icons::paint(ui.painter(), slot, icon, icon_color);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some((icon, label)) = action {
+                        clicked = widgets::icon_button(ui, icon, label).clicked();
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(
+                            bold,
+                            0.0,
+                            egui::TextFormat::simple(
+                                tokens::semibold(tokens::BODY_SIZE),
+                                visuals.text_color(),
+                            ),
+                        );
+                        job.append(
+                            muted,
+                            6.0,
+                            egui::TextFormat::simple(
+                                egui::FontId::proportional(tokens::BODY_SIZE),
+                                visuals.weak_text_color(),
+                            ),
+                        );
+                        ui.add(egui::Label::new(job).wrap());
+                    });
+                });
+            });
+        });
+    ui.add_space(14.0);
+    clicked
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::request::CaptureMode;
+    use crate::ui::tokens;
 
     #[test]
     fn fixture_shell_shows_the_fixture_view_without_a_runtime_or_tray() {
@@ -515,17 +714,133 @@ mod tests {
         assert_eq!(shell.client.snapshot().jobs.len(), view.jobs.len());
     }
 
+    fn screen(width: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 720.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Two frames (fonts apply from the second); returns the last output and the
+    /// root ui's used rect.
+    fn run(
+        ctx: &egui::Context,
+        width: f32,
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) -> (egui::FullOutput, egui::Rect) {
+        ctx.enable_accesskit();
+        ctx.set_visuals(appearance::visuals());
+        let mut used = egui::Rect::NOTHING;
+        let mut last = None;
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(screen(width), |ui| {
+                draw(ui);
+                used = ui.min_rect();
+            });
+            output.textures_delta.clear();
+            last = Some(output);
+        }
+        (last.expect("two frames ran"), used)
+    }
+
+    fn button_labels(output: &egui::FullOutput) -> Vec<String> {
+        output
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| &update.nodes)
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect()
+    }
+
+    fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => {
+                    Some((text.galley.text().to_owned(), text.visual_bounding_rect()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fixture_shell(ctx: &egui::Context) -> Shell {
+        use crate::ui::fixtures::{MockupVariant, mockup_view};
+        Shell::from_fixture(mockup_view(MockupVariant::HistoryBusy), ctx.clone())
+    }
+
     #[test]
-    fn shell_capture_row_offers_the_tray_capture_modes() {
-        let entries = capture_entries();
-        assert_eq!(
-            entries.map(|(_, mode)| mode),
-            [
-                CaptureMode::Region,
-                CaptureMode::Window,
-                CaptureMode::Fullscreen,
-                CaptureMode::LastRegion,
-            ]
+    fn sidebar_offers_exactly_history_settings_and_quit() {
+        let ctx = egui::Context::default();
+        appearance::install_fonts(&ctx);
+        let view =
+            crate::ui::fixtures::mockup_view(crate::ui::fixtures::MockupVariant::HistoryBusy);
+        let (output, _) = run(&ctx, 1180.0, |ui| {
+            draw_sidebar(ui, &view, false);
+        });
+        let mut labels = button_labels(&output);
+        labels.sort();
+        assert_eq!(labels, ["History", "Quit", "Settings"]);
+    }
+
+    #[test]
+    fn sidebar_collapses_below_960_and_keeps_accessible_names() {
+        let ctx = egui::Context::default();
+        let mut shell = fixture_shell(&ctx);
+        let (output, _) = run(&ctx, 900.0, |ui| {
+            shell.draw(ui);
+        });
+        let in_sidebar: Vec<_> = texts(&output)
+            .into_iter()
+            .filter(|(text, rect)| !text.is_empty() && rect.left() < tokens::SIDEBAR_COLLAPSED)
+            .collect();
+        assert!(
+            in_sidebar.is_empty(),
+            "collapsed sidebar draws {in_sidebar:?}"
         );
+        let labels = button_labels(&output);
+        for name in ["History", "Settings", "Quit"] {
+            assert!(labels.iter().any(|l| l == name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn main_window_has_no_capture_or_record_buttons() {
+        let ctx = egui::Context::default();
+        let mut shell = fixture_shell(&ctx);
+        let (output, _) = run(&ctx, 1180.0, |ui| {
+            shell.draw(ui);
+        });
+        let labels = button_labels(&output);
+        assert!(!labels.is_empty());
+        for label in &labels {
+            assert!(
+                // "Recordings" is a History filter, not a launcher.
+                !label.starts_with("Capture ")
+                    && label != "Record"
+                    && !label.starts_with("Record ")
+                    && !label.starts_with("Start / stop")
+                    && label != "Return to tray",
+                "unexpected button {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_draws_at_double_scale_and_380_wide_without_overflow() {
+        let ctx = egui::Context::default();
+        ctx.set_zoom_factor(2.0);
+        let mut shell = fixture_shell(&ctx);
+        // RawInput sizes are points, so this is a 760 px window at 200%.
+        let (_, used) = run(&ctx, 380.0, |ui| {
+            shell.draw(ui);
+        });
+        assert!(used.right() <= 380.5, "content reaches {}", used.right());
     }
 }

@@ -42,25 +42,41 @@ pub fn write_mockup_media() -> std::io::Result<()> {
     let dir = media_dir();
     std::fs::create_dir_all(&dir)?;
     for (i, sample) in SAMPLES.iter().enumerate() {
-        if sample.kind != "screenshot" || !sample.local {
-            continue;
+        if let Some(bytes) = sample_media(i, sample) {
+            std::fs::write(dir.join(sample.name), bytes)?;
         }
-        let mut image = image::RgbaImage::new(320, 180);
-        for (x, y, pixel) in image.enumerate_pixels_mut() {
-            let panel = (16..304).contains(&x) && (13..167).contains(&y);
-            let shade = if panel { 23 } else { 18 };
-            let accent = i as u32 * 29 % 120;
-            *pixel = if panel && y > 40 && y % 14 < 3 && x < 120 + accent {
-                image::Rgba([110, 110, 110, 255])
-            } else {
-                image::Rgba([shade, shade, shade, 255])
-            };
-        }
-        image
-            .save(dir.join(sample.name))
-            .map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+/// A deterministic PNG padded to the sample's listed size, so the preview
+/// loader's size and SHA-256 checks pass against `mockup_view`'s artifact.
+fn sample_media(i: usize, sample: &Sample) -> Option<Vec<u8>> {
+    if sample.kind != "screenshot" || !sample.local {
+        return None;
+    }
+    let mut image = image::RgbaImage::new(320, 180);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let panel = (16..304).contains(&x) && (13..167).contains(&y);
+        let shade = if panel { 23 } else { 18 };
+        let accent = i as u32 * 29 % 120;
+        *pixel = if panel && y > 40 && y % 14 < 3 && x < 120 + accent {
+            image::Rgba([110, 110, 110, 255])
+        } else {
+            image::Rgba([shade, shade, shade, 255])
+        };
+    }
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).ok()?;
+    let mut bytes = bytes.into_inner();
+    // PNG decoders stop at IEND; the zero tail only sets the file size.
+    bytes.resize(bytes.len().max(sample.size as usize), 0);
+    Some(bytes)
+}
+
+fn sample_sha256(i: usize, sample: &Sample) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    sample_media(i, sample).map_or([7; 32], |bytes| Sha256::digest(bytes).into())
 }
 
 struct Sample {
@@ -212,14 +228,14 @@ pub fn mockup_view(variant: MockupVariant) -> DesktopView {
     let dir = media_dir();
     let mut jobs = vec![];
     let mut records = vec![];
-    for sample in &SAMPLES {
+    for (i, sample) in SAMPLES.iter().enumerate() {
         let artifact = Artifact {
             id: ArtifactId::new_random(),
             path: dir.join(sample.name),
             display_name: sample.name.into(),
             kind: artifact_kind(sample.kind),
             size: sample.size,
-            sha256: [7; 32],
+            sha256: sample_sha256(i, sample),
         };
         let status = match (sample.status, busy) {
             (Status::Local, _) => None,
