@@ -14,6 +14,8 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 type Choices = Arc<Mutex<HashMap<String, (DestinationId, u64)>>>;
+/// Rendered by `scripts/render-logo.py`.
+const TRAY_LOGO_PNG: &[u8] = include_bytes!("../../../assets/logo/vectrcap-32.png");
 pub struct Tray {
     _hotkeys: super::hotkeys::HotkeyBridge,
     _appearance: super::appearance::AppearanceWake,
@@ -223,24 +225,14 @@ impl Tray {
                 client.report_error(error);
             }
         }));
-        // Small opaque V mark, generated in memory; no resource or image decoder.
-        let mut pixels = vec![0u8; 24 * 24 * 4];
-        for y in 0usize..24 {
-            for x in 0usize..24 {
-                let v = (5..=17).contains(&y)
-                    && (x.abs_diff(5 + (y - 5) / 2) <= 1 || x.abs_diff(18 - (y - 5) / 2) <= 1);
-                let color = if v {
-                    [231, 193, 122, 255]
-                } else {
-                    [36, 39, 43, 255]
-                };
-                pixels[(y * 24 + x) * 4..(y * 24 + x + 1) * 4].copy_from_slice(&color);
-            }
-        }
+        let logo = image::load_from_memory(TRAY_LOGO_PNG)
+            .map_err(|_| error())?
+            .into_rgba8();
+        let (width, height) = logo.dimensions();
         let icon = TrayIconBuilder::new()
             .with_tooltip("VectrCap")
             .with_menu_on_left_click(false)
-            .with_icon(Icon::from_rgba(pixels, 24, 24).map_err(|_| error())?)
+            .with_icon(Icon::from_rgba(logo.into_raw(), width, height).map_err(|_| error())?)
             .build()
             .map_err(|_| error())?;
         // Safety: the tray icon owns this HWND and keeps it alive at least as
@@ -359,6 +351,12 @@ impl Drop for Tray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tray_logo_decodes() {
+        let logo = image::load_from_memory(TRAY_LOGO_PNG).unwrap();
+        assert_eq!((logo.width(), logo.height()), (32, 32));
+    }
 
     #[test]
     fn a_left_click_on_the_tray_icon_starts_a_region_capture() {

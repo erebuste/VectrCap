@@ -52,8 +52,20 @@ fn run() -> Result<(), AppError> {
     let mut runtime = None;
     let mut pipe_server = None;
     let mut drop_server = None;
+    // Taskbar/title-bar icon; the exe icon comes from build.rs.
+    let logo = image::load_from_memory(include_bytes!("../assets/logo/vectrcap-64.png"))
+        .map(|logo| logo.into_rgba8())
+        .ok();
+    let mut viewport = eframe::egui::ViewportBuilder::default();
+    if let Some(logo) = logo {
+        viewport = viewport.with_icon(eframe::egui::IconData {
+            width: logo.width(),
+            height: logo.height(),
+            rgba: logo.into_raw(),
+        });
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
+        viewport: viewport
             .with_inner_size([610.0, 650.0])
             .with_min_inner_size([360.0, 320.0])
             .with_visible(false)
