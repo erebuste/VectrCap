@@ -4,7 +4,7 @@ pub mod clock;
 pub mod frame;
 pub mod gif;
 pub mod mp4;
-mod native;
+pub(crate) mod native;
 pub mod options;
 pub mod worker;
 use crate::app::error::AppError;

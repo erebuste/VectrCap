@@ -50,6 +50,15 @@ impl Default for CaptureState {
     }
 }
 impl CaptureState {
+    /// Starts the media timeline at the first frame. WGC stamps frames with
+    /// their presentation time, which can be ahead of `now` (QPC when the frame
+    /// arrived); the clock is later read with QPC, so it starts no later than
+    /// `now` or the first read would look like time running backwards.
+    fn start(&mut self, frame: Duration, now: Duration) {
+        self.clock = Some(MediaClock::new(frame.min(now)));
+        self.segment_start = frame;
+        self.segment_active = Duration::ZERO;
+    }
     pub fn elapsed(&mut self, now: Duration) -> Result<Duration, AppError> {
         self.clock
             .as_mut()
@@ -172,9 +181,7 @@ impl Handler {
                 .ok_or(AppError::Capture("invalid WGC timestamp"))?,
         );
         if s.clock.is_none() {
-            s.clock = Some(MediaClock::new(qpc));
-            s.segment_start = qpc;
-            s.segment_active = Duration::ZERO;
+            s.start(qpc, crate::recording::native::qpc_now()?);
         }
         let Some(t) = s.map_qpc(qpc) else {
             return Ok(());
@@ -335,5 +342,25 @@ impl NativeCapture {
 impl Drop for NativeCapture {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_first_frame_stamped_ahead_of_now_still_starts_the_clock() {
+        // WGC stamps frames with their presentation time, a few ms ahead of
+        // the QPC read when the frame arrives.
+        let mut s = CaptureState::default();
+        let now = Duration::from_secs(100);
+        let frame = now + Duration::from_millis(6);
+        s.start(frame, now);
+        assert_eq!(
+            s.elapsed(now + Duration::from_millis(1)).unwrap(),
+            Duration::from_millis(1)
+        );
+        assert_eq!(s.map_qpc(frame), Some(Duration::ZERO));
     }
 }
