@@ -4,6 +4,7 @@ pub mod capture_overlay;
 pub mod destinations;
 pub mod image_export;
 pub mod image_review;
+pub mod in_progress;
 pub mod magnifier;
 pub mod pin_options;
 pub mod pin_sources;
@@ -11,7 +12,6 @@ pub mod pin_window;
 pub mod region_settings;
 pub mod settings;
 pub mod shell;
-pub mod uploads;
 
 pub mod completion_notification;
 

@@ -36,6 +36,7 @@ pub struct Shell {
     tray: Option<Tray>,
     pane: SettingsPane,
     history: super::history::HistoryPane,
+    in_progress_expanded: bool,
     focus_revision: u64,
     current_window: Option<Window>,
     focus_requested: Arc<AtomicBool>,
@@ -94,6 +95,7 @@ impl Shell {
             tray,
             pane: SettingsPane::default(),
             history: Default::default(),
+            in_progress_expanded: false,
             shown_since: Default::default(),
             thumbs: Arc::new(Mutex::new(
                 super::completion_notification::NoticeThumbs::new(),
@@ -109,6 +111,25 @@ impl Shell {
         // A fixture shell (no tray) has no controller: drop, don't report a failure.
         if self.tray.is_none() {
             return;
+        }
+        match command {
+            AppCommand::ChooseUploadFile => {
+                crate::platform::windows::file_dialog::spawn_pick_and_upload(
+                    self.client.clone(),
+                    self.picker_gate.clone(),
+                );
+                return;
+            }
+            AppCommand::ChooseTaskSave { id, name } => {
+                crate::platform::windows::file_dialog::spawn_task_save(
+                    self.client.clone(),
+                    self.picker_gate.clone(),
+                    id,
+                    name,
+                );
+                return;
+            }
+            _ => {}
         }
         if matches!(command, AppCommand::ChooseArchiveFolder) {
             if let Some(settings) = &self.view.settings {
@@ -342,8 +363,15 @@ impl Shell {
                     .inner_margin(margin),
             )
             .show(ui, |ui| {
+                let running = self.view.lifecycle == Lifecycle::Running;
+                if self.view.window == Some(Window::History) && self.view.settings.is_some() {
+                    ui.add_enabled_ui(running, |ui| {
+                        commands.extend(self.history.draw_header(ui, &self.view));
+                    });
+                }
+                // The banner stays enabled: Resume uploads must work while draining.
                 commands.extend(draw_status_banner(ui, &self.view));
-                ui.add_enabled_ui(self.view.lifecycle == Lifecycle::Running, |ui| {
+                ui.add_enabled_ui(running, |ui| {
                     self.draw_page(ui, &mut commands);
                 });
             });
@@ -356,6 +384,33 @@ impl Shell {
         }
     }
 
+    /// The History page takes dropped files, and Ctrl+V while no text field
+    /// has focus, as uploads (what the old Uploads drop zone did).
+    fn accept_uploads(&self, ui: &egui::Ui) -> Vec<AppCommand> {
+        let mut commands = vec![];
+        let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if !files.is_empty() {
+            let paths = files
+                .into_iter()
+                .map(|f| f.path().to_path_buf().into_os_string())
+                .collect();
+            match crate::app::upload_sources::UploadSource::files(paths) {
+                Ok(source) => commands.push(AppCommand::UploadSource(source)),
+                Err(error) => self.client.report_error(error),
+            }
+        }
+        let typing = ui.ctx().memory(|m| m.focused().is_some());
+        if !typing
+            && ui.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+                    || i.modifiers.ctrl && i.key_pressed(egui::Key::V)
+            })
+        {
+            commands.push(AppCommand::UploadClipboard);
+        }
+        commands
+    }
+
     fn draw_page(&mut self, ui: &mut egui::Ui, commands: &mut Vec<AppCommand>) {
         if self.view.window == Some(Window::Settings) && self.view.settings.is_some() {
             self.pane.show_categories(ui);
@@ -363,18 +418,13 @@ impl Shell {
         }
         if self.view.window == Some(Window::History) {
             if self.view.settings.is_some() {
-                // Interim until the In progress section and inspector
-                // (redesign Tasks 5-6) replace these three old pages.
-                egui::CollapsingHeader::new("Uploads")
-                    .default_open(self.view.history_focus == Some(HistoryFocus::InProgress))
-                    .show(ui, |ui| {
-                        commands.extend(super::uploads::draw(
-                            ui,
-                            &self.view,
-                            &self.client,
-                            &self.picker_gate,
-                        ))
-                    });
+                commands.extend(super::in_progress::draw(
+                    ui,
+                    &self.view,
+                    &mut self.in_progress_expanded,
+                ));
+                commands.extend(self.accept_uploads(ui));
+                // Interim until the inspector (redesign Task 6) replaces these.
                 if !self.view.task_workflows.is_empty() {
                     egui::CollapsingHeader::new("Task results")
                         .default_open(matches!(
@@ -478,8 +528,7 @@ pub fn draw_sidebar(ui: &mut egui::Ui, view: &DesktopView, collapsed: bool) -> V
     ui.spacing_mut().item_spacing.y = 2.0;
     brand(ui, collapsed);
     ui.add_space(tokens::NAV_GAP - 2.0);
-    // ponytail: badge stays 0 until Task 5's in_progress_count lands.
-    let in_progress = 0;
+    let in_progress = super::in_progress::in_progress_count(view);
     for (icon, label, window, badge) in [
         (Icon::History, "History", Window::History, in_progress),
         (Icon::Settings, "Settings", Window::Settings, 0),

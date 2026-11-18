@@ -1658,7 +1658,9 @@ impl AppController {
                 )?;
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
-            AppCommand::ChooseArchiveFolder => vec![],
+            AppCommand::ChooseArchiveFolder
+            | AppCommand::ChooseTaskSave { .. }
+            | AppCommand::ChooseUploadFile => vec![],
             AppCommand::SetArchivePolicy { policy, revision } => {
                 self.manager.ensure_revision(revision)?;
                 self.manager.set_archive_policy(policy)?;

@@ -16,19 +16,56 @@ enum Look {
     Normal,
     Toggled,
     Primary,
+    Ghost,
+}
+
+/// Width a small button with this icon/label takes; `label: None` is icon-only.
+pub fn button_width(ui: &Ui, icon: Option<Icon>, label: Option<&str>) -> f32 {
+    let text = label.map_or(0.0, |label| {
+        ui.painter()
+            .layout_no_wrap(
+                label.to_owned(),
+                FontId::proportional(SMALL_SIZE),
+                Color32::PLACEHOLDER,
+            )
+            .size()
+            .x
+    });
+    let icon_width = match (icon, label) {
+        (Some(_), Some(_)) => ICON_SIZE + 6.0,
+        (Some(_), None) => ICON_SIZE,
+        _ => 0.0,
+    };
+    BUTTON_PAD_SMALL * 2.0 + icon_width + text
 }
 
 fn button(ui: &mut Ui, look: Look, icon: Option<Icon>, label: &str) -> Response {
+    button_with(ui, look, icon, label, true)
+}
+
+fn button_with(
+    ui: &mut Ui,
+    look: Look,
+    icon: Option<Icon>,
+    label: &str,
+    show_label: bool,
+) -> Response {
+    let width = button_width(ui, icon, show_label.then_some(label));
     let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
+        if show_label {
+            label.to_owned()
+        } else {
+            String::new()
+        },
         FontId::proportional(SMALL_SIZE),
         Color32::PLACEHOLDER,
     );
-    let icon_width = if icon.is_some() { ICON_SIZE + 6.0 } else { 0.0 };
-    let size = vec2(
-        BUTTON_PAD_SMALL * 2.0 + icon_width + galley.size().x,
-        BUTTON_HEIGHT_SMALL,
-    );
+    let icon_width = match (icon.is_some(), show_label) {
+        (true, true) => ICON_SIZE + 6.0,
+        (true, false) => ICON_SIZE,
+        _ => 0.0,
+    };
+    let size = vec2(width, BUTTON_HEIGHT_SMALL);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response.widget_info(|| {
         WidgetInfo::selected(Role::Button, ui.is_enabled(), look == Look::Toggled, label)
@@ -51,6 +88,16 @@ fn button(ui: &mut Ui, look: Look, icon: Option<Icon>, label: &str) -> Response 
                 state.weak_bg_fill,
                 state.bg_stroke.color,
                 visuals.text_color(),
+            ),
+            Look::Ghost if response.hovered() => (
+                visuals.widgets.inactive.bg_fill,
+                Color32::TRANSPARENT,
+                visuals.text_color(),
+            ),
+            Look::Ghost => (
+                Color32::TRANSPARENT,
+                Color32::TRANSPARENT,
+                visuals.weak_text_color(),
             ),
         };
         let painter = ui.painter();
@@ -98,6 +145,16 @@ pub fn primary_button(ui: &mut Ui, icon: Option<Icon>, label: &str) -> Response 
 /// A small bordered button with a leading icon.
 pub fn icon_button(ui: &mut Ui, icon: Icon, label: &str) -> Response {
     button(ui, Look::Normal, Some(icon), label)
+}
+
+/// A borderless, muted button for secondary row and header actions.
+pub fn ghost_button(ui: &mut Ui, icon: Option<Icon>, label: &str) -> Response {
+    button(ui, Look::Ghost, icon, label)
+}
+
+/// An icon-only ghost button; `name` is its tooltip and screen-reader name.
+pub fn ghost_icon_button(ui: &mut Ui, icon: Icon, name: &str) -> Response {
+    button_with(ui, Look::Ghost, Some(icon), name, false).on_hover_text(name)
 }
 
 /// An on/off switch (36×20), announced to screen readers as a checkbox named `label`.

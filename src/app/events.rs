@@ -265,6 +265,14 @@ pub enum AppCommand {
         revision: u64,
     },
     ChooseArchiveFolder,
+    /// UI-only, like `ChooseArchiveFolder`: the shell opens the native Save
+    /// dialog for workflow `id`; the controller ignores it.
+    ChooseTaskSave {
+        id: Uuid,
+        name: String,
+    },
+    /// UI-only: the shell opens the native "Upload file" picker.
+    ChooseUploadFile,
     SetArchivePolicy {
         policy: ArchivePolicy,
         revision: u64,

@@ -36,8 +36,10 @@ impl HistoryPane {
         self.delete_local = None;
         self.previews.suspend();
     }
-    pub fn draw(&mut self, ui: &mut Ui, view: &DesktopView) -> Vec<AppCommand> {
-        self.queue_paused = view.queue_paused;
+    /// Title, Gallery/List and Preview toggles, and "Upload file"
+    /// (`ChooseUploadFile`, which the shell turns into the native picker).
+    pub fn draw_header(&mut self, ui: &mut Ui, view: &DesktopView) -> Vec<AppCommand> {
+        use super::{icons::Icon, tokens, widgets};
         let mut commands = vec![];
         let preferences = view
             .settings
@@ -45,27 +47,82 @@ impl HistoryPane {
             .map(|s| s.history.clone())
             .unwrap_or_default();
         let mut prefs = preferences.clone();
-        let muted = ui.visuals().weak_text_color();
-        ui.horizontal(|ui| {
-            ui.heading("History");
-            if ui.available_width() > 280.0 {
+        let buttons = [
+            (Icon::Grid, "Gallery"),
+            (Icon::List, "List"),
+            (Icon::PanelRight, "Preview"),
+            (Icon::Upload, "Upload file"),
+        ]
+        .iter()
+        .map(|(icon, label)| widgets::button_width(ui, Some(*icon), Some(label)))
+        .sum::<f32>()
+            + 4.0
+            + 2.0 * 8.0;
+        let title = |ui: &mut Ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(
-                    egui::RichText::new("All your captures and files")
-                        .small()
-                        .color(muted),
+                    egui::RichText::new("History")
+                        .font(tokens::semibold(tokens::TITLE_SIZE))
+                        .color(ui.visuals().text_color()),
                 );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.selectable_label(prefs.preview, "Preview").clicked() {
-                    prefs.preview = !prefs.preview;
-                }
-                ui.selectable_value(&mut prefs.layout, HistoryLayout::List, "List");
-                ui.selectable_value(&mut prefs.layout, HistoryLayout::Gallery, "Gallery");
+                ui.label(
+                    egui::RichText::new("Everything you've captured or uploaded")
+                        .size(tokens::BODY_SIZE)
+                        .color(ui.visuals().weak_text_color()),
+                );
             });
-        });
-        if prefs != preferences {
-            commands.push(AppCommand::SetHistoryPreferences(prefs.clone()));
+        };
+        let mut actions = |ui: &mut Ui| {
+            for (layout, icon, label) in [
+                (HistoryLayout::Gallery, Icon::Grid, "Gallery"),
+                (HistoryLayout::List, Icon::List, "List"),
+            ] {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if widgets::toggle_button(ui, prefs.layout == layout, Some(icon), label).clicked() {
+                    prefs.layout = layout;
+                }
+            }
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if widgets::toggle_button(ui, prefs.preview, Some(Icon::PanelRight), "Preview")
+                .on_hover_text("Show or hide the preview")
+                .clicked()
+            {
+                prefs.preview = !prefs.preview;
+            }
+            if widgets::primary_button(ui, Some(Icon::Upload), "Upload file").clicked() {
+                commands.push(AppCommand::ChooseUploadFile);
+            }
+        };
+        // Room for the title before the buttons wrap under it.
+        if ui.available_width() >= 300.0 + buttons {
+            ui.horizontal_top(|ui| {
+                title(ui);
+                ui.add_space(ui.available_width() - buttons);
+                actions(ui);
+            });
+        } else {
+            title(ui);
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(&mut actions);
         }
+        ui.add_space(16.0);
+        if prefs != preferences {
+            commands.push(AppCommand::SetHistoryPreferences(prefs));
+        }
+        commands
+    }
+
+    pub fn draw(&mut self, ui: &mut Ui, view: &DesktopView) -> Vec<AppCommand> {
+        self.queue_paused = view.queue_paused;
+        let mut commands = vec![];
+        let prefs = view
+            .settings
+            .as_ref()
+            .map(|s| s.history.clone())
+            .unwrap_or_default();
+        let muted = ui.visuals().weak_text_color();
         let mut changed = false;
         let mut dates_changed = false;
         let mut search_focused = false;
@@ -837,7 +894,7 @@ fn created_label(ms: i64) -> String {
         })
         .unwrap_or_default()
 }
-fn format_size(size: u64) -> String {
+pub(super) fn format_size(size: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
