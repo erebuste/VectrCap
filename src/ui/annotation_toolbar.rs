@@ -124,7 +124,11 @@ pub(super) fn color_palette(ui: &mut eframe::egui::Ui, color: &mut [u8; 3]) -> b
     use eframe::egui::{self, Stroke, StrokeKind};
     let mut changed = false;
     // Always left to right (red first), even inside a right-to-left column.
-    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+    // One row high: `with_layout` would take all the height there is (the
+    // whole screen inside a capture overlay popup) and centre the row in it.
+    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y.max(20.0));
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    ui.allocate_ui_with_layout(row, layout, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (&preset, name) in PALETTE.iter().zip(PALETTE_NAMES) {
             let (rect, response) =
@@ -277,6 +281,22 @@ mod tests {
             ToolOptions::default().to_preferences(),
             ToolPreferences::default()
         );
+    }
+
+    #[test]
+    fn the_palette_is_one_row_high_however_tall_the_space() {
+        let ctx = egui::Context::default();
+        let mut height = 0.0;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut color = [0, 0, 0];
+            height = ui
+                .scope(|ui| color_palette(ui, &mut color))
+                .response
+                .rect
+                .height();
+        });
+        output.textures_delta.clear();
+        assert!(height < 40.0, "palette is {height} pt tall");
     }
 
     #[test]
