@@ -141,6 +141,41 @@ pub(super) fn tool_button(
     response.on_hover_text(tool.label())
 }
 
+/// A dock button showing `color`; clicking it opens the palette to change it.
+/// `name` is its tooltip, screen-reader name and the palette's title.
+fn color_swatch(ui: &mut egui::Ui, name: &str, color: &mut [u8; 3]) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), name));
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(4),
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().rect(
+        rect.shrink(6.0),
+        egui::CornerRadius::same(3),
+        Color32::from_rgb(color[0], color[1], color[2]),
+        Stroke::new(1.0, Color32::from_black_alpha(140)),
+        egui::StrokeKind::Outside,
+    );
+    let response = response.on_hover_text(name);
+    egui::Popup::from_toggle_button_response(&response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.label(name);
+            super::super::annotation_toolbar::color_palette(ui, color);
+            ui.label(
+                egui::RichText::new("Kept for your next captures")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+    response
+}
+
 impl CaptureOverlay {
     pub(super) fn toolbar(&mut self, ctx: &egui::Context, transform: OverlayTransform) {
         let rect = bar_rect(
@@ -183,8 +218,8 @@ impl CaptureOverlay {
                                 !self.finishing && !self.finish_tasks_on_release,
                                 |ui| {
                                     ui.horizontal(|ui| {
-                                        // Room for the color swatch, Options, Output and ×.
-                                        let tool_width = (ui.available_width() - 210.0).max(28.0);
+                                        // Room for the two color swatches, Options, Output and ×.
+                                        let tool_width = (ui.available_width() - 242.0).max(28.0);
                                         egui::ScrollArea::horizontal()
                                             .id_salt(("capture-tool-scroll", self.document.id()))
                                             .max_width(tool_width)
@@ -265,48 +300,11 @@ impl CaptureOverlay {
                 });
         }
     }
-    /// A swatch of the current tool's color; it opens the color palette.
-    /// Tools without a color (Region, Select, Spotlight, erasers) show nothing.
+    /// The drawing and highlight color swatches, always in the dock whatever
+    /// tool is active; each opens its palette.
     fn color_button(&mut self, ui: &mut egui::Ui) {
-        let tool = self.tool;
-        let Some(color) = self.options.color_mut(tool) else {
-            return;
-        };
-        let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), egui::Sense::click());
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Drawing color")
-        });
-        let visuals = ui.style().interact(&response);
-        ui.painter().rect(
-            rect,
-            egui::CornerRadius::same(4),
-            visuals.weak_bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().rect(
-            rect.shrink(6.0),
-            egui::CornerRadius::same(3),
-            Color32::from_rgb(color[0], color[1], color[2]),
-            Stroke::new(1.0, Color32::from_black_alpha(140)),
-            egui::StrokeKind::Outside,
-        );
-        let response = response.on_hover_text("Drawing color");
-        egui::Popup::from_toggle_button_response(&response)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| {
-                ui.label(if tool == AnnotationTool::Highlight {
-                    "Highlight color"
-                } else {
-                    "Drawing color"
-                });
-                super::super::annotation_toolbar::color_palette(ui, color);
-                ui.label(
-                    egui::RichText::new("Kept for your next captures")
-                        .small()
-                        .color(ui.visuals().weak_text_color()),
-                );
-            });
+        color_swatch(ui, "Drawing color", &mut self.options.color);
+        color_swatch(ui, "Highlight color", &mut self.options.highlight_color);
     }
     fn toolbar_options(&mut self, ui: &mut egui::Ui) {
         ui.set_max_width(340.0);
@@ -418,5 +416,72 @@ mod tests {
             assert_eq!(bar.width(), width);
             assert!(bar.height() <= 40.0);
         }
+    }
+
+    /// Two frames per step; `click` presses and releases at a point first.
+    fn frame(
+        ctx: &egui::Context,
+        click: Option<Pos2>,
+        draw: &mut dyn FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut last = None;
+        for pressed in click.map_or(vec![None], |_| vec![Some(true), Some(false)]) {
+            let mut input = egui::RawInput::default();
+            if let (Some(at), Some(pressed)) = (click, pressed) {
+                input.events = vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ];
+            }
+            let mut output = ctx.run_ui(input, |ui| draw(ui));
+            output.textures_delta.clear();
+            last = Some(output);
+        }
+        last.expect("a frame ran")
+    }
+    fn named(output: &egui::FullOutput, name: &str) -> bool {
+        output
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| &update.nodes)
+            .any(|(_, node)| node.label() == Some(name))
+    }
+
+    #[test]
+    fn highlight_swatch_opens_its_palette_and_sets_the_color() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut color = [255, 255, 0];
+        let swatch = std::cell::Cell::new(Rect::NOTHING);
+        let mut draw = |ui: &mut egui::Ui| {
+            swatch.set(color_swatch(ui, "Highlight color", &mut color).rect);
+        };
+        let output = frame(&ctx, None, &mut draw);
+        assert!(named(&output, "Highlight color"));
+        assert!(!named(&output, "Red"), "palette starts closed");
+        let at = swatch.get().center();
+        frame(&ctx, Some(at), &mut draw);
+        // A new popup spends its first frame sizing itself, unseen.
+        let output = frame(&ctx, None, &mut draw);
+        assert!(named(&output, "Red"), "click opens the palette");
+        // Its accessibility bounds (points at scale 1): the popup fades in, so
+        // the painted fill isn't the exact red yet.
+        let red = output
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| &update.nodes)
+            .find(|(_, node)| node.label() == Some("Red"))
+            .and_then(|(_, node)| node.bounds())
+            .map(|b| Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+            .expect("red swatch has bounds");
+        frame(&ctx, Some(red), &mut draw);
+        assert_eq!(color, [255, 60, 60]);
     }
 }

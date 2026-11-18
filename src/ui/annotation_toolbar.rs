@@ -160,15 +160,6 @@ pub(super) fn color_palette(ui: &mut eframe::egui::Ui, color: &mut [u8; 3]) -> b
 }
 
 impl ToolOptions {
-    /// The color the current tool draws with, if it draws with one.
-    pub fn color_mut(&mut self, tool: AnnotationTool) -> Option<&mut [u8; 3]> {
-        use AnnotationTool::*;
-        match tool {
-            Highlight => Some(&mut self.highlight_color),
-            Region | Select | Spotlight | AnnotationEraser | SmartEraser => None,
-            _ => Some(&mut self.color),
-        }
-    }
     pub fn from_preferences(t: &crate::persistence::settings::ToolPreferences) -> Self {
         Self {
             color: t.color,
@@ -270,25 +261,6 @@ mod tests {
     use super::*;
     use crate::persistence::settings::ToolPreferences;
     use eframe::egui;
-
-    #[test]
-    fn each_tool_edits_its_own_color() {
-        let mut options = ToolOptions::default();
-        *options.color_mut(AnnotationTool::Rectangle).unwrap() = [1, 2, 3];
-        assert_eq!(options.color, [1, 2, 3]);
-        *options.color_mut(AnnotationTool::Highlight).unwrap() = [4, 5, 6];
-        assert_eq!(options.highlight_color, [4, 5, 6]);
-        assert_eq!(options.color, [1, 2, 3]);
-        for tool in [
-            AnnotationTool::Region,
-            AnnotationTool::Select,
-            AnnotationTool::Spotlight,
-            AnnotationTool::AnnotationEraser,
-            AnnotationTool::SmartEraser,
-        ] {
-            assert!(options.color_mut(tool).is_none(), "{tool:?}");
-        }
-    }
 
     #[test]
     fn options_round_trip_to_saved_defaults() {
