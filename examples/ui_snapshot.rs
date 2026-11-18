@@ -86,9 +86,15 @@ impl eframe::App for Snapshot {
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [name, width, height, out] = args.as_slice() else {
-        eprintln!("usage: ui_snapshot <variant> <width> <height> <out.png>");
-        std::process::exit(2);
+    let (name, width, height, out, zoom) = match args.as_slice() {
+        [name, width, height, out] => (name, width, height, out, 1.0),
+        [name, width, height, out, zoom] => {
+            (name, width, height, out, zoom.parse::<f32>().expect("zoom"))
+        }
+        _ => {
+            eprintln!("usage: ui_snapshot <variant> <width> <height> <out.png> [zoom]");
+            std::process::exit(2);
+        }
     };
     let Some(variant) = variant(name) else {
         eprintln!("unknown variant {name}");
@@ -111,7 +117,12 @@ fn main() -> eframe::Result<()> {
         "VectrCap snapshot",
         options,
         Box::new(move |cc| {
-            let mut shell = Shell::from_fixture(mockup_view(variant), cc.egui_ctx.clone());
+            // The Shell applies the UI scale setting each frame, so set it there.
+            let mut view = mockup_view(variant);
+            if let Some(settings) = view.settings.as_mut() {
+                settings.appearance.ui_scale_percent = (zoom * 100.0).round() as u16;
+            }
+            let mut shell = Shell::from_fixture(view, cc.egui_ctx.clone());
             if let MockupVariant::Settings(category) = variant {
                 shell.select_settings_category(category);
             }
