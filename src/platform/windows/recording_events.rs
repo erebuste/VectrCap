@@ -53,6 +53,35 @@ pub fn place_overlay(title: &str, bounds: PhysicalRect) -> Result<(), AppError> 
     Ok(())
 }
 
+/// Clicks on this window of ours no longer take focus from the app behind it.
+#[allow(unsafe_code)]
+pub fn never_activate(title: &str) {
+    let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        let mut pid = 0;
+        if hwnd.is_null()
+            || GetWindowThreadProcessId(hwnd, &mut pid) == 0
+            || pid != std::process::id()
+        {
+            return;
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if style & WS_EX_NOACTIVATE as isize == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
+        }
+    }
+}
+
+/// Hands the foreground to `hwnd`. Allowed while one of our windows (the
+/// selection overlay) holds it; best effort otherwise.
+#[allow(unsafe_code)]
+pub fn focus_window(hwnd: usize) {
+    unsafe {
+        SetForegroundWindow(hwnd as _);
+    }
+}
+
 #[allow(unsafe_code)]
 pub fn hide_selection(title: &str) -> Result<(), AppError> {
     let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();

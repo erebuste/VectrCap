@@ -275,7 +275,7 @@ impl CaptureOverlay {
     }
     pub fn set_scrolling_selection(&mut self) {
         self.set_recording_selection();
-        self.selection_title = "Select scrolling viewport";
+        self.selection_title = "Select the part of a window to scroll";
     }
     pub fn set_recording_selection(&mut self) {
         self.recording_selection = true;

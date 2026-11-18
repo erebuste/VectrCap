@@ -89,11 +89,15 @@ impl CaptureHost {
                                 }
                             });
                         }
-                        if let Some(status)=&mut state.scrolling_review {
-                            ui.label(format!("Scrolling capture: {} accepted segments",status.segments));
-                            if let Some(reason)=status.reason {
-                                ui.label(format!("Partial result: {reason}"));
-                                if !status.accepted && ui.button("Accept reliable partial result").clicked(){status.accepted=true;}
+                        if let Some(status) = &mut state.scrolling_review
+                            && let Some(reason) = status.reason
+                            && !status.accepted
+                        {
+                            ui.label(format!(
+                                "Stopped early ({reason}). The image ends where it stopped."
+                            ));
+                            if ui.button("Keep what was captured").clicked() {
+                                status.accepted = true;
                             }
                         }
                         let partial_blocked=state.scrolling_review.as_ref().is_some_and(|r|!r.accepted);

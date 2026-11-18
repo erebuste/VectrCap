@@ -157,10 +157,13 @@ impl ScrollingSession {
                 if matches!(self.state, ScrollState::Countdown | ScrollState::Capturing)
                     && !self.valid(&id) =>
             {
-                self.pause("Focus, target, viewport or display changed")
+                self.pause("The window lost focus, moved or was resized")
             }
             ScrollInput::Resume(id) if self.state == ScrollState::Paused && self.valid(&id) => {
                 self.stable.clear();
+                // Frames after a resume must overlap the last accepted one, so
+                // the result stays continuous: the pause no longer makes it partial.
+                self.reason = None;
                 if self.start.is_zero() {
                     self.state = ScrollState::Countdown;
                     vec![]
@@ -181,7 +184,7 @@ impl ScrollingSession {
                     return effects;
                 }
                 if !self.valid(&identity) {
-                    return self.pause("Focus, target, viewport or display changed");
+                    return self.pause("The window lost focus, moved or was resized");
                 }
                 let o = self.options.as_ref().expect("selected options");
                 if super::validate_image(&image).is_err() {
@@ -211,9 +214,7 @@ impl ScrollingSession {
                             }
                         }
                         _ => {
-                            return self.pause(
-                                "Reliable overlap could not be established; prefix retained",
-                            );
+                            return self.pause("Scrolled too far at once to stitch");
                         }
                     }
                 } else {
@@ -240,7 +241,10 @@ impl ScrollingSession {
                 vec![]
             }
             ScrollInput::Pause if self.state == ScrollState::Capturing => {
-                self.pause("Capture paused")
+                // Asked for (or a focus change): nothing was lost, so no reason.
+                self.stable.clear();
+                self.state = ScrollState::Paused;
+                vec![ScrollEffect::StopCandidates]
             }
             ScrollInput::Interrupt(reason)
                 if matches!(

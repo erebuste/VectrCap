@@ -588,6 +588,29 @@ fn terminal_runtime_event_requires_final_pixels_or_cancel() {
     assert!(event.is_terminal());
 }
 #[test]
+fn resuming_after_a_focus_pause_leaves_a_complete_result() {
+    let mut s = start(options());
+    stable(&mut s, 0, 3000);
+    let mut lost = identity();
+    lost.focused = false;
+    s.handle(ScrollInput::Observe(lost));
+    s.handle(ScrollInput::Resume(identity()));
+    stable(&mut s, 13, 4000);
+    s.handle(ScrollInput::Stop);
+    let r = s.take_review().unwrap();
+    assert_eq!(r.accepted_segments, 2);
+    assert!(r.partial_reason.is_none());
+}
+#[test]
+fn a_user_pause_is_not_a_partial_result() {
+    let mut s = start(options());
+    stable(&mut s, 0, 3000);
+    s.handle(ScrollInput::Pause);
+    assert_eq!(s.state(), ScrollState::Paused);
+    s.handle(ScrollInput::Stop);
+    assert!(s.take_review().unwrap().partial_reason.is_none());
+}
+#[test]
 fn malformed_frame_layout_pauses_without_accepting_pixels() {
     let mut s = start(options());
     for t in [3000, 3200] {

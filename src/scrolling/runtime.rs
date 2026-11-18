@@ -367,6 +367,9 @@ impl ScrollingRuntime {
                     };
                     let item = PreparedItem { item, window };
                     let raw = window_rect(native)?;
+                    // The selection overlay had focus; give it back to the
+                    // window being scrolled, or the countdown pauses at once.
+                    crate::platform::windows::recording_events::focus_window(native.hwnd);
                     let mut identity = target.identity()?;
                     identity.focused = true;
                     session.handle(ScrollInput::Select {
