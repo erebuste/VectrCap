@@ -74,6 +74,9 @@ pub struct SelectionModel {
     context: InputContext,
     alt: bool,
     cancelled: bool,
+    /// The crop is still the one the capture opened with (Fullscreen, Window,
+    /// Last region): a plain click on it confirms, like releasing a drag does.
+    preset: bool,
 }
 impl SelectionModel {
     pub fn new(
@@ -116,6 +119,7 @@ impl SelectionModel {
             preferences,
             threshold,
             crop: snapshot.initial_crop,
+            preset: snapshot.initial_crop.is_some(),
             gesture: None,
             context: InputContext::Region,
             alt: false,
@@ -172,6 +176,7 @@ impl SelectionModel {
             return SelectionOutcome::Rejected(error);
         }
         self.crop = Some(r);
+        self.preset = false;
         if changed {
             SelectionOutcome::Changed(r)
         } else {
@@ -388,6 +393,13 @@ impl SelectionModel {
                         self.hover(g.anchor)
                             .map_or(O::Unchanged, |r| self.accept(r, false))
                     }
+                } else if self.preset
+                    && let Some(crop) = self.crop
+                {
+                    // A click (no drag) on the selection the capture opened
+                    // with takes the shot, as releasing a drawn region does.
+                    self.preset = false;
+                    O::Selected(crop)
                 } else {
                     O::Unchanged
                 }
@@ -452,5 +464,79 @@ impl SelectionModel {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::geometry::{MonitorGeometry, PhysicalPoint, PhysicalRect};
+
+    /// One 200×200 screen captured with its whole area preselected, as
+    /// Fullscreen (and Window / Last region) captures open.
+    fn preselected() -> (SelectionModel, PhysicalRect) {
+        preselected_with(None)
+    }
+    /// `crop` defaults to the whole screen.
+    fn preselected_with(crop: Option<PhysicalRect>) -> (SelectionModel, PhysicalRect) {
+        let bounds = PhysicalRect::new(0, 0, 200, 200).unwrap();
+        let mut snapshot = CaptureSnapshot::new(
+            vec![0; 200 * 200 * 4],
+            bounds,
+            vec![MonitorGeometry::new("only".into(), bounds, 1.0).unwrap()],
+            vec![],
+        )
+        .unwrap();
+        let crop = crop.unwrap_or(bounds);
+        snapshot.initial_crop = Some(crop);
+        let model = SelectionModel::new(
+            &snapshot,
+            RegionCapturePreferences::default(),
+            PhysicalPoint { x: 50, y: 50 },
+            (4, 4),
+        )
+        .unwrap();
+        (model, crop)
+    }
+    fn press(m: &mut SelectionModel, p: PhysicalPoint) {
+        m.handle(SelectionInput::PrimaryDown {
+            point: p,
+            context: InputContext::Region,
+        });
+    }
+
+    #[test]
+    fn a_click_confirms_a_preselected_capture() {
+        let (mut m, bounds) = preselected();
+        let p = PhysicalPoint { x: 100, y: 100 };
+        press(&mut m, p);
+        assert_eq!(
+            m.handle(SelectionInput::PrimaryUp(p)),
+            SelectionOutcome::Selected(bounds)
+        );
+    }
+
+    #[test]
+    fn dragging_a_preselected_capture_still_moves_it() {
+        let (mut m, _) = preselected_with(Some(PhysicalRect::new(50, 50, 80, 80).unwrap()));
+        press(&mut m, PhysicalPoint { x: 100, y: 100 });
+        let moved = m.handle(SelectionInput::PrimaryUp(PhysicalPoint { x: 60, y: 100 }));
+        assert!(matches!(
+            moved,
+            SelectionOutcome::Changed(_) | SelectionOutcome::Selected(_)
+        ));
+    }
+
+    #[test]
+    fn only_the_first_click_confirms() {
+        let (mut m, _) = preselected();
+        let p = PhysicalPoint { x: 100, y: 100 };
+        press(&mut m, p);
+        m.handle(SelectionInput::PrimaryUp(p));
+        press(&mut m, p);
+        assert_eq!(
+            m.handle(SelectionInput::PrimaryUp(p)),
+            SelectionOutcome::Unchanged
+        );
     }
 }
