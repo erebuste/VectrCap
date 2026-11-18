@@ -538,8 +538,10 @@ impl AppController {
             return Err(AppError::InUse("finish recording review first"));
         }
         if self.task_runners.contains_key(&w.id) {
-            self.window = Some(Window::Tasks);
-            return Ok(vec![AppEffect::Window(self.window)]);
+            let id = w.id;
+            return Ok(vec![
+                self.focus_history(crate::app::events::HistoryFocus::Workflow(id)),
+            ]);
         }
         let review = w
             .review
@@ -557,9 +559,9 @@ impl AppController {
         }
         let mut runner = crate::workflow::runner::TaskRunner::new(context);
         runner.accept_finalized(Arc::new(a), review.archive_path().map(PathBuf::from));
+        let id = runner.context().id;
         let mut out = self.launch_tasks(runner, None)?;
-        self.window = Some(Window::Tasks);
-        out.push(AppEffect::Window(self.window));
+        out.push(self.focus_history(crate::app::events::HistoryFocus::Workflow(id)));
         Ok(out)
     }
 }

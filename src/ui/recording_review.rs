@@ -305,7 +305,9 @@ fn draw_review(
                 "Upload queued. Cancel its job in Uploads before discarding an active source.",
             );
             if ui.button("Show uploads").clicked() {
-                commands.push(AppCommand::Show(crate::app::events::Window::Uploads));
+                commands.push(AppCommand::FocusHistory(
+                    crate::app::events::HistoryFocus::InProgress,
+                ));
             }
         }
     }

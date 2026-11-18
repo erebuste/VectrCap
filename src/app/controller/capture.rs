@@ -575,8 +575,11 @@ impl AppController {
         if action == OverlayAction::RunSelectedTasks
             && (!surface.overlay.finished_on_release() || needs_attention)
         {
-            self.window = Some(Window::Tasks);
-            effects.push(AppEffect::Window(self.window));
+            effects.push(
+                self.focus_history(crate::app::events::HistoryFocus::Workflow(
+                    capture.context.id,
+                )),
+            );
         }
         // Once an external effect succeeds it must never be replayed because
         // best-effort cleanup/settings bookkeeping failed afterwards.

@@ -213,8 +213,17 @@ pub struct AppController {
     shortcut_entry_active: Option<Uuid>,
     pub lifecycle: Lifecycle,
     pub window: Option<Window>,
+    /// What History should bring into view; cleared when another page is shown.
+    pub history_focus: Option<super::events::HistoryFocus>,
 }
 impl AppController {
+    /// Opens History with `focus` in view (replaces the old Uploads, Task
+    /// results and Batch summary pages).
+    pub(super) fn focus_history(&mut self, focus: super::events::HistoryFocus) -> AppEffect {
+        self.window = Some(Window::History);
+        self.history_focus = Some(focus);
+        AppEffect::Window(self.window)
+    }
     pub fn open(
         repository: Box<dyn DestinationRepository>,
         history: Arc<History>,
@@ -288,6 +297,7 @@ impl AppController {
             shortcut_entry_active: None,
             lifecycle: Lifecycle::Running,
             window,
+            history_focus: None,
         })
     }
     pub fn startup_effects(&self) -> Vec<AppEffect> {
@@ -453,10 +463,10 @@ impl AppController {
         for id in &jobs {
             self.history.job(*id)?;
         }
+        let first = jobs[0];
         self.batch_jobs = jobs;
-        self.window = Some(Window::BatchSummary);
         Ok(vec![
-            AppEffect::Window(self.window),
+            self.focus_history(super::events::HistoryFocus::Batch(first)),
             AppEffect::CancelConnectionTest,
         ])
     }
@@ -670,8 +680,7 @@ impl AppController {
                     .get(&id)
                     .is_some_and(|r| r.context().upload_job.is_none())
                 {
-                    self.window = Some(Window::Tasks);
-                    effects.push(AppEffect::Window(self.window));
+                    effects.push(self.focus_history(super::events::HistoryFocus::Workflow(id)));
                 }
                 Ok(effects)
             }
@@ -1358,12 +1367,18 @@ impl AppController {
                 }
                 self.shortcut_entry_active = None;
                 self.window = Some(window);
+                self.history_focus = None;
                 let mut effects = vec![AppEffect::Window(self.window)];
                 if window != Window::Settings {
                     effects.push(AppEffect::CancelConnectionTest);
                     effects.push(AppEffect::StopAudioTest);
                 }
                 effects
+            }
+            AppCommand::FocusHistory(focus) => vec![self.focus_history(focus)],
+            AppCommand::ClearHistoryFocus => {
+                self.history_focus = None;
+                vec![]
             }
             AppCommand::CloseWindow => {
                 let mut effects = self.close_utility();

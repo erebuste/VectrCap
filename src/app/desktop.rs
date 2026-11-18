@@ -44,6 +44,7 @@ pub struct DesktopView {
     pub pin_picker_requests: u64,
     pub settings: Option<Settings>,
     pub window: Option<Window>,
+    pub history_focus: Option<super::events::HistoryFocus>,
     pub focus_revision: u64,
     pub lifecycle: Lifecycle,
     pub exit_requested: bool,
@@ -95,6 +96,7 @@ impl Default for DesktopView {
             pin_picker_requests: 0,
             settings: None,
             window: None,
+            history_focus: None,
             focus_revision: 0,
             lifecycle: Lifecycle::Running,
             exit_requested: false,
@@ -879,6 +881,7 @@ async fn serve(
             settings: Some(controller.settings().clone()),
             notifications_enabled: controller.notifications_enabled(),
             window: controller.window,
+            history_focus: controller.history_focus,
             focus_revision: 1,
             ..Default::default()
         },
@@ -1010,6 +1013,7 @@ async fn serve(
         }
         effects.state.scrolling = controller.scrolling_view();
         effects.state.task_workflows = controller.task_views();
+        effects.state.history_focus = controller.history_focus;
         effects.state.recording = controller.recording_view();
         effects.state.accepted_workflows = controller.active_workflow_count();
         effects.state.batch_summary = match controller.batch_summary() {

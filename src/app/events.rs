@@ -20,11 +20,19 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
-    Tasks,
     Settings,
-    Uploads,
-    BatchSummary,
     History,
+}
+/// What History should bring into view when it opens on the app's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFocus {
+    /// The In progress section (uploads, workflows waiting on the user).
+    InProgress,
+    /// A task workflow, by its runner id.
+    Workflow(Uuid),
+    Artifact(super::types::ArtifactId),
+    /// An upload batch, by one member job.
+    Batch(super::types::JobId),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
@@ -165,6 +173,9 @@ pub enum AppCommand {
         action: HistoryAction,
     },
     Show(Window),
+    /// Open History with `HistoryFocus` in view.
+    FocusHistory(HistoryFocus),
+    ClearHistoryFocus,
     CloseWindow,
     QueryHistory(crate::persistence::history::browser::HistoryQuery),
     SetHistoryFavorite {

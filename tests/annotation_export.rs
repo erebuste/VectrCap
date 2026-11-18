@@ -1972,8 +1972,12 @@ fn direct_upload_shows_the_configured_before_upload_review() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, AppEffect::Window(Some(Window::Tasks))))
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::History))))
     );
+    assert!(matches!(
+        fx.app.history_focus,
+        Some(vectrcap::app::events::HistoryFocus::Workflow(_))
+    ));
     assert!(
         !effects
             .iter()
@@ -2069,7 +2073,7 @@ fn quick_capture_runs_profile_and_closes_without_opening_task_results() {
     assert!(
         !effects
             .iter()
-            .any(|e| matches!(e, AppEffect::Window(Some(Window::Tasks))))
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::History))))
     );
     assert_eq!(fx.clipboard.images.lock().unwrap().len(), 1);
 }

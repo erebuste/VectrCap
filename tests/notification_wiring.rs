@@ -616,9 +616,10 @@ fn batch_summary_preserves_exact_order_and_resolves_current_history() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, AppEffect::Window(Some(Window::BatchSummary))))
+            .any(|e| matches!(e, AppEffect::Window(Some(Window::History))))
     );
-    assert_eq!(app.window, Some(Window::BatchSummary));
+    assert_eq!(app.window, Some(Window::History));
+    assert_eq!(app.history_focus, Some(HistoryFocus::Batch(second)));
     let rows = app.batch_summary().unwrap();
     assert_eq!(
         rows.iter().map(|r| r.id).collect::<Vec<_>>(),
@@ -630,8 +631,8 @@ fn batch_summary_preserves_exact_order_and_resolves_current_history() {
     let refreshed = app.batch_summary().unwrap();
     assert!(!refreshed[0].local_available);
     assert!(refreshed[0].job.is_some());
-    app.dispatch(AppCommand::Show(Window::Uploads));
-    app.dispatch(AppCommand::Show(Window::BatchSummary));
+    app.dispatch(AppCommand::Show(Window::Settings));
+    app.dispatch(AppCommand::Show(Window::History));
     assert_eq!(
         app.batch_summary()
             .unwrap()

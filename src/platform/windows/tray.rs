@@ -123,7 +123,7 @@ impl Tray {
                     })
                 }
                 "history" => Some(AppCommand::Show(Window::History)),
-                "uploads" => Some(AppCommand::Show(Window::Uploads)),
+                "uploads" => Some(AppCommand::Show(Window::History)),
                 "settings" => Some(AppCommand::Show(Window::Settings)),
                 "quit" => Some(AppCommand::Quit),
                 key => map

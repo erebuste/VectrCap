@@ -3,7 +3,7 @@ use crate::{
     app::{
         desktop::{DesktopClient, DesktopView},
         error::AppError,
-        events::{AppCommand, Lifecycle, QueueAction, Window},
+        events::{AppCommand, HistoryFocus, Lifecycle, QueueAction, Window},
     },
     platform::windows::{appearance, file_dialog::PickerGate, tray::Tray},
 };
@@ -285,32 +285,10 @@ impl eframe::App for Shell {
                             .color(ui.visuals().text_color()),
                     );
                     if ui
-                        .selectable_label(self.view.window == Some(Window::Uploads), "Uploads")
-                        .clicked()
-                    {
-                        commands.push(AppCommand::Show(Window::Uploads));
-                    }
-                    if ui
                         .selectable_label(self.view.window == Some(Window::Settings), "Settings")
                         .clicked()
                     {
                         commands.push(AppCommand::Show(Window::Settings));
-                    }
-                    if !self.view.batch_summary.is_empty()
-                        && ui
-                            .selectable_label(
-                                self.view.window == Some(Window::BatchSummary),
-                                "Batch summary",
-                            )
-                            .clicked()
-                    {
-                        commands.push(AppCommand::Show(Window::BatchSummary));
-                    }
-                    if ui
-                        .selectable_label(self.view.window == Some(Window::Tasks), "Task results")
-                        .clicked()
-                    {
-                        commands.push(AppCommand::Show(Window::Tasks));
                     }
                     if ui
                         .selectable_label(self.view.window == Some(Window::History), "History")
@@ -362,7 +340,7 @@ impl eframe::App for Shell {
                             );
                         }
                     });
-                    if self.view.queue_paused && self.view.window != Some(Window::Uploads) {
+                    if self.view.queue_paused {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 eframe::egui::RichText::new("Uploads are paused.")
@@ -375,7 +353,6 @@ impl eframe::App for Shell {
                             }
                         });
                     } else if !self.view.queue_paused
-                        && self.view.window != Some(Window::Uploads)
                         && self
                             .view
                             .jobs
@@ -394,6 +371,43 @@ impl eframe::App for Shell {
                     }
                     if self.view.window == Some(Window::History) {
                         if self.view.settings.is_some() {
+                            // Interim until the In progress section and inspector
+                            // (redesign Tasks 5-6) replace these three old pages.
+                            egui::CollapsingHeader::new("Uploads")
+                                .default_open(
+                                    self.view.history_focus == Some(HistoryFocus::InProgress),
+                                )
+                                .show(ui, |ui| {
+                                    commands.extend(super::uploads::draw(
+                                        ui,
+                                        &self.view,
+                                        &self.client,
+                                        &self.picker_gate,
+                                    ))
+                                });
+                            if !self.view.task_workflows.is_empty() {
+                                egui::CollapsingHeader::new("Task results")
+                                    .default_open(matches!(
+                                        self.view.history_focus,
+                                        Some(HistoryFocus::Workflow(_))
+                                    ))
+                                    .show(ui, |ui| {
+                                        commands.extend(super::task_results::draw(
+                                            ui,
+                                            &self.view.task_workflows,
+                                            &self.client,
+                                            &self.picker_gate,
+                                        ))
+                                    });
+                            }
+                            if !self.view.batch_summary.is_empty() {
+                                egui::CollapsingHeader::new("Batch summary")
+                                    .default_open(matches!(
+                                        self.view.history_focus,
+                                        Some(HistoryFocus::Batch(_))
+                                    ))
+                                    .show(ui, |ui| super::batch_summary::draw(ui, &self.view));
+                            }
                             commands.extend(self.history.draw(ui, &self.view));
                         } else {
                             ui.label("Opening local settings…");
@@ -458,25 +472,6 @@ impl eframe::App for Shell {
                                     self.view.notifications_enabled,
                                     &self.view.shortcut_statuses,
                                     self.view.recorded_shortcut,
-                                ))
-                            }
-                            (Some(Window::Tasks), Some(_)) => {
-                                commands.extend(super::task_results::draw(
-                                    ui,
-                                    &self.view.task_workflows,
-                                    &self.client,
-                                    &self.picker_gate,
-                                ))
-                            }
-                            (Some(Window::BatchSummary), Some(_)) => {
-                                super::batch_summary::draw(ui, &self.view);
-                            }
-                            (Some(Window::Uploads), Some(_)) => {
-                                commands.extend(super::uploads::draw(
-                                    ui,
-                                    &self.view,
-                                    &self.client,
-                                    &self.picker_gate,
                                 ))
                             }
                             (_, None) => {

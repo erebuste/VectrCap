@@ -87,13 +87,35 @@ fn first_run_opens_setup_close_keeps_tray_alive() {
     assert_eq!(app.window, None);
     assert_eq!(app.lifecycle, Lifecycle::Running);
     assert!(matches!(
-        app.dispatch(AppCommand::Show(Window::Uploads)).as_slice(),
+        app.dispatch(AppCommand::Show(Window::History)).as_slice(),
         [
-            AppEffect::Window(Some(Window::Uploads)),
+            AppEffect::Window(Some(Window::History)),
             AppEffect::CancelConnectionTest,
             AppEffect::StopAudioTest
         ]
     ));
+}
+#[test]
+fn focus_history_opens_history_with_that_focus() {
+    let (_dir, mut app) = app();
+    app.dispatch(AppCommand::FocusHistory(HistoryFocus::InProgress));
+    assert_eq!(app.window, Some(Window::History));
+    assert_eq!(app.history_focus, Some(HistoryFocus::InProgress));
+}
+#[test]
+fn clear_history_focus_clears_it() {
+    let (_dir, mut app) = app();
+    app.dispatch(AppCommand::FocusHistory(HistoryFocus::InProgress));
+    app.dispatch(AppCommand::ClearHistoryFocus);
+    assert_eq!(app.window, Some(Window::History));
+    assert_eq!(app.history_focus, None);
+}
+#[test]
+fn showing_a_page_drops_a_stale_focus() {
+    let (_dir, mut app) = app();
+    app.dispatch(AppCommand::FocusHistory(HistoryFocus::InProgress));
+    app.dispatch(AppCommand::Show(Window::Settings));
+    assert_eq!(app.history_focus, None);
 }
 #[test]
 fn quit_waits_for_worker_drain_and_rejects_new_work() {

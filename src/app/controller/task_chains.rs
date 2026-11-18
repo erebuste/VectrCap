@@ -29,8 +29,7 @@ impl AppController {
     ) -> Result<Vec<AppEffect>, AppError> {
         let id = runner.context().id;
         if self.task_runners.contains_key(&id) {
-            self.window = Some(Window::Tasks);
-            return Ok(vec![AppEffect::Window(self.window)]);
+            return Ok(vec![self.focus_history(HistoryFocus::Workflow(id))]);
         }
         // Acceptance is safety-critical: a checkpoint failure must prevent all
         // downstream publication. Save before exposing the workflow to effects.
@@ -71,8 +70,7 @@ impl AppController {
                 | CaptureTask::BeforeUploadReview
                 | CaptureTask::SaveAs,
             ) => {
-                self.window = Some(Window::Tasks);
-                out.push(AppEffect::Window(self.window));
+                out.push(self.focus_history(HistoryFocus::Workflow(c.id)));
                 Ok(None)
             }
             TaskStep::Capture(CaptureTask::SaveFinal) => {
@@ -192,8 +190,7 @@ impl AppController {
                     UploadTask::CopyUrl => self.clipboard.write_text(receipt.url())?,
                     UploadTask::OpenUrl => self.shell.open_url(receipt.url())?,
                     UploadTask::ShowResult => {
-                        self.window = Some(Window::Tasks);
-                        out.push(AppEffect::Window(self.window));
+                        out.push(self.focus_history(HistoryFocus::Workflow(c.id)));
                     }
                 }
                 Ok(Some(StepResult::Succeeded))
@@ -379,8 +376,7 @@ impl AppController {
             }
         };
         let mut out = self.drive_tasks(id, input);
-        self.window = Some(Window::Tasks);
-        out.push(AppEffect::Window(self.window));
+        out.push(self.focus_history(HistoryFocus::Workflow(id)));
         Ok(out)
     }
     pub(super) fn task_upload_changed(
