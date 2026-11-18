@@ -124,39 +124,66 @@ impl HistoryPane {
                 );
             });
         };
-        let mut actions = |ui: &mut Ui| {
-            for (layout, icon, label) in [
-                (HistoryLayout::Gallery, Icon::Grid, "Gallery"),
-                (HistoryLayout::List, Icon::List, "List"),
-            ] {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if widgets::toggle_button(ui, prefs.layout == layout, Some(icon), label).clicked() {
-                    prefs.layout = layout;
+        // `toggles`: Gallery / List / Preview; `upload`: the primary action.
+        let mut actions = |ui: &mut Ui, toggles: bool, upload: bool| {
+            if toggles {
+                for (layout, icon, label) in [
+                    (HistoryLayout::Gallery, Icon::Grid, "Gallery"),
+                    (HistoryLayout::List, Icon::List, "List"),
+                ] {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if widgets::toggle_button(ui, prefs.layout == layout, Some(icon), label)
+                        .clicked()
+                    {
+                        prefs.layout = layout;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if widgets::toggle_button(ui, prefs.preview, Some(Icon::PanelRight), "Preview")
+                    .on_hover_text("Show or hide the preview")
+                    .clicked()
+                {
+                    prefs.preview = !prefs.preview;
                 }
             }
-            ui.add_space(4.0);
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if widgets::toggle_button(ui, prefs.preview, Some(Icon::PanelRight), "Preview")
-                .on_hover_text("Show or hide the preview")
-                .clicked()
-            {
-                prefs.preview = !prefs.preview;
-            }
-            if widgets::primary_button(ui, Some(Icon::Upload), "Upload file").clicked() {
+            if upload && widgets::primary_button(ui, Some(Icon::Upload), "Upload file").clicked() {
                 commands.push(AppCommand::ChooseUploadFile);
             }
         };
-        // Room for the title before the buttons wrap under it.
-        if ui.available_width() >= 300.0 + buttons {
+        // Wraps like the mockup's flex row: what doesn't fit beside the title
+        // moves to the next line, Upload file first.
+        let upload = widgets::button_width(ui, Some(Icon::Upload), Some("Upload file")) + 8.0;
+        let toggles = buttons - upload;
+        let title_width = ui
+            .painter()
+            .layout_no_wrap(
+                "Everything you've captured or uploaded".into(),
+                egui::FontId::proportional(tokens::BODY_SIZE),
+                egui::Color32::PLACEHOLDER,
+            )
+            .size()
+            .x
+            + 16.0;
+        let room = ui.available_width();
+        if room >= title_width + buttons {
             ui.horizontal_top(|ui| {
                 title(ui);
                 ui.add_space(ui.available_width() - buttons);
-                actions(ui);
+                actions(ui, true, true);
             });
+        } else if room >= title_width + toggles {
+            ui.horizontal_top(|ui| {
+                title(ui);
+                ui.add_space(ui.available_width() - toggles);
+                actions(ui, true, false);
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| actions(ui, false, true));
         } else {
             title(ui);
             ui.add_space(8.0);
-            ui.horizontal_wrapped(&mut actions);
+            ui.horizontal_wrapped(|ui| actions(ui, true, true));
         }
         ui.add_space(16.0);
         if prefs != preferences {

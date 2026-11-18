@@ -11,13 +11,13 @@ pub struct IntegrationsPane {
     error: Option<AppError>,
 }
 fn status_pill(ui: &mut Ui, status: RegistrationStatus) {
-    let (text, tone) = match status {
-        RegistrationStatus::Enabled => ("On", PillTone::Success),
-        RegistrationStatus::Disabled => ("Off", PillTone::Neutral),
-        RegistrationStatus::Stale => ("Needs repair", PillTone::Warning),
-        RegistrationStatus::Foreign => ("Another app", PillTone::Warning),
+    // On/off is the switch; a pill only flags the states a switch can't show.
+    let text = match status {
+        RegistrationStatus::Enabled | RegistrationStatus::Disabled => return,
+        RegistrationStatus::Stale => "Needs repair",
+        RegistrationStatus::Foreign => "Another app",
     };
-    widgets::pill(ui, text, tone);
+    widgets::pill(ui, text, PillTone::Warning);
 }
 impl IntegrationsPane {
     pub fn draw(&mut self, ui: &mut Ui) {
@@ -35,6 +35,15 @@ impl IntegrationsPane {
         let registry = NativeRegistry;
         let explorer = ExplorerIntegration::new(&registry, executable.clone());
         let association = DestinationAssociation::new(&registry, executable);
+        // Read (never write) the registration once, so the switches show the
+        // real state; every change still waits for a switch flip.
+        if self.status.is_none() {
+            self.status = Some(
+                explorer
+                    .status()
+                    .and_then(|a| association.status().map(|b| (a, b))),
+            );
+        }
         let known = match &self.status {
             Some(Ok(pair)) => Some(*pair),
             _ => None,
@@ -79,12 +88,18 @@ impl IntegrationsPane {
                                 widgets::hint(ui, description);
                             },
                             |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                if widgets::ghost_button(ui, None, "Turn off").clicked() {
-                                    action = Some(index + 1);
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                // Stale still points at VectrCap, just an old path.
+                                let registered = matches!(
+                                    status,
+                                    Some(RegistrationStatus::Enabled | RegistrationStatus::Stale)
+                                );
+                                let mut on = registered;
+                                if widgets::toggle_switch(ui, &mut on, label).changed() {
+                                    action = Some(if on { index } else { index + 1 });
                                 }
-                                if widgets::toggle_button(ui, false, None, "Turn on / repair")
-                                    .clicked()
+                                if status == Some(RegistrationStatus::Stale)
+                                    && widgets::ghost_button(ui, None, "Repair").clicked()
                                 {
                                     action = Some(index);
                                 }
@@ -92,27 +107,24 @@ impl IntegrationsPane {
                         );
                     });
                 }
-                widgets::card_footer(ui, |ui| {
-                    if widgets::toggle_button(ui, false, None, "Check status").clicked() {
-                        self.status = Some(
-                            explorer
-                                .status()
-                                .and_then(|a| association.status().map(|b| (a, b))),
-                        );
-                    }
-                    match &self.status {
-                        None => {
-                            widgets::hint(ui, "Status is read only when you ask.");
+                // Only shown when something needs saying: a failed read or change.
+                let read_error = match &self.status {
+                    Some(Err(error)) => Some(error.to_string()),
+                    _ => None,
+                };
+                if read_error.is_some() || self.error.is_some() {
+                    widgets::card_footer(ui, |ui| {
+                        for message in read_error
+                            .iter()
+                            .chain(self.error.as_ref().map(|e| e.to_string()).iter())
+                        {
+                            ui.colored_label(ui.visuals().error_fg_color, message);
                         }
-                        Some(Err(error)) => {
-                            ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                        if widgets::ghost_button(ui, None, "Check again").clicked() {
+                            self.status = None;
                         }
-                        Some(Ok(_)) => {}
-                    }
-                    if let Some(error) = &self.error {
-                        ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                    }
-                });
+                    });
+                }
             },
         );
         if let Some(action) = action {

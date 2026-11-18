@@ -1249,6 +1249,20 @@ mod tests {
     }
 
     #[test]
+    fn integrations_are_switches() {
+        let integrations = switches(SettingsCategory::Integrations);
+        for name in [
+            "\"Upload with Vectr\" in Explorer",
+            "Open .vectrcap files with VectrCap",
+        ] {
+            assert!(
+                integrations.iter().any(|l| l == name),
+                "{name} missing: {integrations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn select_sets_the_shown_category() {
         let mut pane = SettingsPane::default();
         pane.select(SettingsCategory::Shortcuts);

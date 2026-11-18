@@ -96,11 +96,14 @@ impl TroubleshootingPane {
     pub fn snapshot(&self) -> &DiagnosticSnapshot {
         &self.snapshot
     }
+    /// The two Troubleshooting groups (mockup: "Connection check", "Diagnostic
+    /// report"), one action per row. Drawing is pure; actions are returned.
     pub fn controls(
         &mut self,
         ui: &mut egui::Ui,
         settings: &Settings,
     ) -> Vec<TroubleshootingAction> {
+        use super::widgets;
         let mut actions = Vec::new();
         if self
             .selected
@@ -109,17 +112,88 @@ impl TroubleshootingPane {
             self.selected = settings.destinations.default_id();
         }
         let previous = self.selected;
-        egui::ComboBox::from_id_salt("diagnostic-destination")
-            .selected_text(
-                self.selected
+        widgets::setting_group(
+            ui,
+            "Connection check",
+            Some(
+                "Sends a health request and a token-only uploader request. No test upload is created.",
+            ),
+            |ui| {
+                widgets::setting_row(ui, "Connection", None, |ui| {
+                    egui::ComboBox::from_id_salt("diagnostic-destination")
+                        .selected_text(
+                            self.selected
+                                .and_then(|id| settings.destinations.get(id))
+                                .map_or("Select a connection", |d| d.name.as_str()),
+                        )
+                        .show_ui(ui, |ui| {
+                            for d in settings.destinations.iter() {
+                                ui.selectable_value(&mut self.selected, Some(d.id), &d.name);
+                            }
+                        });
+                });
+                let name = self
+                    .selected
                     .and_then(|id| settings.destinations.get(id))
-                    .map_or("Select destination", |d| d.name.as_str()),
-            )
-            .show_ui(ui, |ui| {
-                for d in settings.destinations.iter() {
-                    ui.selectable_value(&mut self.selected, Some(d.id), &d.name);
+                    .map_or("the connection", |d| d.name.as_str());
+                widgets::setting_row(
+                    ui,
+                    "Test connection",
+                    Some(&format!(
+                        "Checks that {name} is reachable and the token works. Nothing is uploaded."
+                    )),
+                    |ui| {
+                        if self.connection.is_some() {
+                            if widgets::ghost_button(ui, None, "Cancel").clicked() {
+                                actions.push(TroubleshootingAction::CancelConnection);
+                            }
+                            ui.spinner();
+                        } else {
+                            let run = ui
+                                .add_enabled_ui(self.selected.is_some(), |ui| {
+                                    widgets::toggle_button(ui, false, None, "Run test").clicked()
+                                })
+                                .inner;
+                            if run && let Some(id) = self.selected {
+                                actions.push(TroubleshootingAction::TestConnection(id));
+                            }
+                        }
+                    },
+                );
+                let connection = &self.snapshot.connection;
+                let tested = connection.health.availability != Availability::NotProbed
+                    || connection.uploader.status != TokenStatus::NotTested;
+                if tested {
+                    widgets::card_block(ui, |ui| {
+                        widgets::hint(
+                            ui,
+                            &format!(
+                                "Service: {:?}. A healthy service doesn't prove the token works.",
+                                connection.health.availability
+                            ),
+                        );
+                        widgets::hint(
+                            ui,
+                            match connection.uploader.status {
+                                TokenStatus::NotTested => "Token: not tested",
+                                TokenStatus::NeedsSetup => "Token: needs setup",
+                                TokenStatus::Verified => "Token: verified",
+                                TokenStatus::UnverifiedManualDomain => {
+                                    "Token: unverified (the server has no metadata endpoint); manual domain only"
+                                }
+                                TokenStatus::Failed => "Token: test failed",
+                            },
+                        );
+                        for code in [connection.health.error, connection.uploader.error]
+                            .into_iter()
+                            .flatten()
+                        {
+                            widgets::hint(ui, &format!("Code: {code:?}"));
+                        }
+                    });
                 }
-            });
+            },
+        );
         if previous != self.selected || self.revision != Some(settings.revision) {
             self.cancel_connection();
             self.connection_cancel = None;
@@ -127,113 +201,111 @@ impl TroubleshootingPane {
             self.connection = None;
             self.revision = Some(settings.revision);
         }
-        ui.label("Refresh reads aggregate counts and bounded storage metadata. Capture, encoder and audio remain unprobed; no streams or permissions are opened.");
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(self.refresh.is_none(), egui::Button::new("Refresh"))
-                .clicked()
-            {
-                actions.push(TroubleshootingAction::Refresh);
-            }
-            if ui
-                .add_enabled(
-                    self.connection.is_none() && self.selected.is_some(),
-                    egui::Button::new("Test connection"),
-                )
-                .clicked()
-                && let Some(id) = self.selected
-            {
-                actions.push(TroubleshootingAction::TestConnection(id));
-            }
-            if ui
-                .add_enabled(
-                    self.connection.is_some(),
-                    egui::Button::new("Cancel connection test"),
-                )
-                .clicked()
-            {
-                actions.push(TroubleshootingAction::CancelConnection);
-            }
-            if ui
-                .add_enabled(
-                    self.file.is_none() && self.replace.is_none(),
-                    egui::Button::new("Preview diagnostic report"),
-                )
-                .clicked()
-            {
-                actions.push(TroubleshootingAction::Preview);
-            }
-        });
-        ui.label("Test connection sends only GET /healthz without credentials and the token-only GET /api/uploader to the selected destination. No test upload is created.");
-        ui.label(format!(
-            "Service health: {:?}. A healthy service does not validate a token.",
-            self.snapshot.connection.health.availability
-        ));
-        ui.label(match self.snapshot.connection.uploader.status {
-            TokenStatus::NotTested=>"Token: not tested",
-            TokenStatus::NeedsSetup=>"Token: needs setup",
-            TokenStatus::Verified=>"Token: verified by uploader metadata",
-            TokenStatus::UnverifiedManualDomain=>"Token: unverified (metadata endpoint returned 404); manual domain compatibility only",
-            TokenStatus::Failed=>"Token: test failed; no compatibility fallback",
-        });
-        for probe in [
-            self.snapshot.connection.health.error,
-            self.snapshot.connection.uploader.error,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            ui.label(format!("Connection code: {probe:?}"));
-        }
-        ui.label(format!(
-            "History: {:?}; unfinished jobs: {}; completed jobs: {}",
-            self.snapshot.history.availability,
-            self.snapshot.pending_jobs,
-            self.snapshot.completed_jobs
-        ));
-        for s in self.snapshot.storage {
-            ui.label(format!(
-                "{:?}: {:?}, {} files, {} bytes{}",
-                s.label,
-                s.availability,
-                s.files,
-                s.bytes,
-                if s.partial { " (partial scan)" } else { "" }
-            ));
-        }
-        if let Some(preview) = &self.preview {
-            ui.separator();
-            ui.label("Frozen preview below: Save/Copy use exactly these bytes. Refresh never replaces this preview. Review it before sharing; nothing is sent automatically.");
-            egui::ScrollArea::vertical()
-                .id_salt("diagnostic-preview")
-                .max_height(240.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(preview.as_str()).monospace())
-                            .selectable(true),
-                    );
-                });
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.file.is_none() && self.replace.is_none(),
-                        egui::Button::new("Save diagnostic report..."),
-                    )
-                    .clicked()
-                {
-                    actions.push(TroubleshootingAction::Save);
+        ui.add_space(super::tokens::GROUP_GAP);
+        widgets::setting_group(
+            ui,
+            "Diagnostic report",
+            Some(
+                "Counts and error codes only: no file names, links or tokens. Nothing is sent automatically.",
+            ),
+            |ui| {
+                widgets::setting_row(
+                    ui,
+                    "Refresh counts",
+                    Some(
+                        "Reads history and storage totals. Capture, encoder and audio aren't probed.",
+                    ),
+                    |ui| {
+                        let refresh = ui
+                            .add_enabled_ui(self.refresh.is_none(), |ui| {
+                                widgets::toggle_button(ui, false, None, "Refresh").clicked()
+                            })
+                            .inner;
+                        if refresh {
+                            actions.push(TroubleshootingAction::Refresh);
+                        }
+                    },
+                );
+                if self.snapshot.history.availability != Availability::NotProbed {
+                    widgets::card_block(ui, |ui| {
+                        widgets::hint(
+                            ui,
+                            &format!(
+                                "History: {:?}; {} unfinished, {} completed uploads",
+                                self.snapshot.history.availability,
+                                self.snapshot.pending_jobs,
+                                self.snapshot.completed_jobs
+                            ),
+                        );
+                        for s in self.snapshot.storage {
+                            widgets::hint(
+                                ui,
+                                &format!(
+                                    "{:?}: {:?}, {} files, {} bytes{}",
+                                    s.label,
+                                    s.availability,
+                                    s.files,
+                                    s.bytes,
+                                    if s.partial { " (partial scan)" } else { "" }
+                                ),
+                            );
+                        }
+                    });
                 }
-                if ui
-                    .add_enabled(
-                        self.file.is_none(),
-                        egui::Button::new("Copy diagnostic report"),
-                    )
-                    .clicked()
-                {
-                    actions.push(TroubleshootingAction::Copy);
+                widgets::setting_row(
+                    ui,
+                    "Preview a report",
+                    Some("Freezes the current counts into the exact text Save and Copy use."),
+                    |ui| {
+                        let preview = ui
+                            .add_enabled_ui(self.file.is_none() && self.replace.is_none(), |ui| {
+                                widgets::toggle_button(ui, false, None, "Preview…").clicked()
+                            })
+                            .inner;
+                        if preview {
+                            actions.push(TroubleshootingAction::Preview);
+                        }
+                    },
+                );
+                if let Some(preview) = &self.preview {
+                    widgets::card_block(ui, |ui| {
+                        widgets::hint(
+                            ui,
+                            "Refresh never replaces this preview. Review it before sharing.",
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("diagnostic-preview")
+                            .max_height(240.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(preview.as_str()).monospace(),
+                                    )
+                                    .selectable(true),
+                                );
+                            });
+                    });
+                    widgets::card_footer(ui, |ui| {
+                        let save = ui
+                            .add_enabled_ui(self.file.is_none() && self.replace.is_none(), |ui| {
+                                widgets::toggle_button(ui, false, None, "Save report…").clicked()
+                            })
+                            .inner;
+                        if save {
+                            actions.push(TroubleshootingAction::Save);
+                        }
+                        let copy = ui
+                            .add_enabled_ui(self.file.is_none(), |ui| {
+                                widgets::toggle_button(ui, false, None, "Copy report").clicked()
+                            })
+                            .inner;
+                        if copy {
+                            actions.push(TroubleshootingAction::Copy);
+                        }
+                    });
                 }
-            });
-        }
+            },
+        );
         actions
     }
     pub(crate) fn poll(&mut self, settings: &Settings) {
@@ -323,14 +395,7 @@ impl TroubleshootingPane {
         client: &DesktopClient,
         gate: &PickerGate,
     ) {
-        super::widgets::setting_group(
-            ui,
-            "Connection check and diagnostic report",
-            Some(
-                "The check sends a health request and a token check to one connection; nothing is uploaded. The report holds counts and error codes only: no file names, links or tokens.",
-            ),
-            |ui| super::widgets::card_block(ui, |ui| self.draw_body(ui, settings, client, gate)),
-        );
+        self.draw_body(ui, settings, client, gate);
     }
     fn draw_body(
         &mut self,
@@ -405,32 +470,43 @@ impl TroubleshootingPane {
                 }
             }
         }
-        if self.replace.is_some() && self.file.is_none() {
-            ui.label("Replace the selected diagnostic report with the frozen preview?");
-            if ui.button("Confirm diagnostic report replacement").clicked()
-                && let Some((path, preview)) = self.replace.take()
-            {
-                self.start_file(ui.ctx(), move || {
-                    preview.save(&path, true)?;
-                    Ok(FileResult::Saved)
+        let replacing = self.replace.is_some() && self.file.is_none();
+        let busy = self.refresh.is_some() || self.connection.is_some() || self.file.is_some();
+        if replacing || busy || self.status.is_some() || self.error.is_some() {
+            ui.add_space(14.0);
+            super::widgets::card(ui, |ui| {
+                super::widgets::card_block(ui, |ui| {
+                    if replacing {
+                        ui.label("Replace the existing report file with this preview?");
+                        ui.horizontal_wrapped(|ui| {
+                            if super::widgets::toggle_button(ui, false, None, "Replace").clicked()
+                                && let Some((path, preview)) = self.replace.take()
+                            {
+                                self.start_file(ui.ctx(), move || {
+                                    preview.save(&path, true)?;
+                                    Ok(FileResult::Saved)
+                                });
+                            }
+                            if super::widgets::ghost_button(ui, None, "Cancel").clicked() {
+                                self.replace = None;
+                            }
+                        });
+                    }
+                    if let Some(status) = self.status {
+                        ui.label(status);
+                    }
+                    if let Some(code) = self.error {
+                        ui.label(format!(
+                            "Diagnostic operation: {code:?}. Capture remains available."
+                        ));
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
                 });
-            }
-            if ui.button("Cancel diagnostic export").clicked() {
-                self.replace = None;
-            }
+            });
         }
-        if let Some(status) = self.status {
-            ui.label(status);
-        }
-        if let Some(code) = self.error {
-            ui.label(format!(
-                "Diagnostic operation: {code:?}. Capture remains available."
-            ));
-        }
-        if self.refresh.is_some() || self.connection.is_some() || self.file.is_some() {
-            ui.spinner();
-        }
-        if self.refresh.is_some() || self.connection.is_some() || self.file.is_some() {
+        if busy {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
