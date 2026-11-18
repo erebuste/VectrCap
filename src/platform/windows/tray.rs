@@ -129,6 +129,23 @@ pub fn menu_layout(
 fn error() -> AppError {
     AppError::Persistence("native tray unavailable")
 }
+/// A left click on the icon starts a region capture (as in ShareX); the menu
+/// opens on right click. Acts on release, so one click is one capture.
+fn tray_click_command(event: &tray_icon::TrayIconEvent) -> Option<AppCommand> {
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+    matches!(
+        event,
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+    )
+    .then(|| AppCommand::StartCapture {
+        mode: crate::capture::request::CaptureMode::Region,
+        selection: Default::default(),
+    })
+}
 impl Tray {
     #[allow(unsafe_code)]
     pub fn new(
@@ -139,6 +156,14 @@ impl Tray {
         let choices: Choices = Arc::new(Mutex::new(HashMap::new()));
         let map = choices.clone();
         let hotkey_client = client.clone();
+        let click_client = client.clone();
+        tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+            if let Some(command) = tray_click_command(&event)
+                && let Err(error) = click_client.submit(command)
+            {
+                click_client.report_error(error);
+            }
+        }));
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if event.id.as_ref() == "upload-file" {
                 super::file_dialog::spawn_pick_and_upload(client.clone(), picker_gate.clone());
@@ -213,7 +238,8 @@ impl Tray {
             }
         }
         let icon = TrayIconBuilder::new()
-            .with_tooltip("VectrCap")
+            .with_tooltip("VectrCap — click to capture a region")
+            .with_menu_on_left_click(false)
             .with_icon(Icon::from_rgba(pixels, 24, 24).map_err(|_| error())?)
             .build()
             .map_err(|_| error())?;
@@ -326,12 +352,37 @@ fn append(
 impl Drop for Tray {
     fn drop(&mut self) {
         MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
+        tray_icon::TrayIconEvent::set_event_handler(None::<fn(tray_icon::TrayIconEvent)>);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_left_click_on_the_tray_icon_starts_a_region_capture() {
+        use tray_icon::{
+            MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId, dpi::PhysicalPosition,
+        };
+        let click = |button, button_state| TrayIconEvent::Click {
+            id: TrayIconId::new("tray"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button,
+            button_state,
+        };
+        assert!(matches!(
+            tray_click_command(&click(MouseButton::Left, MouseButtonState::Up)),
+            Some(AppCommand::StartCapture {
+                mode: crate::capture::request::CaptureMode::Region,
+                ..
+            })
+        ));
+        // One capture per click, and the right button keeps the menu.
+        assert!(tray_click_command(&click(MouseButton::Left, MouseButtonState::Down)).is_none());
+        assert!(tray_click_command(&click(MouseButton::Right, MouseButtonState::Up)).is_none());
+    }
 
     fn label(node: &MenuNode) -> String {
         match node {
