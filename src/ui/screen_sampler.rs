@@ -175,9 +175,29 @@ impl UtilitySurface {
             if response.clicked_by(egui::PointerButton::Secondary) {
                 input = Some(UtilityInput::Close);
             }
-            egui::Window::new("Frozen screen sample")
+            // The overlay spans every monitor; keep the panel on the screen
+            // being sampled (its corner could be on another screen or off all).
+            let point = transform.logical(self.session.sampler.point);
+            let screen = self
+                .session
+                .snapshot()
+                .and_then(|snapshot| {
+                    snapshot
+                        .monitors()
+                        .iter()
+                        .map(|monitor| transform.rect(monitor.bounds()))
+                        .find(|bounds| bounds.contains(point))
+                })
+                .unwrap_or(viewport);
+            let size_key = ui.make_persistent_id("sample-panel-size");
+            let size = ctx
+                .data(|d| d.get_temp::<egui::Vec2>(size_key))
+                .unwrap_or(egui::vec2(260.0, 170.0));
+            let panel = egui::Window::new("Frozen screen sample")
                 .resizable(false)
-                .default_pos(viewport.min + egui::vec2(12.0, 12.0))
+                .collapsible(false)
+                .fixed_pos(sample_panel_position(screen, size, point))
+                .constrain_to(screen)
                 .show(&ctx, |ui| {
                     ui.label("Frozen source · physical pixels");
                     ui.label("Select a pixel to open its result. Copy is explicit.");
@@ -209,8 +229,27 @@ impl UtilitySurface {
                         ui.colored_label(Color32::LIGHT_RED, error.to_string());
                     }
                 });
+            if let Some(panel) = panel {
+                ctx.data_mut(|d| d.insert_temp(size_key, panel.response.rect.size()));
+            }
         }
         Ok(input)
+    }
+}
+
+/// The sample panel's corner on `screen`: top-left, or top-right while the
+/// sampling point is under the top-left spot (the lens follows the pointer,
+/// so the panel stays out of its way instead of chasing it).
+fn sample_panel_position(screen: egui::Rect, size: egui::Vec2, point: egui::Pos2) -> egui::Pos2 {
+    const GAP: f32 = 12.0;
+    let left = egui::pos2(screen.left() + GAP, screen.top() + GAP);
+    if egui::Rect::from_min_size(left, size)
+        .expand(GAP)
+        .contains(point)
+    {
+        egui::pos2((screen.right() - GAP - size.x).max(screen.left()), left.y)
+    } else {
+        left
     }
 }
 
@@ -327,6 +366,21 @@ pub fn show_host(ctx: &egui::Context, client: &DesktopClient, view: &DesktopView
 mod tests {
     use super::*;
     use crate::{capture::geometry::MonitorGeometry, tools::UtilitySnapshot};
+
+    #[test]
+    fn sample_panel_stays_on_the_sampled_screen_away_from_the_pointer() {
+        // The second of two side-by-side screens.
+        let screen = egui::Rect::from_min_size(egui::pos2(1000.0, 0.0), egui::vec2(1000.0, 800.0));
+        let size = egui::vec2(220.0, 150.0);
+        let far = sample_panel_position(screen, size, egui::pos2(1600.0, 500.0));
+        assert_eq!(far, egui::pos2(1012.0, 12.0));
+        let near = sample_panel_position(screen, size, egui::pos2(1050.0, 40.0));
+        assert_eq!(near, egui::pos2(2000.0 - 12.0 - size.x, 12.0));
+        for pos in [far, near] {
+            assert!(screen.contains_rect(egui::Rect::from_min_size(pos, size)));
+        }
+    }
+
     #[test]
     fn canvas_click_keeps_remapped_ruler_keys_active() {
         let b = PhysicalRect::new(0, 0, 800, 600).unwrap();

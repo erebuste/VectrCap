@@ -204,9 +204,57 @@ pub(crate) fn show(
     if let Some(drag) = &state.drag {
         paint_valid(ui, state, transform, drag.rect()?, Color32::WHITE, true);
     }
-    egui::Window::new("Pixel ruler")
+    // The overlay spans every monitor, so its corner can be on another screen
+    // or in a gap no monitor covers: place the panel beside what is being
+    // measured, inside that measurement's monitor.
+    let anchor = state
+        .drag
+        .as_ref()
+        .and_then(|drag| drag.rect().ok())
+        .or_else(|| state.session.ruler.selected())
+        .or_else(|| preview.as_ref().ok().and_then(|run| run.rect().ok()))
+        .map(|rect| transform.rect(rect))
+        .or_else(|| {
+            response
+                .hover_pos()
+                .map(|p| egui::Rect::from_min_size(p, egui::Vec2::ZERO))
+        });
+    let screen = anchor
+        .and_then(|anchor| {
+            snapshot
+                .monitors()
+                .iter()
+                .map(|monitor| transform.rect(monitor.bounds()))
+                .find(|bounds| bounds.contains(anchor.center()))
+        })
+        .unwrap_or_else(|| ctx.viewport_rect());
+    let size_key = ui.make_persistent_id("ruler-panel-size");
+    let size = ctx
+        .data(|d| d.get_temp::<egui::Vec2>(size_key))
+        .unwrap_or(egui::vec2(300.0, 220.0));
+    let position_key = ui.make_persistent_id("ruler-panel-position");
+    let previous = ctx.data(|d| d.get_temp::<egui::Pos2>(position_key));
+    // Hold still while the pointer is on the panel: otherwise the preview
+    // under the cursor moves the panel away from its own buttons.
+    let pointer = ctx.pointer_hover_pos();
+    let position = match previous {
+        Some(previous)
+            if pointer.is_some_and(|p| egui::Rect::from_min_size(previous, size).contains(p)) =>
+        {
+            previous
+        }
+        _ => panel_position(
+            anchor.unwrap_or(egui::Rect::from_min_size(screen.min, egui::Vec2::ZERO)),
+            size,
+            screen,
+        ),
+    };
+    ctx.data_mut(|d| d.insert_temp(position_key, position));
+    let panel = egui::Window::new("Pixel ruler")
         .resizable(false)
-        .default_pos(ctx.viewport_rect().min + egui::vec2(12.0, 12.0))
+        .collapsible(false)
+        .fixed_pos(position)
+        .constrain_to(screen)
         .show(&ctx, |ui| {
             ui.label("Frozen source · physical pixels");
             ui.label(format!(
@@ -247,7 +295,32 @@ pub(crate) fn show(
                 ui.colored_label(Color32::LIGHT_RED, error.to_string());
             }
         });
+    if let Some(panel) = panel {
+        // Next frame places the panel with its real size.
+        ctx.data_mut(|d| d.insert_temp(size_key, panel.response.rect.size()));
+    }
     Ok(input)
+}
+
+/// Top-left for a `size` panel beside `anchor`: to its right, else its left,
+/// else below, else above (12 pt away), always kept inside `bounds`.
+fn panel_position(anchor: egui::Rect, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
+    const GAP: f32 = 12.0;
+    let fits_x = |x: f32| x >= bounds.left() && x + size.x <= bounds.right();
+    let fits_y = |y: f32| y >= bounds.top() && y + size.y <= bounds.bottom();
+    let (x, y) = if fits_x(anchor.right() + GAP) {
+        (anchor.right() + GAP, anchor.top())
+    } else if fits_x(anchor.left() - GAP - size.x) {
+        (anchor.left() - GAP - size.x, anchor.top())
+    } else if fits_y(anchor.bottom() + GAP) {
+        (anchor.left(), anchor.bottom() + GAP)
+    } else {
+        (anchor.left(), anchor.top() - GAP - size.y)
+    };
+    egui::pos2(
+        x.clamp(bounds.left(), (bounds.right() - size.x).max(bounds.left())),
+        y.clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top())),
+    )
 }
 fn paint_valid(
     ui: &egui::Ui,
@@ -317,6 +390,57 @@ fn paint_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Rect, pos2, vec2};
+
+    /// Two side-by-side 1000×800 screens; the overlay spans both.
+    fn screen() -> Rect {
+        Rect::from_min_size(pos2(1000.0, 0.0), vec2(1000.0, 800.0))
+    }
+    const PANEL: egui::Vec2 = vec2(240.0, 180.0);
+
+    fn inside(panel: Rect, bounds: Rect) -> bool {
+        bounds.contains_rect(panel)
+    }
+
+    #[test]
+    fn panel_sits_right_of_the_selection_on_its_screen() {
+        let anchor = Rect::from_min_size(pos2(1200.0, 300.0), vec2(80.0, 40.0));
+        let pos = panel_position(anchor, PANEL, screen());
+        assert_eq!(pos, pos2(1292.0, 300.0));
+        assert!(inside(Rect::from_min_size(pos, PANEL), screen()));
+    }
+
+    #[test]
+    fn panel_flips_left_near_the_right_edge() {
+        let anchor = Rect::from_min_size(pos2(1900.0, 300.0), vec2(60.0, 40.0));
+        let pos = panel_position(anchor, PANEL, screen());
+        assert_eq!(pos.x, 1900.0 - 12.0 - PANEL.x);
+        assert!(inside(Rect::from_min_size(pos, PANEL), screen()));
+    }
+
+    #[test]
+    fn wide_selection_puts_the_panel_below_it() {
+        let anchor = Rect::from_min_size(pos2(1005.0, 100.0), vec2(990.0, 20.0));
+        let pos = panel_position(anchor, PANEL, screen());
+        assert_eq!(pos.y, 132.0);
+        assert!(inside(Rect::from_min_size(pos, PANEL), screen()));
+    }
+
+    #[test]
+    fn panel_never_leaves_the_selections_screen() {
+        for anchor in [
+            Rect::from_min_size(pos2(1000.0, 0.0), vec2(1000.0, 800.0)),
+            Rect::from_min_size(pos2(1990.0, 790.0), vec2(4.0, 4.0)),
+            Rect::from_min_size(pos2(1000.0, 780.0), vec2(30.0, 20.0)),
+        ] {
+            let pos = panel_position(anchor, PANEL, screen());
+            assert!(
+                inside(Rect::from_min_size(pos, PANEL), screen()),
+                "{anchor:?} -> {pos:?}"
+            );
+        }
+    }
+
     #[test]
     fn handle_center_targets_inclusive_endpoint_pixel() {
         let bounds = PhysicalRect::new(-100, -100, 800, 600).unwrap();
