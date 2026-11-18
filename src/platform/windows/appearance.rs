@@ -57,6 +57,63 @@ const VECTR_RADIUS_CONTROL: u8 = 6;
 /// `--radius` itself, used for window/menu chrome.
 const VECTR_RADIUS_SURFACE: u8 = 10;
 
+/// Whether a Windows contrast theme is on. Failure to read the setting counts
+/// as on, so a contrast user is never shown the low-contrast palette.
+fn contrast_theme_on() -> bool {
+    unsafe {
+        let mut contrast = HIGHCONTRASTW {
+            cbSize: size_of::<HIGHCONTRASTW>() as u32,
+            ..std::mem::zeroed()
+        };
+        let known = SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            (&mut contrast as *mut HIGHCONTRASTW).cast(),
+            0,
+        ) != 0;
+        !known || contrast.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+}
+
+/// Makes the Win32 popup menus this process shows (the tray menu) dark, to
+/// match the always-dark main window. Windows exposes this only through
+/// uxtheme's unnamed exports `SetPreferredAppMode` (ordinal 135, Windows 10
+/// 1903+) and `FlushMenuThemes` (ordinal 136), as Explorer and many tray apps
+/// use. If either is missing the menus simply stay light. Skipped under a
+/// contrast theme, whose colors Windows must keep.
+pub fn force_dark_menus() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    /// `PreferredAppMode::ForceDark`.
+    const FORCE_DARK: i32 = 2;
+    if contrast_theme_on() {
+        return;
+    }
+    let name: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
+    unsafe {
+        // System32 only; the module stays loaded for the process lifetime.
+        let module = LoadLibraryExW(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+        if module.is_null() {
+            return;
+        }
+        // An ordinal is passed as a pointer-sized integer (MAKEINTRESOURCEA).
+        let set = GetProcAddress(module, 135usize as *const u8);
+        let flush = GetProcAddress(module, 136usize as *const u8);
+        if let (Some(set), Some(flush)) = (set, flush) {
+            // Safety: these ordinals have had these signatures since 1903.
+            let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set);
+            let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+            set(FORCE_DARK);
+            flush();
+        }
+    }
+}
+
 pub fn visuals() -> Visuals {
     let mut visual = Visuals::dark();
     visual.panel_fill = VECTR_BACKGROUND;
@@ -97,19 +154,7 @@ pub fn visuals() -> Visuals {
     visual.widgets.open.corner_radius = CornerRadius::same(VECTR_RADIUS_CONTROL);
     visual.weak_text_color = Some(VECTR_MUTED_FOREGROUND);
     unsafe {
-        let mut contrast = HIGHCONTRASTW {
-            cbSize: size_of::<HIGHCONTRASTW>() as u32,
-            ..std::mem::zeroed()
-        };
-        // Failure selects a conservative high-contrast palette rather than
-        // assuming the user has not enabled a contrast theme.
-        let known = SystemParametersInfoW(
-            SPI_GETHIGHCONTRAST,
-            contrast.cbSize,
-            (&mut contrast as *mut HIGHCONTRASTW).cast(),
-            0,
-        ) != 0;
-        if !known || contrast.dwFlags & HCF_HIGHCONTRASTON != 0 {
+        if contrast_theme_on() {
             let color = |index| {
                 let c = GetSysColor(index);
                 Color32::from_rgb(c as u8, (c >> 8) as u8, (c >> 16) as u8)
@@ -283,4 +328,15 @@ pub fn card_hover_border(visuals: &Visuals) -> Color32 {
     visuals
         .override_text_color
         .unwrap_or(VECTR_CARD_HOVER_BORDER)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dark_menus_can_be_requested_repeatedly() {
+        // No visible window is involved; this checks the ordinal lookup and
+        // calls are safe on this Windows build and safe to repeat.
+        super::force_dark_menus();
+        super::force_dark_menus();
+    }
 }

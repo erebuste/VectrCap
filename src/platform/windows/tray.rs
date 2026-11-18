@@ -225,6 +225,8 @@ impl Tray {
             super::hotkeys::HotkeyBridge::attach(icon.window_handle(), hotkey_client.clone())
         }?;
         hotkey_client.submit(AppCommand::AttachHotkeyWindow(icon.window_handle() as isize))?;
+        // Before the first menu exists, so Windows draws every menu dark.
+        super::appearance::force_dark_menus();
         let mut tray = Self {
             _hotkeys: hotkeys,
             _appearance: appearance,
