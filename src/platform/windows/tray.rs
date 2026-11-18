@@ -238,7 +238,7 @@ impl Tray {
             }
         }
         let icon = TrayIconBuilder::new()
-            .with_tooltip("VectrCap — click to capture a region")
+            .with_tooltip("VectrCap")
             .with_menu_on_left_click(false)
             .with_icon(Icon::from_rgba(pixels, 24, 24).map_err(|_| error())?)
             .build()
