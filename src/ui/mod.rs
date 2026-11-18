@@ -15,8 +15,6 @@ pub mod shell;
 
 pub mod completion_notification;
 
-pub mod batch_summary;
-
 pub mod history;
 
 pub mod history_previews;
@@ -31,7 +29,6 @@ pub mod scrolling_review;
 pub mod scrolling_controls;
 
 pub mod quick_tasks;
-pub mod task_results;
 pub mod task_settings;
 
 pub mod destination_install;

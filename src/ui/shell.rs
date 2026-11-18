@@ -7,7 +7,7 @@ use crate::{
     app::{
         desktop::{DesktopClient, DesktopView},
         error::AppError,
-        events::{AppCommand, HistoryFocus, Lifecycle, QueueAction, Window},
+        events::{AppCommand, Lifecycle, QueueAction, Window},
     },
     platform::windows::{appearance, file_dialog::PickerGate, tray::Tray},
 };
@@ -384,10 +384,18 @@ impl Shell {
         }
     }
 
-    /// The History page takes dropped files, and Ctrl+V while no text field
-    /// has focus, as uploads (what the old Uploads drop zone did).
-    fn accept_uploads(&self, ui: &egui::Ui) -> Vec<AppCommand> {
+    /// Files dropped onto the History page (while running and with the pointer
+    /// over the page) upload. Clipboard paste needs History's focused paste
+    /// target, never a bare Ctrl+V.
+    fn accept_drops(&self, ui: &egui::Ui) -> Vec<AppCommand> {
         let mut commands = vec![];
+        let over_page = ui
+            .ctx()
+            .pointer_hover_pos()
+            .is_some_and(|pos| ui.max_rect().contains(pos));
+        if self.view.lifecycle != Lifecycle::Running || !over_page {
+            return commands;
+        }
         let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
         if !files.is_empty() {
             let paths = files
@@ -399,15 +407,6 @@ impl Shell {
                 Err(error) => self.client.report_error(error),
             }
         }
-        let typing = ui.ctx().memory(|m| m.focused().is_some());
-        if !typing
-            && ui.input(|i| {
-                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
-                    || i.modifiers.ctrl && i.key_pressed(egui::Key::V)
-            })
-        {
-            commands.push(AppCommand::UploadClipboard);
-        }
         commands
     }
 
@@ -418,37 +417,19 @@ impl Shell {
         }
         if self.view.window == Some(Window::History) {
             if self.view.settings.is_some() {
-                commands.extend(super::in_progress::draw(
-                    ui,
-                    &self.view,
-                    &mut self.in_progress_expanded,
-                ));
-                commands.extend(self.accept_uploads(ui));
-                // Interim until the inspector (redesign Task 6) replaces these.
-                if !self.view.task_workflows.is_empty() {
-                    egui::CollapsingHeader::new("Task results")
-                        .default_open(matches!(
-                            self.view.history_focus,
-                            Some(HistoryFocus::Workflow(_))
-                        ))
-                        .show(ui, |ui| {
-                            commands.extend(super::task_results::draw(
-                                ui,
-                                &self.view.task_workflows,
-                                &self.client,
-                                &self.picker_gate,
-                            ))
-                        });
-                }
-                if !self.view.batch_summary.is_empty() {
-                    egui::CollapsingHeader::new("Batch summary")
-                        .default_open(matches!(
-                            self.view.history_focus,
-                            Some(HistoryFocus::Batch(_))
-                        ))
-                        .show(ui, |ui| super::batch_summary::draw(ui, &self.view));
-                }
-                commands.extend(self.history.draw(ui, &self.view));
+                commands.extend(self.accept_drops(ui));
+                // In progress, filters, results, inspector and footer scroll as one page.
+                egui::ScrollArea::vertical()
+                    .id_salt("history-page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        commands.extend(super::in_progress::draw(
+                            ui,
+                            &self.view,
+                            &mut self.in_progress_expanded,
+                        ));
+                        commands.extend(self.history.draw(ui, &self.view));
+                    });
             } else {
                 ui.label("Opening local settings…");
             }

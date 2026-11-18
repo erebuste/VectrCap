@@ -6,7 +6,7 @@ use crate::{
         controller::BatchSummaryRow,
         desktop::DesktopView,
         destinations::{CredentialKey, DestinationSelection, DestinationSnapshot},
-        events::Window,
+        events::{HistoryFocus, Window},
         types::{Artifact, ArtifactId, ArtifactKind, JobId, UploadReceipt},
     },
     persistence::{
@@ -178,9 +178,6 @@ const SAMPLES: [Sample; 9] = [
         status: Status::Uploaded,
     },
 ];
-/// 2026-11-17 23:04 local-ish, fixed so screenshots are reproducible.
-const NOW_MS: i64 = 1_794_956_640_000;
-
 fn artifact_kind(kind: &str) -> ArtifactKind {
     match kind {
         "gif" => ArtifactKind::Gif,
@@ -269,7 +266,7 @@ pub fn mockup_view(variant: MockupVariant) -> DesktopView {
             name: sample.name.into(),
             kind: sample.kind.into(),
             size: sample.size,
-            created_ms: NOW_MS - sample.minutes_ago * 60_000,
+            created_ms: chrono::Utc::now().timestamp_millis() - sample.minutes_ago * 60_000,
             favorite: sample.favorite,
             local_available: sample.local,
             retryable: matches!(sample.status, Status::Failed) && busy,
@@ -321,7 +318,16 @@ pub fn mockup_view(variant: MockupVariant) -> DesktopView {
             })
             .collect();
         jobs.push(waiting);
-        view.task_workflows = vec![needs_attention(&settings)];
+        let first = Arc::new(records[0].artifact.clone());
+        // No automatic saving, so every step of the finished run can succeed.
+        let mut unsaved = settings.clone();
+        unsaved.archive.storage_mode = StorageMode::NeverAutomatic;
+        view.task_workflows = vec![
+            needs_attention(&settings),
+            run_workflow(&unsaved, TaskIntent::Direct(CaptureTask::CopyImage), first),
+        ];
+        // The mockup opens with the first card selected.
+        view.history_focus = Some(HistoryFocus::Artifact(records[0].artifact.id));
     }
     view.jobs = jobs;
     view.history_page = HistoryPage {
@@ -336,14 +342,6 @@ pub fn mockup_view(variant: MockupVariant) -> DesktopView {
 fn needs_attention(settings: &Settings) -> TaskRunner {
     let mut settings = settings.clone();
     settings.archive.storage_mode = StorageMode::NeverAutomatic;
-    let mut runner = TaskRunner::new(WorkflowContext::new(
-        ArtifactKind::Screenshot,
-        EffectiveProfile::snapshot(&settings, None),
-        TaskIntent::Direct(CaptureTask::CopyFile),
-        DestinationSelection::Inherit,
-        &settings.destinations,
-        None,
-    ));
     let artifact = Arc::new(Artifact {
         id: ArtifactId::new_random(),
         path: media_dir().join("capture_2026-11-17_2310.png"),
@@ -352,6 +350,24 @@ fn needs_attention(settings: &Settings) -> TaskRunner {
         size: 210_000,
         sha256: [7; 32],
     });
+    run_workflow(
+        &settings,
+        TaskIntent::Direct(CaptureTask::CopyFile),
+        artifact,
+    )
+}
+
+/// Runs a workflow for `artifact`, every executed step succeeding, until it
+/// finishes or stops for the user.
+fn run_workflow(settings: &Settings, intent: TaskIntent, artifact: Arc<Artifact>) -> TaskRunner {
+    let mut runner = TaskRunner::new(WorkflowContext::new(
+        artifact.kind,
+        EffectiveProfile::snapshot(settings, None),
+        intent,
+        DestinationSelection::Inherit,
+        &settings.destinations,
+        None,
+    ));
     let mut effects = runner.handle(TaskInput::Start);
     let mut guard = 0;
     while let Some(TaskEffect::Execute(step)) = effects.pop() {

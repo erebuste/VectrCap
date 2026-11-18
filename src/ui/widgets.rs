@@ -40,7 +40,64 @@ pub fn button_width(ui: &Ui, icon: Option<Icon>, label: Option<&str>) -> f32 {
 }
 
 fn button(ui: &mut Ui, look: Look, icon: Option<Icon>, label: &str) -> Response {
-    button_with(ui, look, icon, label, true)
+    button_with(ui, look, icon, label, true, 0.0)
+}
+
+/// A small button at least `width` wide with its content centered, for button
+/// grids (the History inspector's action rows). `primary` gives the lavender look.
+pub fn wide_button(
+    ui: &mut Ui,
+    primary: bool,
+    icon: Option<Icon>,
+    label: &str,
+    width: f32,
+) -> Response {
+    let look = if primary { Look::Primary } else { Look::Normal };
+    button_with(ui, look, icon, label, true, width)
+}
+
+/// A filter chip (26 high, borderless until toggled on).
+pub fn chip(ui: &mut Ui, selected: bool, label: &str) -> Response {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(BODY_SIZE),
+        Color32::PLACEHOLDER,
+    );
+    let size = vec2(galley.size().x + 20.0, BUTTON_HEIGHT_SMALL);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| WidgetInfo::selected(Role::Button, ui.is_enabled(), selected, label));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let lit = selected || response.hovered();
+        let fill = if lit {
+            visuals.widgets.inactive.bg_fill
+        } else {
+            Color32::TRANSPARENT
+        };
+        let border = if selected {
+            appearance::toggled_border(visuals)
+        } else {
+            Color32::TRANSPARENT
+        };
+        let text = if lit {
+            visuals.text_color()
+        } else {
+            visuals.weak_text_color()
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(RADIUS_CONTROL),
+            fill,
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+        ui.painter().galley(
+            pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            text,
+        );
+    }
+    response
 }
 
 fn button_with(
@@ -49,8 +106,10 @@ fn button_with(
     icon: Option<Icon>,
     label: &str,
     show_label: bool,
+    min_width: f32,
 ) -> Response {
-    let width = button_width(ui, icon, show_label.then_some(label));
+    let content = button_width(ui, icon, show_label.then_some(label));
+    let width = content.max(min_width);
     let galley = ui.painter().layout_no_wrap(
         if show_label {
             label.to_owned()
@@ -108,7 +167,7 @@ fn button_with(
             Stroke::new(1.0, border),
             StrokeKind::Inside,
         );
-        let mut x = rect.left() + BUTTON_PAD_SMALL;
+        let mut x = rect.left() + (width - content) / 2.0 + BUTTON_PAD_SMALL;
         if let Some(icon) = icon {
             let area = Rect::from_x_y_ranges(x..=rect.right(), rect.y_range());
             icons::paint(painter, icons::slot(area, ICON_SIZE), icon, text);
@@ -154,7 +213,7 @@ pub fn ghost_button(ui: &mut Ui, icon: Option<Icon>, label: &str) -> Response {
 
 /// An icon-only ghost button; `name` is its tooltip and screen-reader name.
 pub fn ghost_icon_button(ui: &mut Ui, icon: Icon, name: &str) -> Response {
-    button_with(ui, Look::Ghost, Some(icon), name, false).on_hover_text(name)
+    button_with(ui, Look::Ghost, Some(icon), name, false, 0.0).on_hover_text(name)
 }
 
 /// An on/off switch (36×20), announced to screen readers as a checkbox named `label`.

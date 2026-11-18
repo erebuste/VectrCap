@@ -590,6 +590,45 @@ fn preference_update_rejects_external_edits_and_repeated_value_preserves_revisio
 }
 
 #[test]
+fn copy_batch_links_copies_only_confirmed_links_in_batch_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, history, artifacts, _, clipboard) = open(dir.path());
+    seed(&mut app);
+    let receipt =
+        |url: &str, name: &str| Ok(vectrcap::app::types::UploadReceipt::new(url, name).unwrap());
+    let first = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "first.txt",
+        ArtifactKind::File,
+        receipt("https://links.example/first", "first.txt"),
+    );
+    let failed = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "failed.txt",
+        ArtifactKind::File,
+        Err(AppError::Network),
+    );
+    let second = accept_and_settle(
+        &mut app,
+        &history,
+        &artifacts,
+        "second.txt",
+        ArtifactKind::File,
+        receipt("https://links.example/second", "second.txt"),
+    );
+    app.dispatch(AppCommand::ShowBatchSummary(vec![second, failed, first]));
+    app.dispatch(AppCommand::CopyBatchLinks);
+    assert_eq!(
+        clipboard.written.lock().unwrap().as_slice(),
+        &["https://links.example/second\nhttps://links.example/first".to_string()]
+    );
+}
+
+#[test]
 fn batch_summary_preserves_exact_order_and_resolves_current_history() {
     use vectrcap::app::types::JobId;
     let dir = tempfile::tempdir().unwrap();

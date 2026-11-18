@@ -445,6 +445,21 @@ impl AppController {
             })
             .collect()
     }
+    fn copy_batch_links(&self) -> Result<Vec<AppEffect>, AppError> {
+        let links: Vec<String> = self
+            .batch_summary()?
+            .into_iter()
+            .filter_map(|row| match row.job?.status {
+                JobStatus::Completed(receipt) => Some(receipt.url().to_string()),
+                _ => None,
+            })
+            .collect();
+        if links.is_empty() {
+            return Err(AppError::InvalidInput("no confirmed links in this batch"));
+        }
+        self.clipboard.write_text(&links.join("\n"))?;
+        Ok(vec![])
+    }
     fn show_batch_summary(
         &mut self,
         jobs: Vec<super::types::JobId>,
@@ -1355,6 +1370,7 @@ impl AppController {
                 vec![]
             }
             AppCommand::ShowBatchSummary(jobs) => self.show_batch_summary(jobs)?,
+            AppCommand::CopyBatchLinks => self.copy_batch_links()?,
             AppCommand::Show(window) => {
                 if self
                     .capture

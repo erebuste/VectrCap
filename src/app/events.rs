@@ -273,6 +273,8 @@ pub enum AppCommand {
     },
     /// UI-only: the shell opens the native "Upload file" picker.
     ChooseUploadFile,
+    /// Copies the confirmed links of the batch History is showing, in batch order.
+    CopyBatchLinks,
     SetArchivePolicy {
         policy: ArchivePolicy,
         revision: u64,
