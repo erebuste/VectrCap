@@ -1656,6 +1656,11 @@ impl AppController {
                 self.manager.set_appearance(appearance)?;
                 vec![AppEffect::SettingsSaved(self.settings().clone())]
             }
+            AppCommand::SetToolPreferences { tools, revision } => {
+                self.manager.ensure_revision(revision)?;
+                self.manager.set_tool_preferences(tools)?;
+                vec![AppEffect::SettingsSaved(self.settings().clone())]
+            }
             AppCommand::SetRegionPreferences {
                 preferences,
                 revision,

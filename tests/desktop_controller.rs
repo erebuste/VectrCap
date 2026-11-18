@@ -166,6 +166,37 @@ fn region_settings_validate_and_persist_through_controller() {
     let reloaded = controller(dir.path(), store);
     assert_eq!(reloaded.settings().region, prefs);
 }
+#[test]
+fn drawing_defaults_validate_and_persist_through_controller() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::with_backend(Backend(Arc::new(Memory::default()))));
+    let mut app = controller(dir.path(), store.clone());
+    let mut tools = app.settings().tools.clone();
+    tools.color = [40, 120, 255];
+    tools.highlight_color = [120, 255, 120];
+    let revision = app.settings().revision;
+    let effects = app.dispatch(AppCommand::SetToolPreferences {
+        tools: tools.clone(),
+        revision,
+    });
+    assert!(matches!(effects.as_slice(), [AppEffect::SettingsSaved(_)]));
+    assert_eq!(app.settings().tools, tools);
+    let next_revision = app.settings().revision;
+    let mut invalid = tools.clone();
+    invalid.width_tenths = 0;
+    assert!(matches!(
+        app.dispatch(AppCommand::SetToolPreferences {
+            tools: invalid,
+            revision: next_revision
+        })
+        .as_slice(),
+        [AppEffect::Error(_)]
+    ));
+    assert_eq!(app.settings().tools, tools);
+    drop(app);
+    let reloaded = controller(dir.path(), store);
+    assert_eq!(reloaded.settings().tools, tools);
+}
 fn seed(app: &mut AppController, name: &str, origin: ServerOrigin, value: &str) -> DestinationId {
     let revision = app.settings().revision;
     let mut destinations = app.settings().destinations.clone();

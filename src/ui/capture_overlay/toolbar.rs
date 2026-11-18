@@ -183,7 +183,8 @@ impl CaptureOverlay {
                                 !self.finishing && !self.finish_tasks_on_release,
                                 |ui| {
                                     ui.horizontal(|ui| {
-                                        let tool_width = (ui.available_width() - 178.0).max(28.0);
+                                        // Room for the color swatch, Options, Output and ×.
+                                        let tool_width = (ui.available_width() - 210.0).max(28.0);
                                         egui::ScrollArea::horizontal()
                                             .id_salt(("capture-tool-scroll", self.document.id()))
                                             .max_width(tool_width)
@@ -211,6 +212,9 @@ impl CaptureOverlay {
                                                     });
                                                 });
                                             });
+                                        ui.add_enabled_ui(!self.has_active_edit(), |ui| {
+                                            self.color_button(ui)
+                                        });
                                         ui.menu_button("Options", |ui| self.toolbar_options(ui));
                                         if ui
                                             .add_enabled(
@@ -260,6 +264,49 @@ impl CaptureOverlay {
                     });
                 });
         }
+    }
+    /// A swatch of the current tool's color; it opens the color palette.
+    /// Tools without a color (Region, Select, Spotlight, erasers) show nothing.
+    fn color_button(&mut self, ui: &mut egui::Ui) {
+        let tool = self.tool;
+        let Some(color) = self.options.color_mut(tool) else {
+            return;
+        };
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Drawing color")
+        });
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(4),
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().rect(
+            rect.shrink(6.0),
+            egui::CornerRadius::same(3),
+            Color32::from_rgb(color[0], color[1], color[2]),
+            Stroke::new(1.0, Color32::from_black_alpha(140)),
+            egui::StrokeKind::Outside,
+        );
+        let response = response.on_hover_text("Drawing color");
+        egui::Popup::from_toggle_button_response(&response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.label(if tool == AnnotationTool::Highlight {
+                    "Highlight color"
+                } else {
+                    "Drawing color"
+                });
+                super::super::annotation_toolbar::color_palette(ui, color);
+                ui.label(
+                    egui::RichText::new("Kept for your next captures")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
     }
     fn toolbar_options(&mut self, ui: &mut egui::Ui) {
         ui.set_max_width(340.0);

@@ -331,6 +331,25 @@ impl DestinationManager {
         self.settings = candidate;
         Ok(())
     }
+    pub fn set_tool_preferences(
+        &mut self,
+        tools: crate::persistence::settings::ToolPreferences,
+    ) -> Result<(), AppError> {
+        self.ensure_not_corrupted()?;
+        if self.settings.tools == tools {
+            return Ok(());
+        }
+        let mut candidate = self.settings.clone();
+        candidate.tools = tools;
+        candidate.revision = candidate
+            .revision
+            .checked_add(1)
+            .ok_or(AppError::Persistence("settings revisions are exhausted"))?;
+        candidate.validate()?;
+        self.repository.save_settings(&candidate)?;
+        self.settings = candidate;
+        Ok(())
+    }
     pub fn set_task_profiles(
         &mut self,
         tasks: crate::workflow::profile::TaskProfiles,

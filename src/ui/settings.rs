@@ -204,6 +204,8 @@ impl SettingsPane {
         match self.category {
             SettingsCategory::Integrations => self.integrations.draw(ui),
             SettingsCategory::Capture => {
+                drawing(ui, settings, &mut commands);
+                ui.add_space(tokens::GROUP_GAP);
                 let pane = self.region.get_or_insert_with(|| {
                     super::region_settings::RegionSettingsPane::new(settings)
                 });
@@ -790,6 +792,51 @@ fn general(
     });
 }
 
+/// The colors and line width the capture tools start with. A color picked in
+/// the capture toolbar is saved here too when the capture ends.
+fn drawing(ui: &mut Ui, settings: &Settings, commands: &mut Vec<AppCommand>) {
+    let mut tools = settings.tools.clone();
+    widgets::setting_group(
+        ui,
+        "Drawing",
+        Some(
+            "What the capture tools start with. A color you pick while drawing is remembered here too.",
+        ),
+        |ui| {
+            widgets::setting_row(
+                ui,
+                "Drawing color",
+                Some("Arrows, shapes, lines, text and steps."),
+                |ui| {
+                    ui.push_id("drawing-color", |ui| {
+                        super::annotation_toolbar::color_palette(ui, &mut tools.color);
+                    });
+                },
+            );
+            widgets::setting_row(ui, "Highlight color", None, |ui| {
+                ui.push_id("highlight-color", |ui| {
+                    super::annotation_toolbar::color_palette(ui, &mut tools.highlight_color);
+                });
+            });
+            widgets::setting_row(ui, "Line width", None, |ui| {
+                let mut width = f32::from(tools.width_tenths) / 10.0;
+                if ui
+                    .add(egui::Slider::new(&mut width, 0.5..=64.0).suffix(" px"))
+                    .changed()
+                {
+                    tools.width_tenths = (width * 10.0).round() as u16;
+                }
+            });
+        },
+    );
+    if tools != settings.tools {
+        commands.push(AppCommand::SetToolPreferences {
+            tools,
+            revision: settings.revision,
+        });
+    }
+}
+
 fn storage(ui: &mut Ui, settings: &Settings, commands: &mut Vec<AppCommand>) {
     use crate::persistence::settings::StorageMode;
     let mut policy = settings.archive.clone();
@@ -1282,6 +1329,13 @@ mod tests {
             .count();
         assert!(shown > 0);
         assert_eq!(defaults, shown);
+    }
+
+    #[test]
+    fn capture_offers_drawing_and_highlight_colors() {
+        let buttons = labels(SettingsCategory::Capture, egui::accesskit::Role::Button);
+        // One palette for the drawing color, one for the highlight color.
+        assert_eq!(buttons.iter().filter(|label| *label == "Red").count(), 2);
     }
 
     #[test]

@@ -265,6 +265,11 @@ pub enum AppCommand {
         revision: u64,
     },
     ChooseArchiveFolder,
+    /// Saves the drawing defaults (colors, widths) the capture overlay starts with.
+    SetToolPreferences {
+        tools: crate::persistence::settings::ToolPreferences,
+        revision: u64,
+    },
     /// UI-only, like `ChooseArchiveFolder`: the shell opens the native Save
     /// dialog for workflow `id`; the controller ignores it.
     ChooseTaskSave {

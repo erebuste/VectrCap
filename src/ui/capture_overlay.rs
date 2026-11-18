@@ -173,6 +173,8 @@ pub struct CaptureOverlay {
     sampled: Option<SmartEraser>,
     sampling: bool,
     options: ToolOptions,
+    /// The drawing defaults this capture started from (None in tests/fixtures).
+    saved_tools: Option<crate::persistence::settings::ToolPreferences>,
     finish_visible: bool,
     finish_tasks_on_release: bool,
     release_runs_tasks: bool,
@@ -208,6 +210,7 @@ impl CaptureOverlay {
             sampled: None,
             sampling: false,
             options: Default::default(),
+            saved_tools: None,
             finish_visible: false,
             finish_tasks_on_release: false,
             release_runs_tasks: true,
@@ -227,20 +230,18 @@ impl CaptureOverlay {
     ) -> Result<(), AppError> {
         settings.tools.validate()?;
         *self.output.options_mut() = settings.image.options()?;
-        let t = &settings.tools;
-        self.options = ToolOptions {
-            color: t.color,
-            fill_color: t.fill_color,
-            fill: t.fill,
-            width: f32::from(t.width_tenths) / 10.0,
-            text_size: f32::from(t.text_size),
-            step_radius: f32::from(t.step_radius),
-            highlight_color: t.highlight_color,
-            opacity: f32::from(t.opacity_percent) / 100.0,
-            dim: f32::from(t.dim_percent) / 100.0,
-            eraser_width: f32::from(t.eraser_width),
-        };
+        self.options = ToolOptions::from_preferences(&settings.tools);
+        self.saved_tools = Some(settings.tools.clone());
         Ok(())
+    }
+    /// The drawing defaults to save when this capture ends, if the user
+    /// changed any (e.g. picked another color) and they are valid.
+    pub fn changed_tool_preferences(
+        &self,
+    ) -> Option<crate::persistence::settings::ToolPreferences> {
+        let saved = self.saved_tools.as_ref()?;
+        let now = self.options.to_preferences();
+        (*saved != now && now.validate().is_ok()).then_some(now)
     }
     pub fn from_snapshot(
         snapshot: CaptureSnapshot,

@@ -107,6 +107,16 @@ impl CaptureHost {
                                 }else{state.overlay.show(ui,&settings.shortcuts)}
                             })
                         };
+                        // A color or width picked while drawing becomes the
+                        // default for the next capture once this one ends.
+                        let remembered = if matches!(
+                            event,
+                            Some(CaptureOverlayEvent::Cancel | CaptureOverlayEvent::Finish(_))
+                        ) {
+                            state.overlay.changed_tool_preferences()
+                        } else {
+                            None
+                        };
                         let mut save = None;
                         match event {
                             Some(CaptureOverlayEvent::Cancel) => {
@@ -131,6 +141,14 @@ impl CaptureHost {
                             state.working = true;
                         }
                         drop(state);
+                        if let (Some(tools), Some(settings)) = (remembered, &view.settings)
+                            && let Err(error) = client.submit(AppCommand::SetToolPreferences {
+                                tools,
+                                revision: settings.revision,
+                            })
+                        {
+                            client.report_error(error);
+                        }
                         if choose_folder && let Some(settings) = &view.settings {
                             crate::platform::windows::file_dialog::spawn_capture_archive_folder(
                                 client.clone(),

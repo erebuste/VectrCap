@@ -103,7 +103,104 @@ impl Default for ToolOptions {
         }
     }
 }
+/// Quick colors for drawings, with names for tooltips and screen readers.
+pub(super) const PALETTE: [[u8; 3]; 8] = [
+    [255, 60, 60],
+    [255, 150, 40],
+    [255, 220, 0],
+    [60, 200, 90],
+    [50, 130, 255],
+    [180, 100, 255],
+    [255, 255, 255],
+    [20, 20, 20],
+];
+const PALETTE_NAMES: [&str; 8] = [
+    "Red", "Orange", "Yellow", "Green", "Blue", "Purple", "White", "Black",
+];
+
+/// The preset swatches plus a custom color picker for `color`.
+/// Returns whether the color changed.
+pub(super) fn color_palette(ui: &mut eframe::egui::Ui, color: &mut [u8; 3]) -> bool {
+    use eframe::egui::{self, Stroke, StrokeKind};
+    let mut changed = false;
+    // Always left to right (red first), even inside a right-to-left column.
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (&preset, name) in PALETTE.iter().zip(PALETTE_NAMES) {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+            let current = *color == preset;
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::Role::Button, true, current, name)
+            });
+            let border = if current {
+                Stroke::new(2.0, ui.visuals().text_color())
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke
+            };
+            ui.painter().rect(
+                rect,
+                egui::CornerRadius::same(4),
+                egui::Color32::from_rgb(preset[0], preset[1], preset[2]),
+                border,
+                StrokeKind::Outside,
+            );
+            if response.on_hover_text(name).clicked() && !current {
+                *color = preset;
+                changed = true;
+            }
+        }
+        ui.add_space(4.0);
+        changed |= ui
+            .color_edit_button_srgb(color)
+            .on_hover_text("Custom color")
+            .changed();
+    });
+    changed
+}
+
 impl ToolOptions {
+    /// The color the current tool draws with, if it draws with one.
+    pub fn color_mut(&mut self, tool: AnnotationTool) -> Option<&mut [u8; 3]> {
+        use AnnotationTool::*;
+        match tool {
+            Highlight => Some(&mut self.highlight_color),
+            Region | Select | Spotlight | AnnotationEraser | SmartEraser => None,
+            _ => Some(&mut self.color),
+        }
+    }
+    pub fn from_preferences(t: &crate::persistence::settings::ToolPreferences) -> Self {
+        Self {
+            color: t.color,
+            fill_color: t.fill_color,
+            fill: t.fill,
+            width: f32::from(t.width_tenths) / 10.0,
+            text_size: f32::from(t.text_size),
+            step_radius: f32::from(t.step_radius),
+            highlight_color: t.highlight_color,
+            opacity: f32::from(t.opacity_percent) / 100.0,
+            dim: f32::from(t.dim_percent) / 100.0,
+            eraser_width: f32::from(t.eraser_width),
+        }
+    }
+    /// The saved form of these options (integer units, as settings store them).
+    pub fn to_preferences(&self) -> crate::persistence::settings::ToolPreferences {
+        let units =
+            |value: f32, scale: f32| (value * scale).round().clamp(0.0, f32::from(u16::MAX)) as u16;
+        let percent = |value: f32| (value * 100.0).round().clamp(0.0, 100.0) as u8;
+        crate::persistence::settings::ToolPreferences {
+            color: self.color,
+            fill_color: self.fill_color,
+            fill: self.fill,
+            width_tenths: units(self.width, 10.0),
+            text_size: units(self.text_size, 1.0),
+            step_radius: units(self.step_radius, 1.0),
+            highlight_color: self.highlight_color,
+            opacity_percent: percent(self.opacity),
+            dim_percent: percent(self.dim),
+            eraser_width: units(self.eraser_width, 1.0),
+        }
+    }
     pub fn rgba(&self) -> [u8; 4] {
         [self.color[0], self.color[1], self.color[2], 255]
     }
@@ -165,5 +262,89 @@ impl ToolOptions {
                 _ => {}
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::settings::ToolPreferences;
+    use eframe::egui;
+
+    #[test]
+    fn each_tool_edits_its_own_color() {
+        let mut options = ToolOptions::default();
+        *options.color_mut(AnnotationTool::Rectangle).unwrap() = [1, 2, 3];
+        assert_eq!(options.color, [1, 2, 3]);
+        *options.color_mut(AnnotationTool::Highlight).unwrap() = [4, 5, 6];
+        assert_eq!(options.highlight_color, [4, 5, 6]);
+        assert_eq!(options.color, [1, 2, 3]);
+        for tool in [
+            AnnotationTool::Region,
+            AnnotationTool::Select,
+            AnnotationTool::Spotlight,
+            AnnotationTool::AnnotationEraser,
+            AnnotationTool::SmartEraser,
+        ] {
+            assert!(options.color_mut(tool).is_none(), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn options_round_trip_to_saved_defaults() {
+        let saved = ToolPreferences {
+            color: [10, 20, 30],
+            width_tenths: 45,
+            ..Default::default()
+        };
+        assert_eq!(
+            ToolOptions::from_preferences(&saved).to_preferences(),
+            saved
+        );
+        assert_eq!(
+            ToolOptions::default().to_preferences(),
+            ToolPreferences::default()
+        );
+    }
+
+    #[test]
+    fn clicking_a_swatch_picks_its_color() {
+        let ctx = egui::Context::default();
+        let mut color = [0, 0, 0];
+        let mut swatch = egui::Rect::NOTHING;
+        let mut changed = false;
+        for pressed in [None, Some(true), Some(false)] {
+            let mut input = egui::RawInput::default();
+            if let Some(pressed) = pressed {
+                let at = swatch.center();
+                input.events = vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ];
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                changed |= color_palette(ui, &mut color);
+            });
+            output.textures_delta.clear();
+            // Find the Orange swatch where it was painted.
+            let orange = egui::Color32::from_rgb(PALETTE[1][0], PALETTE[1][1], PALETTE[1][2]);
+            if let Some(rect) = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(shape) if shape.fill == orange => Some(shape.rect),
+                    _ => None,
+                })
+            {
+                swatch = rect;
+            }
+        }
+        assert!(changed);
+        assert_eq!(color, PALETTE[1]);
     }
 }
