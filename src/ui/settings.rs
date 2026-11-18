@@ -226,7 +226,9 @@ impl SettingsPane {
             }
             SettingsCategory::Tasks => commands.extend(super::task_settings::draw(ui, settings)),
             SettingsCategory::General => {
-                general(ui, settings, notifications_enabled, &mut commands)
+                general(ui, settings, notifications_enabled, &mut commands);
+                ui.add_space(tokens::GROUP_GAP);
+                updates(ui);
             }
             SettingsCategory::Storage => storage(ui, settings, &mut commands),
             SettingsCategory::Shortcuts => {
@@ -789,6 +791,70 @@ fn general(
                 }
             },
         );
+    });
+}
+
+/// The running version and the GitHub Releases update flow (`crate::update`).
+fn updates(ui: &mut Ui) {
+    use crate::update::{self, Status};
+    let status = update::status();
+    let (text, action, busy) = match &status {
+        Status::Idle => (
+            "Checks GitHub for new versions daily.".into(),
+            Some("Check now"),
+            false,
+        ),
+        Status::Checking => ("Checking for updates…".into(), None, true),
+        Status::NoReleases => (
+            "No releases are published yet.".into(),
+            Some("Check again"),
+            false,
+        ),
+        Status::UpToDate => (
+            "You have the latest version.".into(),
+            Some("Check again"),
+            false,
+        ),
+        Status::Available(release) => (
+            format!(
+                "Version {} is available. VectrCap restarts to install it.",
+                release.version
+            ),
+            Some("Update and restart"),
+            false,
+        ),
+        Status::Downloading(release) => (
+            format!("Downloading version {}…", release.version),
+            None,
+            true,
+        ),
+        Status::Restarting(release) => (
+            format!("Restarting into version {}…", release.version),
+            None,
+            true,
+        ),
+        Status::Failed(message) => (message.clone(), Some("Try again"), false),
+    };
+    widgets::setting_group(ui, "Updates", None, |ui| {
+        let label = format!("VectrCap {}", update::CURRENT);
+        widgets::setting_row(ui, &label, Some(&text), |ui| {
+            if busy {
+                ui.spinner();
+            }
+            if let Some(action) = action {
+                let clicked = if matches!(status, Status::Available(_)) {
+                    widgets::primary_button(ui, None, action).clicked()
+                } else {
+                    widgets::ghost_button(ui, None, action).clicked()
+                };
+                if clicked {
+                    match status {
+                        Status::Available(_) => update::install(),
+                        _ => update::check(),
+                    }
+                }
+            }
+        });
     });
 }
 

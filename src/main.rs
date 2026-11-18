@@ -16,6 +16,8 @@ fn main() {
     if run().is_err() {
         startup_error();
     }
+    // After everything in `run` is dropped, including the single-instance lock.
+    vectrcap::update::finish_restart();
 }
 fn run() -> Result<(), AppError> {
     use vectrcap::app::cli::{LaunchMode, parse_launch_args};
@@ -44,6 +46,7 @@ fn run() -> Result<(), AppError> {
             })),
         };
     };
+    vectrcap::update::start();
     let root = vectrcap::persistence::AppPaths::current_user()?.root;
     std::fs::create_dir_all(&root).map_err(|e| AppError::Io {
         stage: "opening application data",

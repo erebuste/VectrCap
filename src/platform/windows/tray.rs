@@ -23,6 +23,8 @@ pub struct Tray {
     choices: Choices,
     checks: Vec<(DestinationId, CheckMenuItem)>,
     revision: Option<u64>,
+    /// The update version the current menu offers.
+    offered: Option<String>,
 }
 
 /// One entry of the tray menu, built into the native menu by `Tray::update`.
@@ -66,8 +68,9 @@ fn submenu(label: &str, children: Vec<MenuNode>) -> MenuNode {
 pub fn menu_layout(
     destinations: &[(DestinationId, String)],
     default: Option<DestinationId>,
+    update: Option<&str>,
 ) -> Vec<MenuNode> {
-    vec![
+    let mut menu = vec![
         item("capture-region", "Capture region"),
         submenu(
             "Capture",
@@ -125,8 +128,12 @@ pub fn menu_layout(
                 .collect(),
         },
         MenuNode::Separator,
-        item("quit", "Quit"),
-    ]
+    ];
+    if let Some(version) = update {
+        menu.push(item("update", &format!("Update to {version} and restart")));
+    }
+    menu.push(item("quit", "Quit"));
+    menu
 }
 fn error() -> AppError {
     AppError::Persistence("native tray unavailable")
@@ -213,6 +220,10 @@ impl Tray {
                 "open" | "history" | "uploads" => Some(AppCommand::Show(Window::History)),
                 "settings" => Some(AppCommand::Show(Window::Settings)),
                 "quit" => Some(AppCommand::Quit),
+                "update" => {
+                    crate::update::install();
+                    None
+                }
                 key => map
                     .lock()
                     .ok()
@@ -252,6 +263,7 @@ impl Tray {
             choices,
             checks: vec![],
             revision: None,
+            offered: None,
         };
         tray.update(&Destinations::default(), 0)?;
         Ok(tray)
@@ -263,7 +275,8 @@ impl Tray {
         self.update(&settings.destinations, settings.revision)
     }
     pub fn update(&mut self, destinations: &Destinations, revision: u64) -> Result<(), AppError> {
-        if self.revision != Some(revision) {
+        let offered = crate::update::offered_version();
+        if self.revision != Some(revision) || self.offered != offered {
             let listed: Vec<_> = destinations
                 .iter()
                 .map(|d| (d.id, d.name.clone()))
@@ -271,13 +284,14 @@ impl Tray {
             let menu = Menu::new();
             let mut choices = HashMap::new();
             let mut checks = vec![];
-            for node in menu_layout(&listed, destinations.default_id()) {
+            for node in menu_layout(&listed, destinations.default_id(), offered.as_deref()) {
                 append(&menu, node, revision, &mut choices, &mut checks)?;
             }
             *self.choices.lock().map_err(|_| error())? = choices;
             self.checks = checks;
             self.icon.set_menu(Some(Box::new(menu)));
             self.revision = Some(revision);
+            self.offered = offered;
         }
         for (id, item) in &self.checks {
             item.set_checked(Some(*id) == destinations.default_id());
@@ -417,7 +431,7 @@ mod tests {
 
     #[test]
     fn tray_menu_matches_the_design() {
-        let menu = menu_layout(&[], None);
+        let menu = menu_layout(&[], None, None);
         assert_eq!(
             top_level_labels(&menu),
             [
@@ -471,12 +485,23 @@ mod tests {
     }
 
     #[test]
+    fn an_offered_update_sits_just_above_quit() {
+        let menu = menu_layout(&[], None, Some("0.2.0"));
+        let labels = top_level_labels(&menu);
+        assert_eq!(
+            labels[labels.len() - 3..],
+            ["—", "Update to 0.2.0 and restart", "Quit"]
+        );
+    }
+
+    #[test]
     fn destinations_are_checks_with_the_default_checked() {
         let work = DestinationId(uuid::Uuid::new_v4());
         let home = DestinationId(uuid::Uuid::new_v4());
         let menu = menu_layout(
             &[(work, "Vectr & work".into()), (home, "Personal".into())],
             Some(work),
+            None,
         );
         let (children, enabled) = submenu(&menu, "Destination");
         assert!(enabled);
@@ -493,7 +518,7 @@ mod tests {
     #[test]
     fn every_previous_tray_id_is_still_present() {
         let mut all = vec![];
-        ids(&menu_layout(&[], None), &mut all);
+        ids(&menu_layout(&[], None, None), &mut all);
         for id in [
             "tool-sampler",
             "tool-ruler",

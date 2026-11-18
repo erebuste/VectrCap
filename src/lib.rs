@@ -17,6 +17,7 @@ pub mod recording;
 pub mod scrolling;
 pub mod tools;
 pub mod ui;
+pub mod update;
 pub mod vectr;
 
 pub mod diagnostics;

@@ -52,6 +52,14 @@ impl Shell {
         context: egui::Context,
     ) -> Result<Self, AppError> {
         appearance::install_fonts(&context);
+        let repaint = context.clone();
+        let quit = client.clone();
+        crate::update::connect(
+            Arc::new(move || repaint.request_repaint()),
+            Arc::new(move || {
+                let _ = quit.submit(crate::app::events::AppCommand::Quit);
+            }),
+        );
         let picker_gate = PickerGate::default();
         let tray = Tray::new(client.clone(), context, picker_gate.clone())?;
         Ok(Self::assemble(
