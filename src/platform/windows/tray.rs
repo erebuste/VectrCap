@@ -11,7 +11,7 @@ use std::{
 };
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 type Choices = Arc<Mutex<HashMap<String, (DestinationId, u64)>>>;
 pub struct Tray {
@@ -21,10 +21,110 @@ pub struct Tray {
     choices: Choices,
     checks: Vec<(DestinationId, CheckMenuItem)>,
     revision: Option<u64>,
-    task_settings: Option<(
-        crate::workflow::profile::TaskProfiles,
-        crate::persistence::settings::ArchivePolicy,
-    )>,
+}
+
+/// One entry of the tray menu, built into the native menu by `Tray::update`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuNode {
+    Item {
+        id: String,
+        label: String,
+        enabled: bool,
+    },
+    Check {
+        id: String,
+        label: String,
+        checked: bool,
+    },
+    Separator,
+    Submenu {
+        label: String,
+        enabled: bool,
+        children: Vec<MenuNode>,
+    },
+}
+
+fn item(id: &str, label: &str) -> MenuNode {
+    MenuNode::Item {
+        id: id.into(),
+        label: label.into(),
+        enabled: true,
+    }
+}
+fn submenu(label: &str, children: Vec<MenuNode>) -> MenuNode {
+    MenuNode::Submenu {
+        label: label.into(),
+        enabled: true,
+        children,
+    }
+}
+
+/// The tray menu: the common capture first, then grouped actions, the window,
+/// the upload destination, and Quit. Task switches live in Settings ▸ Tasks.
+pub fn menu_layout(
+    destinations: &[(DestinationId, String)],
+    default: Option<DestinationId>,
+) -> Vec<MenuNode> {
+    vec![
+        item("capture-region", "Capture region"),
+        submenu(
+            "Capture",
+            vec![
+                item("capture-window", "Window under pointer"),
+                item("capture-fullscreen", "Fullscreen"),
+                item("capture-last", "Last region"),
+                item("scrolling", "Scrolling (manual)"),
+                MenuNode::Separator,
+                item("cancel-capture", "Cancel capture / delay"),
+            ],
+        ),
+        submenu(
+            "Record",
+            vec![
+                item("record-gif", "GIF"),
+                item("record-mp4", "MP4"),
+                MenuNode::Separator,
+                item("record-pause", "Pause / resume"),
+                item("record-stop", "Stop"),
+                item("record-cancel", "Cancel"),
+            ],
+        ),
+        submenu(
+            "Upload",
+            vec![
+                item("upload-file", "File…"),
+                item("upload-clipboard", "From clipboard"),
+            ],
+        ),
+        submenu(
+            "Tools",
+            vec![
+                item("tool-sampler", "Screen color picker"),
+                item("tool-ruler", "Ruler"),
+                MenuNode::Separator,
+                item("pin", "Pin to screen…"),
+                item("close-pins", "Close all pins"),
+            ],
+        ),
+        MenuNode::Separator,
+        item("open", "Open VectrCap"),
+        item("settings", "Settings"),
+        MenuNode::Submenu {
+            label: "Destination".into(),
+            enabled: !destinations.is_empty(),
+            children: destinations
+                .iter()
+                .map(|(id, name)| MenuNode::Check {
+                    id: format!("destination-{}", id.0),
+                    // A lone '&' would underline the next letter in Win32 menus.
+                    label: name.replace('&', "&&"),
+                    checked: Some(*id) == default,
+                })
+                .collect(),
+        },
+        MenuNode::Separator,
+        item("quit", "Quit"),
+    ]
 }
 fn error() -> AppError {
     AppError::Persistence("native tray unavailable")
@@ -40,46 +140,6 @@ impl Tray {
         let map = choices.clone();
         let hotkey_client = client.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            use crate::workflow::profile::{CaptureTask, UploadTask};
-            let key = event.id.as_ref();
-            if key.starts_with("capture-task-") || key.starts_with("upload-task-") {
-                if let Some(s) = client.snapshot().settings {
-                    let mut tasks = s.tasks.clone();
-                    let mut archive = s.archive.clone();
-                    if let Some(task) = key
-                        .strip_prefix("capture-task-")
-                        .and_then(|i| i.parse::<usize>().ok())
-                        .and_then(|i| CaptureTask::ALL.get(i))
-                        .copied()
-                    {
-                        if task == CaptureTask::SaveFinal {
-                            let enabled = !tasks.save_final(&archive);
-                            tasks.set_save_final(&mut archive, enabled);
-                        } else if task == CaptureTask::BeforeUploadReview {
-                            tasks.global.before_upload_review = !tasks.global.before_upload_review;
-                            tasks.global.capture.remove(&task);
-                        } else if !tasks.global.capture.remove(&task) {
-                            tasks.global.capture.insert(task);
-                        }
-                    } else if let Some(task) = key
-                        .strip_prefix("upload-task-")
-                        .and_then(|i| i.parse::<usize>().ok())
-                        .and_then(|i| UploadTask::ALL.get(i))
-                        .copied()
-                        && !tasks.global.after_upload.remove(&task)
-                    {
-                        tasks.global.after_upload.insert(task);
-                    }
-                    if let Err(e) = client.submit(AppCommand::SetTaskProfiles {
-                        tasks,
-                        archive,
-                        revision: s.revision,
-                    }) {
-                        client.report_error(e);
-                    }
-                }
-                return;
-            }
             if event.id.as_ref() == "upload-file" {
                 super::file_dialog::spawn_pick_and_upload(client.clone(), picker_gate.clone());
                 return;
@@ -122,8 +182,8 @@ impl Tray {
                         selection: Default::default(),
                     })
                 }
-                "history" => Some(AppCommand::Show(Window::History)),
-                "uploads" => Some(AppCommand::Show(Window::History)),
+                // "history" and "uploads" are ids from the previous menu.
+                "open" | "history" | "uploads" => Some(AppCommand::Show(Window::History)),
                 "settings" => Some(AppCommand::Show(Window::Settings)),
                 "quit" => Some(AppCommand::Quit),
                 key => map
@@ -172,7 +232,6 @@ impl Tray {
             choices,
             checks: vec![],
             revision: None,
-            task_settings: None,
         };
         tray.update(&Destinations::default(), 0)?;
         Ok(tray)
@@ -181,131 +240,20 @@ impl Tray {
         &mut self,
         settings: &crate::persistence::settings::Settings,
     ) -> Result<(), AppError> {
-        self.task_settings = Some((settings.tasks.clone(), settings.archive.clone()));
         self.update(&settings.destinations, settings.revision)
     }
     pub fn update(&mut self, destinations: &Destinations, revision: u64) -> Result<(), AppError> {
         if self.revision != Some(revision) {
+            let listed: Vec<_> = destinations
+                .iter()
+                .map(|d| (d.id, d.name.clone()))
+                .collect();
             let menu = Menu::new();
-            let tools = Submenu::new("Tools", true);
-            tools
-                .append(&MenuItem::with_id(
-                    "tool-sampler",
-                    "Screen color picker",
-                    true,
-                    None,
-                ))
-                .map_err(|_| error())?;
-            tools
-                .append(&MenuItem::with_id("tool-ruler", "Ruler", true, None))
-                .map_err(|_| error())?;
-            menu.append(&tools).map_err(|_| error())?;
-            for (id, label) in [
-                ("capture-region", "Capture region"),
-                ("capture-window", "Capture window under pointer"),
-                ("capture-fullscreen", "Capture fullscreen"),
-                ("capture-last", "Capture last region"),
-            ] {
-                menu.append(&MenuItem::with_id(id, label, true, None))
-                    .map_err(|_| error())?;
-            }
-            for (id, label) in [
-                ("scrolling", "Scrolling capture (manual)"),
-                ("record-gif", "Start / stop GIF recording"),
-                ("record-mp4", "Start / stop MP4 recording"),
-                ("record-stop", "Stop current recording"),
-                ("record-pause", "Pause / resume current recording"),
-                ("record-cancel", "Cancel current recording"),
-            ] {
-                menu.append(&MenuItem::with_id(id, label, true, None))
-                    .map_err(|_| error())?;
-            }
-            menu.append(&MenuItem::with_id(
-                "cancel-capture",
-                "Cancel active capture / delay",
-                true,
-                None,
-            ))
-            .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id(
-                "upload-clipboard",
-                "Upload from clipboard",
-                true,
-                None,
-            ))
-            .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id("upload-file", "Upload file", true, None))
-                .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id("pin", "Pin to screen…", true, None))
-                .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id(
-                "close-pins",
-                "Close all pins",
-                true,
-                None,
-            ))
-            .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id("uploads", "Uploads", true, None))
-                .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id("settings", "Settings", true, None))
-                .map_err(|_| error())?;
-            menu.append(&MenuItem::with_id("history", "History", true, None))
-                .map_err(|_| error())?;
-            if let Some((tasks, archive)) = &self.task_settings {
-                use crate::workflow::profile::{CaptureTask, UploadTask};
-                let capture = Submenu::new("After capture tasks", true);
-                for (i, t) in CaptureTask::ALL.into_iter().enumerate() {
-                    let checked = match t {
-                        CaptureTask::SaveFinal => tasks.save_final(archive),
-                        CaptureTask::BeforeUploadReview => {
-                            tasks.global.before_upload_review || tasks.global.capture.contains(&t)
-                        }
-                        _ => tasks.global.capture.contains(&t),
-                    };
-                    capture
-                        .append(&CheckMenuItem::with_id(
-                            format!("capture-task-{i}"),
-                            t.label(),
-                            true,
-                            checked,
-                            None,
-                        ))
-                        .map_err(|_| error())?;
-                }
-                menu.append(&capture).map_err(|_| error())?;
-                let uploaded = Submenu::new("After upload tasks", true);
-                for (i, t) in UploadTask::ALL.into_iter().enumerate() {
-                    uploaded
-                        .append(&CheckMenuItem::with_id(
-                            format!("upload-task-{i}"),
-                            t.label(),
-                            true,
-                            tasks.global.after_upload.contains(&t),
-                            None,
-                        ))
-                        .map_err(|_| error())?;
-                }
-                menu.append(&uploaded).map_err(|_| error())?;
-            }
-            let submenu = Submenu::new("Destination", !destinations.is_empty());
             let mut choices = HashMap::new();
             let mut checks = vec![];
-            for d in destinations.iter() {
-                let key = format!("destination-{}", d.id.0);
-                let check = CheckMenuItem::with_id(
-                    key.clone(),
-                    d.name.replace('&', "&&"),
-                    true,
-                    Some(d.id) == destinations.default_id(),
-                    None,
-                );
-                submenu.append(&check).map_err(|_| error())?;
-                choices.insert(key, (d.id, revision));
-                checks.push((d.id, check));
+            for node in menu_layout(&listed, destinations.default_id()) {
+                append(&menu, node, revision, &mut choices, &mut checks)?;
             }
-            menu.append(&submenu).map_err(|_| error())?;
-            menu.append(&MenuItem::with_id("quit", "Quit", true, None))
-                .map_err(|_| error())?;
             *self.choices.lock().map_err(|_| error())? = choices;
             self.checks = checks;
             self.icon.set_menu(Some(Box::new(menu)));
@@ -317,8 +265,207 @@ impl Tray {
         Ok(())
     }
 }
+
+/// Anything a native menu node can be appended to (the menu or a submenu).
+trait MenuParent {
+    fn add(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), AppError>;
+}
+impl MenuParent for Menu {
+    fn add(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), AppError> {
+        self.append(item).map_err(|_| error())
+    }
+}
+impl MenuParent for Submenu {
+    fn add(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), AppError> {
+        self.append(item).map_err(|_| error())
+    }
+}
+
+/// Builds one `MenuNode` natively. Destination checks are recorded so a click
+/// maps back to its destination at this settings revision.
+fn append(
+    parent: &dyn MenuParent,
+    node: MenuNode,
+    revision: u64,
+    choices: &mut HashMap<String, (DestinationId, u64)>,
+    checks: &mut Vec<(DestinationId, CheckMenuItem)>,
+) -> Result<(), AppError> {
+    match node {
+        MenuNode::Item { id, label, enabled } => {
+            parent.add(&MenuItem::with_id(id, label, enabled, None))
+        }
+        MenuNode::Check { id, label, checked } => {
+            let check = CheckMenuItem::with_id(id.clone(), label, true, checked, None);
+            parent.add(&check)?;
+            if let Some(destination) = id
+                .strip_prefix("destination-")
+                .and_then(|uuid| uuid.parse().ok())
+                .map(DestinationId)
+            {
+                choices.insert(id, (destination, revision));
+                checks.push((destination, check));
+            }
+            Ok(())
+        }
+        MenuNode::Separator => parent.add(&PredefinedMenuItem::separator()),
+        MenuNode::Submenu {
+            label,
+            enabled,
+            children,
+        } => {
+            let submenu = Submenu::new(label, enabled);
+            for child in children {
+                append(&submenu, child, revision, choices, checks)?;
+            }
+            parent.add(&submenu)
+        }
+    }
+}
 impl Drop for Tray {
     fn drop(&mut self) {
         MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label(node: &MenuNode) -> String {
+        match node {
+            MenuNode::Item { label, .. }
+            | MenuNode::Check { label, .. }
+            | MenuNode::Submenu { label, .. } => label.clone(),
+            MenuNode::Separator => "—".into(),
+        }
+    }
+    fn top_level_labels(menu: &[MenuNode]) -> Vec<String> {
+        menu.iter().map(label).collect()
+    }
+    fn submenu<'a>(menu: &'a [MenuNode], name: &str) -> (&'a [MenuNode], bool) {
+        menu.iter()
+            .find_map(|node| match node {
+                MenuNode::Submenu {
+                    label,
+                    enabled,
+                    children,
+                } if label == name => Some((children.as_slice(), *enabled)),
+                _ => None,
+            })
+            .expect("submenu exists")
+    }
+    fn ids(menu: &[MenuNode], out: &mut Vec<String>) {
+        for node in menu {
+            match node {
+                MenuNode::Item { id, .. } | MenuNode::Check { id, .. } => out.push(id.clone()),
+                MenuNode::Submenu { children, .. } => ids(children, out),
+                MenuNode::Separator => {}
+            }
+        }
+    }
+
+    #[test]
+    fn tray_menu_matches_the_design() {
+        let menu = menu_layout(&[], None);
+        assert_eq!(
+            top_level_labels(&menu),
+            [
+                "Capture region",
+                "Capture",
+                "Record",
+                "Upload",
+                "Tools",
+                "—",
+                "Open VectrCap",
+                "Settings",
+                "Destination",
+                "—",
+                "Quit"
+            ]
+        );
+        let names = |name| top_level_labels(submenu(&menu, name).0);
+        assert_eq!(
+            names("Capture"),
+            [
+                "Window under pointer",
+                "Fullscreen",
+                "Last region",
+                "Scrolling (manual)",
+                "—",
+                "Cancel capture / delay"
+            ]
+        );
+        assert_eq!(
+            names("Record"),
+            ["GIF", "MP4", "—", "Pause / resume", "Stop", "Cancel"]
+        );
+        assert_eq!(names("Upload"), ["File…", "From clipboard"]);
+        assert_eq!(
+            names("Tools"),
+            [
+                "Screen color picker",
+                "Ruler",
+                "—",
+                "Pin to screen…",
+                "Close all pins"
+            ]
+        );
+        assert!(
+            !submenu(&menu, "Destination").1,
+            "empty Destination is disabled"
+        );
+        let mut all = vec![];
+        ids(&menu, &mut all);
+        assert!(all.iter().all(|id| !id.contains("-task-")));
+    }
+
+    #[test]
+    fn destinations_are_checks_with_the_default_checked() {
+        let work = DestinationId(uuid::Uuid::new_v4());
+        let home = DestinationId(uuid::Uuid::new_v4());
+        let menu = menu_layout(
+            &[(work, "Vectr & work".into()), (home, "Personal".into())],
+            Some(work),
+        );
+        let (children, enabled) = submenu(&menu, "Destination");
+        assert!(enabled);
+        assert!(matches!(
+            &children[0],
+            MenuNode::Check { label, checked: true, id } if label == "Vectr && work" && *id == format!("destination-{}", work.0)
+        ));
+        assert!(matches!(
+            &children[1],
+            MenuNode::Check { checked: false, .. }
+        ));
+    }
+
+    #[test]
+    fn every_previous_tray_id_is_still_present() {
+        let mut all = vec![];
+        ids(&menu_layout(&[], None), &mut all);
+        for id in [
+            "tool-sampler",
+            "tool-ruler",
+            "upload-clipboard",
+            "upload-file",
+            "scrolling",
+            "record-gif",
+            "record-mp4",
+            "record-stop",
+            "record-pause",
+            "record-cancel",
+            "pin",
+            "close-pins",
+            "cancel-capture",
+            "capture-region",
+            "capture-window",
+            "capture-fullscreen",
+            "capture-last",
+            "open",
+            "settings",
+            "quit",
+        ] {
+            assert!(all.iter().any(|listed| listed == id), "{id} missing");
+        }
     }
 }
