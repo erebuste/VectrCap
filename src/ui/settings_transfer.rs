@@ -1,5 +1,6 @@
 //! Preferences backup review. File pickers/read/write run on bounded workers;
 //! only an explicit Apply submits a validated preview to the controller.
+use super::widgets;
 use crate::{
     app::{desktop::DesktopClient, error::AppError, events::AppCommand},
     persistence::{settings::Settings, settings_transfer::*},
@@ -106,74 +107,118 @@ impl SettingsTransferPane {
         client: &DesktopClient,
         gate: &PickerGate,
     ) {
-        ui.heading("Backup");
-        ui.label("Back up preferences and destination links. Tokens, history and device identifiers are excluded. Install destinations with the separate .vectrcap action.");
         let busy = self.worker.is_some() || self.applying.is_some();
-        ui.add_enabled_ui(!busy && self.replace.is_none(), |ui| {
-            self.draw_file_actions(ui, settings, gate)
-        });
-        if self.replace.is_some() {
-            ui.label("Replace the selected backup file?");
-            if let Some((path, _)) = &self.replace {
-                ui.label(path.display().to_string());
-            }
-            if ui.button("Confirm replacement").clicked()
-                && let Some((path, settings)) = self.replace.take()
-            {
-                self.start(ui.ctx(), move || {
-                    write_export(&path, &settings, true)?;
-                    Ok(FileResult::Exported)
-                });
-            }
-            if ui.button("Cancel export").clicked() {
-                self.replace = None;
-            }
+        let idle = !busy && self.replace.is_none();
+        widgets::setting_group(
+            ui,
+            "Back up your settings",
+            Some(
+                "Exports shortcuts, tasks, preferences and connection links. Tokens, history and device identifiers are never included.",
+            ),
+            |ui| {
+                widgets::setting_row(
+                    ui,
+                    "Export settings",
+                    Some("Saves a file you can import on another computer."),
+                    |ui| {
+                        ui.add_enabled_ui(idle, |ui| self.export_button(ui, settings, gate));
+                    },
+                );
+                widgets::setting_row(
+                    ui,
+                    "Import settings",
+                    Some(
+                        "You choose what to apply before anything changes. Add a connection with Import VectrCap config in Connections.",
+                    ),
+                    |ui| {
+                        ui.add_enabled_ui(idle, |ui| self.import_button(ui, settings, gate));
+                    },
+                );
+                if self.replace.is_some() {
+                    widgets::card_block(ui, |ui| {
+                        ui.label("Replace the existing backup file?");
+                        if let Some((path, _)) = &self.replace {
+                            widgets::hint(ui, &path.display().to_string());
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if widgets::toggle_button(ui, false, None, "Replace").clicked()
+                                && let Some((path, settings)) = self.replace.take()
+                            {
+                                self.start(ui.ctx(), move || {
+                                    write_export(&path, &settings, true)?;
+                                    Ok(FileResult::Exported)
+                                });
+                            }
+                            if widgets::ghost_button(ui, None, "Cancel").clicked() {
+                                self.replace = None;
+                            }
+                        });
+                    });
+                }
+                if busy || self.status.is_some() {
+                    widgets::card_block(ui, |ui| {
+                        if let Some(message) = &self.status {
+                            ui.label(message);
+                        }
+                        if busy {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                widgets::hint(
+                                    ui,
+                                    "Waiting for the file operation or an active capture to finish…",
+                                );
+                            });
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                    });
+                }
+            },
+        );
+        if self.preview.is_some() {
+            ui.add_space(super::tokens::GROUP_GAP);
+            widgets::setting_group(
+                ui,
+                "Import preview",
+                Some("Pick what to apply. Nothing changes until you apply."),
+                |ui| widgets::card_block(ui, |ui| self.draw_preview(ui, settings, client, busy)),
+            );
         }
-        if let Some(message) = &self.status {
-            ui.label(message);
-        }
-        if busy {
-            ui.spinner();
-            ui.label("Waiting for the file operation or active capture session to end...");
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
-        }
-        self.draw_preview(ui, settings, client, busy);
     }
-    fn draw_file_actions(&mut self, ui: &mut egui::Ui, settings: &Settings, gate: &PickerGate) {
-        ui.horizontal(|ui| {
-            if ui.button("Export preferences...").clicked()
-                && let Some(guard) = gate.try_acquire()
-            {
-                let snapshot = settings.clone();
-                self.start(ui.ctx(), move || {
-                    let _guard = guard;
-                    let Some(path) = file_dialog::pick_preferences_file(true)? else {
-                        return Ok(FileResult::Cancelled);
-                    };
-                    if path
-                        .try_exists()
-                        .map_err(|e| AppError::io("checking preferences backup", &e))?
-                    {
-                        return Ok(FileResult::Replace(path, snapshot));
-                    }
-                    write_export(&path, &snapshot, false)?;
-                    Ok(FileResult::Exported)
-                });
-            }
-            if ui.button("Import preferences...").clicked()
-                && let Some(guard) = gate.try_acquire()
-            {
-                let snapshot = settings.clone();
-                self.start(ui.ctx(), move || {
-                    let _guard = guard;
-                    file_dialog::pick_preferences_file(false)?
-                        .map(|p| read_import(&p, &snapshot))
-                        .transpose()
-                        .map(FileResult::Imported)
-                });
-            }
-        });
+    fn export_button(&mut self, ui: &mut egui::Ui, settings: &Settings, gate: &PickerGate) {
+        if widgets::toggle_button(ui, false, None, "Export…").clicked()
+            && let Some(guard) = gate.try_acquire()
+        {
+            let snapshot = settings.clone();
+            self.start(ui.ctx(), move || {
+                let _guard = guard;
+                let Some(path) = file_dialog::pick_preferences_file(true)? else {
+                    return Ok(FileResult::Cancelled);
+                };
+                if path
+                    .try_exists()
+                    .map_err(|e| AppError::io("checking preferences backup", &e))?
+                {
+                    return Ok(FileResult::Replace(path, snapshot));
+                }
+                write_export(&path, &snapshot, false)?;
+                Ok(FileResult::Exported)
+            });
+        }
+    }
+    fn import_button(&mut self, ui: &mut egui::Ui, settings: &Settings, gate: &PickerGate) {
+        if widgets::toggle_button(ui, false, None, "Import…").clicked()
+            && let Some(guard) = gate.try_acquire()
+        {
+            let snapshot = settings.clone();
+            self.start(ui.ctx(), move || {
+                let _guard = guard;
+                file_dialog::pick_preferences_file(false)?
+                    .map(|p| read_import(&p, &snapshot))
+                    .transpose()
+                    .map(FileResult::Imported)
+            });
+        }
     }
     fn draw_preview(
         &mut self,
@@ -185,7 +230,6 @@ impl SettingsTransferPane {
         let Some(preview) = &self.preview else {
             return;
         };
-        ui.separator();
         ui.label(format!(
             "Preview based on settings revision {}",
             preview.base_revision()

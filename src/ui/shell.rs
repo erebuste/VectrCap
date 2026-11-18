@@ -113,6 +113,13 @@ impl Shell {
             return;
         }
         match command {
+            AppCommand::ChooseImportConfig => {
+                crate::platform::windows::file_dialog::spawn_import_destination(
+                    self.client.clone(),
+                    self.picker_gate.clone(),
+                );
+                return;
+            }
             AppCommand::ChooseUploadFile => {
                 crate::platform::windows::file_dialog::spawn_pick_and_upload(
                     self.client.clone(),
@@ -369,6 +376,13 @@ impl Shell {
                         commands.extend(self.history.draw_header(ui, &self.view));
                     });
                 }
+                if self.view.window == Some(Window::Settings) {
+                    page_header(
+                        ui,
+                        "Settings",
+                        "Connections, shortcuts, and what happens after you capture",
+                    );
+                }
                 // The banner stays enabled: Resume uploads must work while draining.
                 commands.extend(draw_status_banner(ui, &self.view));
                 ui.add_enabled_ui(running, |ui| {
@@ -411,12 +425,9 @@ impl Shell {
     }
 
     fn draw_page(&mut self, ui: &mut egui::Ui, commands: &mut Vec<AppCommand>) {
-        if self.view.window == Some(Window::Settings) && self.view.settings.is_some() {
-            self.pane.show_categories(ui);
-            ui.separator();
-        }
-        if self.view.window == Some(Window::History) {
-            if self.view.settings.is_some() {
+        match self.view.window {
+            Some(Window::Settings) => self.draw_settings(ui, commands),
+            Some(Window::History) if self.view.settings.is_some() => {
                 commands.extend(self.accept_drops(ui));
                 // In progress, filters, results, inspector and footer scroll as one page.
                 egui::ScrollArea::vertical()
@@ -430,76 +441,120 @@ impl Shell {
                         ));
                         commands.extend(self.history.draw(ui, &self.view));
                     });
-            } else {
+            }
+            Some(Window::History) => {
                 ui.label("Opening local settings…");
             }
-            return;
+            None => {}
         }
+    }
+
+    /// Settings: the section list (a column, or a strip on narrow windows)
+    /// beside one section's groups, which scroll.
+    fn draw_settings(&mut self, ui: &mut egui::Ui, commands: &mut Vec<AppCommand>) {
+        let Some(settings) = self.view.settings.clone() else {
+            ui.label("Opening local settings…");
+            return;
+        };
+        if self.pane.category() == SettingsCategory::Connections {
+            commands.extend(self.accept_config_drop(ui));
+        }
+        let strip = ui.ctx().content_rect().width() < tokens::COLLAPSE_BELOW;
+        if strip {
+            self.pane.show_categories(ui, true);
+            ui.add_space(14.0);
+            self.settings_body(ui, &settings, commands);
+        } else {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                self.pane.show_categories(ui, false);
+                ui.add_space(tokens::SECTION_GAP);
+                ui.vertical(|ui| self.settings_body(ui, &settings, commands));
+            });
+        }
+    }
+
+    /// The current section's groups, scrolling, at most 760 wide.
+    fn settings_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &crate::persistence::settings::Settings,
+        commands: &mut Vec<AppCommand>,
+    ) {
         egui::ScrollArea::vertical()
+            .id_salt("settings-page")
             .auto_shrink([false, false])
-            .show(ui, |ui| match (self.view.window, &self.view.settings) {
-                (Some(Window::Settings), Some(settings)) => {
-                    match self.pane.category() {
-                        SettingsCategory::Troubleshooting => {
-                            self.troubleshooting.draw(
-                                ui,
-                                settings,
-                                &self.client,
-                                &self.picker_gate,
-                            );
-                        }
-                        SettingsCategory::Backup => {
-                            self.preferences_transfer.draw(
-                                ui,
-                                settings,
-                                &self.client,
-                                &self.picker_gate,
-                            );
-                            if ui.button("Import VectrCap config…").clicked() {
-                                crate::platform::windows::file_dialog::spawn_import_destination(
-                                    self.client.clone(),
-                                    self.picker_gate.clone(),
-                                );
-                            }
-                            let zone = ui.add(
-                                egui::Label::new(
-                                    "Drop one .vectrcap config here to review installation",
-                                )
-                                .sense(egui::Sense::click()),
-                            );
-                            if zone.hovered() {
-                                let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
-                                if files.len() == 1 {
-                                    match crate::app::cli::LaunchRequest::import(
-                                        files[0].path().to_path_buf().into_os_string(),
-                                    ) {
-                                        Ok(request) => {
-                                            commands.push(AppCommand::Launch {
-                                                request,
-                                                reply: None,
-                                            });
-                                        }
-                                        Err(error) => self.client.report_error(error),
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
+            .show(ui, |ui| {
+                // Cap, never widen: set_max_width alone would stretch a narrow page.
+                ui.set_max_width(ui.available_width().min(tokens::GROUPS_MAX_WIDTH));
+                match self.pane.category() {
+                    SettingsCategory::Troubleshooting => {
+                        self.troubleshooting
+                            .draw(ui, settings, &self.client, &self.picker_gate)
                     }
-                    commands.extend(self.pane.draw(
+                    SettingsCategory::Backup => self.preferences_transfer.draw(
                         ui,
                         settings,
-                        self.view.notifications_enabled,
-                        &self.view.shortcut_statuses,
-                        self.view.recorded_shortcut,
-                    ))
+                        &self.client,
+                        &self.picker_gate,
+                    ),
+                    _ => {}
                 }
-                (_, None) => {
-                    ui.label("Opening local settings…");
-                }
-                _ => {}
+                commands.extend(self.pane.draw(
+                    ui,
+                    settings,
+                    self.view.notifications_enabled,
+                    &self.view.shortcut_statuses,
+                    self.view.recorded_shortcut,
+                ));
             });
     }
+
+    /// One `.vectrcap` file dropped on Connections opens its install review.
+    fn accept_config_drop(&self, ui: &egui::Ui) -> Vec<AppCommand> {
+        let over_page = ui
+            .ctx()
+            .pointer_hover_pos()
+            .is_some_and(|pos| ui.max_rect().contains(pos));
+        let files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if self.view.lifecycle != Lifecycle::Running || !over_page || files.is_empty() {
+            return vec![];
+        }
+        if files.len() != 1 {
+            self.client
+                .report_error(AppError::InvalidInput("drop one .vectrcap file at a time"));
+            return vec![];
+        }
+        match crate::app::cli::LaunchRequest::import(files[0].path().to_path_buf().into_os_string())
+        {
+            Ok(request) => vec![AppCommand::Launch {
+                request,
+                reply: None,
+            }],
+            Err(error) => {
+                self.client.report_error(error);
+                vec![]
+            }
+        }
+    }
+}
+
+/// A page title (SemiBold 20) over a muted subtitle, 16 above the content.
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(
+            egui::RichText::new(title)
+                .font(tokens::semibold(tokens::TITLE_SIZE))
+                .color(ui.visuals().text_color()),
+        );
+        ui.label(
+            egui::RichText::new(subtitle)
+                .size(tokens::BODY_SIZE)
+                .color(ui.visuals().weak_text_color()),
+        );
+    });
+    ui.add_space(16.0);
 }
 
 /// The left navigation: brand, History, Settings and, at the bottom, Quit.
@@ -858,6 +913,43 @@ mod tests {
                     && !label.starts_with("Start / stop")
                     && label != "Return to tray",
                 "unexpected button {label}"
+            );
+        }
+    }
+
+    fn settings_shell(ctx: &egui::Context, category: SettingsCategory) -> Shell {
+        use crate::ui::fixtures::{MockupVariant, mockup_view};
+        let mut shell =
+            Shell::from_fixture(mockup_view(MockupVariant::Settings(category)), ctx.clone());
+        shell.select_settings_category(category);
+        shell
+    }
+
+    #[test]
+    fn import_config_lives_in_connections_not_backup() {
+        let import = "Import VectrCap config…".to_owned();
+        let ctx = egui::Context::default();
+        let mut shell = settings_shell(&ctx, SettingsCategory::Connections);
+        let (output, _) = run(&ctx, 1180.0, |ui| shell.draw(ui));
+        assert!(button_labels(&output).contains(&import));
+        let ctx = egui::Context::default();
+        let mut shell = settings_shell(&ctx, SettingsCategory::Backup);
+        let (output, _) = run(&ctx, 1180.0, |ui| shell.draw(ui));
+        assert!(!button_labels(&output).contains(&import));
+    }
+
+    #[test]
+    fn each_section_draws_at_380_double_scale_without_overflow() {
+        for category in SettingsCategory::ALL {
+            let ctx = egui::Context::default();
+            ctx.set_zoom_factor(2.0);
+            let mut shell = settings_shell(&ctx, category);
+            let (_, used) = run(&ctx, 380.0, |ui| shell.draw(ui));
+            assert!(
+                used.right() <= 380.5,
+                "{} reaches {}",
+                category.label(),
+                used.right()
             );
         }
     }

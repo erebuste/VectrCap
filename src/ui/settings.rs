@@ -1,4 +1,9 @@
 use super::destinations::ConnectionDraft;
+use super::{
+    icons::Icon,
+    tokens,
+    widgets::{self, PillTone},
+};
 use crate::{
     app::{
         desktop::DesktopView, destination_manager::DestinationEdit, destinations::DestinationId,
@@ -20,6 +25,7 @@ pub enum SettingsCategory {
     Capture,
     Recording,
     Shortcuts,
+    Tasks,
     Storage,
     General,
     Integrations,
@@ -28,11 +34,12 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Connections,
         Self::Capture,
         Self::Recording,
         Self::Shortcuts,
+        Self::Tasks,
         Self::Storage,
         Self::General,
         Self::Integrations,
@@ -46,6 +53,7 @@ impl SettingsCategory {
             Self::Capture => "Capture",
             Self::Recording => "Recording",
             Self::Shortcuts => "Shortcuts",
+            Self::Tasks => "Tasks",
             Self::Storage => "Storage",
             Self::General => "General",
             Self::Integrations => "Integrations",
@@ -109,17 +117,27 @@ impl SettingsPane {
     pub fn select(&mut self, category: SettingsCategory) {
         self.category = category;
     }
-    pub fn show_categories(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
+    /// The section list: a 168-wide column, or a wrapping strip when `strip`.
+    pub fn show_categories(&mut self, ui: &mut Ui, strip: bool) {
+        let mut entries = |ui: &mut Ui, width: f32| {
             for category in SettingsCategory::ALL {
-                if ui
-                    .selectable_label(self.category == category, category.label())
-                    .clicked()
-                {
+                let current = self.category == category;
+                if widgets::section_button(ui, current, category.label(), width).clicked() {
                     self.category = category;
                 }
             }
-        });
+        };
+        if strip {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                entries(ui, 0.0);
+            });
+        } else {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                entries(ui, tokens::SECTION_LIST_WIDTH);
+            });
+        }
     }
     /// Does not touch `saving`: `reconcile` owns that field's lifecycle and
     /// runs every frame regardless of which window is active, so switching
@@ -179,15 +197,8 @@ impl SettingsPane {
             self.adding = None;
         }
         match self.category {
-            SettingsCategory::Integrations => {
-                ui.heading("Integrations");
-                self.integrations.draw(ui);
-            }
+            SettingsCategory::Integrations => self.integrations.draw(ui),
             SettingsCategory::Capture => {
-                ui.heading("Capture");
-                commands.extend(super::task_settings::draw(ui, settings));
-                ui.add_space(12.0);
-                ui.heading("Region");
                 let pane = self.region.get_or_insert_with(|| {
                     super::region_settings::RegionSettingsPane::new(settings)
                 });
@@ -196,7 +207,6 @@ impl SettingsPane {
                 }
             }
             SettingsCategory::Recording => {
-                ui.heading("Recording");
                 let pane = self.recorder.get_or_insert_with(|| {
                     super::recording_settings::RecordingSettingsPane::new(settings)
                 });
@@ -207,144 +217,82 @@ impl SettingsPane {
                     self.audio_meter.as_ref(),
                 ));
             }
+            SettingsCategory::Tasks => commands.extend(super::task_settings::draw(ui, settings)),
             SettingsCategory::General => {
-                ui.heading("General");
-                let mut enabled = notifications_enabled;
-                if ui
-                    .checkbox(&mut enabled, "Show completion notifications")
-                    .changed()
-                {
-                    commands.push(AppCommand::SetNotificationsEnabled(enabled));
-                }
-                let mut appearance = settings.appearance;
-                egui::ComboBox::from_id_salt("ui-scale")
-                    .selected_text(format!("{}%", appearance.ui_scale_percent))
-                    .show_ui(ui, |ui| {
-                        for scale in
-                            crate::persistence::settings::AppearancePreferences::VALID_SCALES
-                        {
-                            ui.selectable_value(
-                                &mut appearance.ui_scale_percent,
-                                scale,
-                                format!("{scale}%"),
-                            );
-                        }
-                    });
-                if appearance != settings.appearance {
-                    commands.push(AppCommand::SetAppearance {
-                        appearance,
-                        revision: settings.revision,
-                    });
-                }
-                ui.label("Scale changes interface text and controls relative to Windows DPI. Media pixels are unchanged.");
-                let mut startup = settings.startup;
-                if ui
-                    .checkbox(
-                        &mut startup.launch_at_sign_in,
-                        "Launch VectrCap when I sign in",
-                    )
-                    .changed()
-                {
-                    commands.push(AppCommand::SetStartup {
-                        startup,
-                        revision: settings.revision,
-                    });
-                }
+                general(ui, settings, notifications_enabled, &mut commands)
             }
-            SettingsCategory::Storage => {
-                ui.heading("Storage");
-                use crate::persistence::settings::StorageMode;
-                let mut policy = settings.archive.clone();
-                ui.label(policy.archive_root.as_ref().map_or_else(
-                    || "Archive: Pictures / VectrCap".to_owned(),
-                    |p| format!("Archive: {}", p.display()),
-                ));
-                if ui.button("Choose archive folder...").clicked() {
-                    commands.push(AppCommand::ChooseArchiveFolder);
-                }
-                if ui.button("Use default archive folder").clicked() {
-                    policy.archive_root = None;
-                }
-                egui::ComboBox::from_id_salt("archive-mode")
-                    .selected_text(format!("{:?}", policy.storage_mode))
-                    .show_ui(ui, |ui| {
-                        for mode in [
-                            StorageMode::AlwaysSave,
-                            StorageMode::PendingOrFailed,
-                            StorageMode::NeverAutomatic,
-                        ] {
-                            ui.selectable_value(
-                                &mut policy.storage_mode,
-                                mode,
-                                format!("{mode:?}"),
-                            );
-                        }
-                    });
-                let mut cleanup = policy.cleanup_age_days.is_some();
-                if ui
-                    .checkbox(
-                        &mut cleanup,
-                        "Enable age-based cleanup of app-owned archive copies",
-                    )
-                    .changed()
-                {
-                    policy.cleanup_age_days = cleanup.then_some(30);
-                }
-                if let Some(days) = &mut policy.cleanup_age_days {
-                    ui.add(egui::DragValue::new(days).range(1..=3650).suffix(" days"));
-                }
-                ui.label("Cleanup runs at launch. Active upload sources are retained. Favorites do not change retention. Working spool and recording files remain necessary with any archive mode.");
-                if policy != settings.archive {
-                    commands.push(AppCommand::SetArchivePolicy {
-                        policy,
-                        revision: settings.revision,
-                    });
-                }
-            }
+            SettingsCategory::Storage => storage(ui, settings, &mut commands),
             SettingsCategory::Shortcuts => {
-                ui.heading("Shortcuts");
-                ui.label("Add a shortcut, choose what it does, then press the key. Actions without a key stay off this list. Editor, ruler, and sampler shortcuts that already have keys stay listed. Apply saves the list together; a conflict keeps the previous settings.");
-                let mut recording = self.recording.take();
-                let mut adding = self.adding.take();
-                let mut shortcut_error = None;
-                let mut clear_draft = false;
-                {
-                    let bindings = self
-                        .shortcuts
-                        .get_or_insert_with(|| settings.shortcuts.effective());
-                    let can_add = bindings.iter().any(|binding| binding.chord.is_none());
-                    if adding.is_none()
-                        && ui
-                            .add_enabled(can_add, egui::Button::new("Add shortcut"))
-                            .clicked()
-                        && let Some(action) = bindings
-                            .iter()
-                            .find(|binding| binding.chord.is_none())
-                            .map(|binding| binding.action)
+                self.shortcuts_section(ui, settings, statuses, recorded_shortcut, &mut commands)
+            }
+            SettingsCategory::Connections => self.connections(ui, settings, &mut commands),
+            SettingsCategory::Backup | SettingsCategory::Troubleshooting => {}
+        }
+        commands.push(AppCommand::SetShortcutEntryActive(
+            self.recording.as_ref().map(|(_, request, _)| *request),
+        ));
+        if self.category != SettingsCategory::Connections
+            && let Some(error) = &self.error
+        {
+            ui.add_space(10.0);
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Could not apply: {error}"),
+            );
+        }
+        commands
+    }
+
+    fn shortcuts_section(
+        &mut self,
+        ui: &mut Ui,
+        settings: &Settings,
+        statuses: &[(
+            crate::app::shortcuts::ShortcutAction,
+            crate::app::shortcuts::ShortcutStatus,
+        )],
+        recorded_shortcut: Option<(Uuid, crate::app::shortcuts::KeyChord)>,
+        commands: &mut Vec<AppCommand>,
+    ) {
+        use crate::app::{destinations::DestinationSelection, shortcuts::ShortcutStatus};
+        let mut recording = self.recording.take();
+        let mut adding = self.adding.take();
+        let mut shortcut_error = None;
+        let mut clear_draft = false;
+        let bindings = self
+            .shortcuts
+            .get_or_insert_with(|| settings.shortcuts.effective());
+        widgets::setting_group(
+            ui,
+            "Shortcuts",
+            Some(
+                "Press a shortcut anywhere in Windows to run its action. Editor, ruler and sampler keys work inside those tools.",
+            ),
+            |ui| {
+                if let Some(mut draft) = adding.take() {
+                    let choices: Vec<_> = bindings
+                        .iter()
+                        .filter(|binding| binding.chord.is_none())
+                        .map(|binding| binding.action)
+                        .collect();
+                    if !choices.contains(&draft.action)
+                        && let Some(action) = choices.first().copied()
                     {
-                        adding = Some(NewShortcut {
-                            action,
-                            chord: None,
-                        });
+                        draft.action = action;
                     }
-                    if let Some(mut draft) = adding.take() {
-                        let choices: Vec<_> = bindings
-                            .iter()
-                            .filter(|binding| binding.chord.is_none())
-                            .map(|binding| binding.action)
-                            .collect();
-                        if !choices.contains(&draft.action)
-                            && let Some(action) = choices.first().copied()
-                        {
-                            draft.action = action;
-                        }
-                        if choices.is_empty() {
-                            recording = None;
-                        } else {
-                            let mut dismiss_draft = false;
-                            ui.group(|ui| {
-                                ui.label("New shortcut");
+                    if choices.is_empty() {
+                        recording = None;
+                    } else {
+                        let mut dismiss = false;
+                        widgets::card_block(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("New shortcut")
+                                    .font(tokens::medium(tokens::BODY_SIZE))
+                                    .color(ui.visuals().text_color()),
+                            );
+                            ui.horizontal_wrapped(|ui| {
                                 egui::ComboBox::from_id_salt("new-shortcut-action")
+                                    .width(220.0)
                                     .selected_text(draft.action.label())
                                     .show_ui(ui, |ui| {
                                         for action in &choices {
@@ -355,85 +303,130 @@ impl SettingsPane {
                                             );
                                         }
                                     });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(shortcut_scope_label(draft.action.scope()));
-                                    match shortcut_key_button(
-                                        ui,
-                                        "new-shortcut-key",
-                                        &mut recording,
-                                        ShortcutCapture::New,
-                                        draft.chord,
-                                        recorded_shortcut,
-                                        "Click to choose a key",
+                                widgets::hint(ui, shortcut_scope_label(draft.action.scope()));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                match shortcut_key_button(
+                                    ui,
+                                    "new-shortcut-key",
+                                    &mut recording,
+                                    ShortcutCapture::New,
+                                    draft.chord,
+                                    recorded_shortcut,
+                                    "Click, then press the keys",
+                                ) {
+                                    Ok(Some(chord)) => draft.chord = Some(chord),
+                                    Ok(None) => {}
+                                    Err(error) => shortcut_error = Some(error),
+                                }
+                                let add = ui
+                                    .add_enabled_ui(draft.chord.is_some(), |ui| {
+                                        widgets::toggle_button(ui, false, None, "Add").clicked()
+                                    })
+                                    .inner;
+                                if add && let Some(chord) = draft.chord {
+                                    match store_shortcut_change(
+                                        bindings,
+                                        draft.action,
+                                        Some(chord),
+                                        true,
                                     ) {
-                                        Ok(Some(chord)) => draft.chord = Some(chord),
-                                        Ok(None) => {}
+                                        Ok(()) => dismiss = true,
                                         Err(error) => shortcut_error = Some(error),
                                     }
-                                    if ui
-                                        .add_enabled(
-                                            draft.chord.is_some(),
-                                            egui::Button::new("Add"),
-                                        )
-                                        .clicked()
-                                        && let Some(chord) = draft.chord
-                                    {
-                                        match store_shortcut_change(
-                                            bindings,
-                                            draft.action,
-                                            Some(chord),
-                                            true,
-                                        ) {
-                                            Ok(()) => dismiss_draft = true,
-                                            Err(error) => shortcut_error = Some(error),
-                                        }
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        dismiss_draft = true;
-                                    }
-                                });
+                                }
+                                if widgets::ghost_button(ui, None, "Cancel").clicked() {
+                                    dismiss = true;
+                                }
                             });
-                            if dismiss_draft {
-                                if recording
-                                    .as_ref()
-                                    .is_some_and(|(target, _, _)| *target == ShortcutCapture::New)
-                                {
-                                    recording = None;
-                                }
-                            } else {
-                                adding = Some(draft);
+                        });
+                        if dismiss {
+                            if recording
+                                .as_ref()
+                                .is_some_and(|(target, _, _)| *target == ShortcutCapture::New)
+                            {
+                                recording = None;
                             }
+                        } else {
+                            adding = Some(draft);
                         }
                     }
-                    if !bindings.iter().any(shortcut_is_shown) {
-                        ui.label("No shortcuts yet.");
-                    }
-                    let shown: Vec<usize> = bindings
+                }
+                let shown: Vec<usize> = bindings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, binding)| shortcut_is_shown(binding))
+                    .map(|(index, _)| index)
+                    .collect();
+                if shown.is_empty() {
+                    widgets::card_block(ui, |ui| {
+                        widgets::hint(ui, "No shortcuts yet. Add one below.");
+                    });
+                }
+                for index in shown {
+                    let action = bindings[index].action;
+                    let status = statuses
                         .iter()
-                        .enumerate()
-                        .filter(|(_, binding)| shortcut_is_shown(binding))
-                        .map(|(index, _)| index)
-                        .collect();
-                    for index in shown {
-                        let action = bindings[index].action;
-                        if let Some((_, status)) =
-                            statuses.iter().find(|(listed, _)| *listed == action)
-                        {
-                            ui.label(format!("Current registration: {status:?}"));
-                        }
-                        ui.push_id(action, |ui| {
-                            ui.label(format!(
-                                "{} · {}{}",
-                                action.label(),
-                                shortcut_scope_label(action.scope()),
-                                if action.is_available_now() {
-                                    ""
-                                } else {
-                                    " · unavailable until its feature is implemented"
+                        .find(|(listed, _)| *listed == action)
+                        .map(|(_, status)| *status);
+                    let mut description = shortcut_scope_label(action.scope()).to_owned();
+                    if !action.is_available_now() {
+                        description.push_str(", not available yet");
+                    } else if status == Some(ShortcutStatus::Unavailable) {
+                        description.push_str(", not registered: another app may be using it");
+                    }
+                    ui.push_id(action, |ui| {
+                        let mut reset = false;
+                        let mut remove = false;
+                        let destinations = action.supports_task_profile();
+                        let mut destination = bindings[index].destination;
+                        widgets::setting_row_with(
+                            ui,
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(action.label())
+                                        .font(tokens::medium(tokens::BODY_SIZE))
+                                        .color(ui.visuals().text_color()),
+                                );
+                                widgets::hint(ui, &description);
+                                if destinations {
+                                    ui.horizontal_wrapped(|ui| {
+                                        let label = match destination {
+                                            DestinationSelection::Inherit => {
+                                                "Default destination".to_owned()
+                                            }
+                                            DestinationSelection::Specific(id) => settings
+                                                .destinations
+                                                .get(id)
+                                                .map(|d| d.name.clone())
+                                                .unwrap_or_else(|| "Missing destination".into()),
+                                        };
+                                        egui::ComboBox::from_id_salt("shortcut-destination")
+                                            .width(150.0)
+                                            .selected_text(label)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut destination,
+                                                    DestinationSelection::Inherit,
+                                                    "Default destination",
+                                                );
+                                                for d in settings.destinations.iter() {
+                                                    ui.selectable_value(
+                                                        &mut destination,
+                                                        DestinationSelection::Specific(d.id),
+                                                        &d.name,
+                                                    );
+                                                }
+                                            });
+                                        reset = widgets::ghost_button(ui, None, "Default")
+                                            .on_hover_text("Restore this action's default key")
+                                            .clicked();
+                                    });
                                 }
-                            ));
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut bindings[index].enabled, "Enabled");
+                            },
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                remove = widgets::ghost_button(ui, None, "Remove").clicked();
                                 let enabled = bindings[index].enabled;
                                 match shortcut_key_button(
                                     ui,
@@ -457,68 +450,60 @@ impl SettingsPane {
                                     Ok(None) => {}
                                     Err(error) => shortcut_error = Some(error),
                                 }
-                                if action.supports_task_profile() {
-                                    use crate::app::destinations::DestinationSelection;
-                                    let label = match bindings[index].destination {
-                                        DestinationSelection::Inherit => {
-                                            "Default destination".to_owned()
-                                        }
-                                        DestinationSelection::Specific(id) => settings
-                                            .destinations
-                                            .iter()
-                                            .find(|destination| destination.id == id)
-                                            .map(|destination| destination.name.clone())
-                                            .unwrap_or_else(|| "Missing destination".into()),
-                                    };
-                                    egui::ComboBox::from_id_salt("shortcut-destination")
-                                        .selected_text(label)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut bindings[index].destination,
-                                                DestinationSelection::Inherit,
-                                                "Default destination",
-                                            );
-                                            for destination in settings.destinations.iter() {
-                                                ui.selectable_value(
-                                                    &mut bindings[index].destination,
-                                                    DestinationSelection::Specific(destination.id),
-                                                    &destination.name,
-                                                );
-                                            }
-                                        });
-                                }
-                                if ui.button("Default").clicked() {
-                                    commands.push(AppCommand::ResetShortcuts {
-                                        actions: Some(vec![action]),
-                                        revision: settings.revision,
-                                    });
-                                    bindings[index] =
-                                        crate::app::shortcuts::ShortcutBinding::default_for(action);
-                                    if recording.as_ref().is_some_and(|(target, _, _)| {
-                                        *target == ShortcutCapture::Binding(action)
-                                    }) {
-                                        recording = None;
-                                    }
-                                }
-                                if ui.button("Remove").clicked() {
-                                    bindings[index].chord = None;
-                                    bindings[index].enabled = false;
-                                    if recording.as_ref().is_some_and(|(target, _, _)| {
-                                        *target == ShortcutCapture::Binding(action)
-                                    }) {
-                                        recording = None;
-                                    }
-                                }
+                                widgets::toggle_switch(
+                                    ui,
+                                    &mut bindings[index].enabled,
+                                    &format!("{} enabled", action.label()),
+                                );
+                            },
+                        );
+                        bindings[index].destination = destination;
+                        let mine = |recording: &Option<(ShortcutCapture, Uuid, _)>| {
+                            recording.as_ref().is_some_and(|(target, _, _)| {
+                                *target == ShortcutCapture::Binding(action)
+                            })
+                        };
+                        if reset {
+                            commands.push(AppCommand::ResetShortcuts {
+                                actions: Some(vec![action]),
+                                revision: settings.revision,
                             });
+                            bindings[index] =
+                                crate::app::shortcuts::ShortcutBinding::default_for(action);
+                            if mine(&recording) {
+                                recording = None;
+                            }
+                        }
+                        if remove {
+                            bindings[index].chord = None;
+                            bindings[index].enabled = false;
+                            if mine(&recording) {
+                                recording = None;
+                            }
+                        }
+                    });
+                }
+                widgets::card_footer(ui, |ui| {
+                    let narrow = ui.available_width() < tokens::STACK_BELOW;
+                    let can_add = bindings.iter().any(|binding| binding.chord.is_none());
+                    let add = ui
+                        .add_enabled_ui(can_add && adding.is_none(), |ui| {
+                            widgets::toggle_button(ui, false, Some(Icon::Plus), "Add shortcut")
+                                .clicked()
+                        })
+                        .inner;
+                    if add
+                        && let Some(action) = bindings
+                            .iter()
+                            .find(|binding| binding.chord.is_none())
+                            .map(|binding| binding.action)
+                    {
+                        adding = Some(NewShortcut {
+                            action,
+                            chord: None,
                         });
                     }
-                    if ui.button("Apply shortcuts").clicked() {
-                        commands.push(AppCommand::ApplyShortcuts {
-                            bindings: bindings.clone(),
-                            revision: settings.revision,
-                        });
-                    }
-                    if ui.button("Reset all shortcuts").clicked() {
+                    if widgets::ghost_button(ui, None, "Reset all").clicked() {
                         commands.push(AppCommand::ResetShortcuts {
                             actions: None,
                             revision: settings.revision,
@@ -527,149 +512,343 @@ impl SettingsPane {
                         adding = None;
                         recording = None;
                     }
-                }
-                if clear_draft {
-                    self.shortcuts = None;
-                }
-                self.recording = recording;
-                self.adding = adding;
-                if let Some(error) = shortcut_error {
-                    self.error = Some(error);
-                }
-            }
-            SettingsCategory::Connections
-            | SettingsCategory::Backup
-            | SettingsCategory::Troubleshooting => {}
-        }
-        commands.push(AppCommand::SetShortcutEntryActive(
-            self.recording.as_ref().map(|(_, request, _)| *request),
-        ));
-        if self.category != SettingsCategory::Connections {
-            if let Some(error) = &self.error {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Could not apply: {error}"),
-                );
-            }
-            return commands;
-        }
-        ui.heading(if settings.destinations.is_empty() {
-            "Connect to Vectr"
-        } else {
-            "Destinations"
-        });
-        ui.label("Use an uploader token created in Vectr. Your password is never needed.");
-        ui.add_space(14.0);
-        if let Some(error) = &self.error {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Could not apply: {error}"),
-            );
-        }
-        if let Some(draft) = &mut self.draft {
-            let mut cancel = false;
-            ui.add_enabled_ui(self.saving.is_none(), |ui| {
-                match connection(ui, draft, settings, self.just_opened) {
-                    Ok(Some(command)) => {
-                        if let AppCommand::SaveConnection { request, .. } = &command {
-                            self.saving = Some(*request);
+                    let mut save = |ui: &mut Ui| {
+                        if widgets::primary_button(ui, None, "Save shortcuts").clicked() {
+                            commands.push(AppCommand::ApplyShortcuts {
+                                bindings: bindings.clone(),
+                                revision: settings.revision,
+                            });
                         }
-                        commands.push(command);
-                    }
-                    Ok(None) => {}
-                    Err(error) => self.error = Some(error),
-                }
-                cancel = ui.button("Cancel editing").clicked();
-            });
-            self.just_opened = false;
-            if cancel {
-                self.clear(ui.ctx());
-                commands.push(AppCommand::CancelConnectionTest);
-            }
-            if self.saving.is_some() {
-                ui.label("Saving connection…");
-            }
-            return commands;
-        }
-        let mut edit = None;
-        for d in settings.destinations.iter() {
-            ui.push_id(d.id.0, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        eframe::egui::RichText::new(&d.name)
-                            .strong()
-                            .color(ui.visuals().text_color()),
-                    );
-                    let default = Some(d.id) == settings.destinations.default_id();
-                    if ui.radio(default, "Default").clicked() && !default {
-                        commands.push(AppCommand::SetDefault {
-                            id: d.id,
-                            revision: settings.revision,
+                    };
+                    // Narrow: Save wraps inline; wide: hint and Save sit at the right end.
+                    if narrow {
+                        save(ui);
+                    } else {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            save(ui);
+                            widgets::hint(ui, "Changes apply when you save");
                         });
                     }
-                    if ui.button(format!("Edit {}", d.name)).clicked() {
-                        edit = Some(d.id);
-                    }
-                    if ui.button(format!("Remove {}", d.name)).clicked() {
-                        self.remove = Some(d.id);
-                    }
                 });
-                ui.label(d.origin.as_str());
-                ui.label(
-                    d.link_domain_override
-                        .as_ref()
-                        .map(|d| format!("Link domain: {}", d.as_str()))
-                        .unwrap_or_else(|| "Link domain: uploader default".into()),
-                );
-                if d.credential_ref.is_none() {
-                    ui.label("Setup needed: no token saved");
-                }
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(6.0);
-            });
+            },
+        );
+        if clear_draft {
+            self.shortcuts = None;
         }
+        self.recording = recording;
+        self.adding = adding;
+        if let Some(error) = shortcut_error {
+            self.error = Some(error);
+        }
+    }
+
+    fn connections(&mut self, ui: &mut Ui, settings: &Settings, commands: &mut Vec<AppCommand>) {
+        let title = if settings.destinations.is_empty() {
+            "Connect to Vectr"
+        } else {
+            "Connections"
+        };
+        let description = "Where your uploads go. Use an uploader token created in Vectr; your password is never needed.";
+        if let Some(draft) = &mut self.draft {
+            let mut cancel = false;
+            let mut remove = None;
+            let editing = draft.id;
+            widgets::setting_group(
+                ui,
+                if editing.is_some() {
+                    "Edit connection"
+                } else {
+                    title
+                },
+                Some(description),
+                |ui| {
+                    widgets::card_block(ui, |ui| {
+                        if let Some(error) = &self.error {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("Could not apply: {error}"),
+                            );
+                        }
+                        ui.add_enabled_ui(self.saving.is_none(), |ui| {
+                            match connection(ui, draft, settings, self.just_opened) {
+                                Ok(Some(command)) => {
+                                    if let AppCommand::SaveConnection { request, .. } = &command {
+                                        self.saving = Some(*request);
+                                    }
+                                    commands.push(command);
+                                }
+                                Ok(None) => {}
+                                Err(error) => self.error = Some(error),
+                            }
+                        });
+                        if self.saving.is_some() {
+                            widgets::hint(ui, "Saving connection…");
+                        }
+                    });
+                    widgets::card_footer(ui, |ui| {
+                        cancel = widgets::ghost_button(ui, None, "Cancel").clicked();
+                        if let Some(id) = editing
+                            && widgets::ghost_button(ui, None, "Remove connection").clicked()
+                        {
+                            remove = Some(id);
+                        }
+                    });
+                },
+            );
+            self.just_opened = false;
+            if cancel || remove.is_some() {
+                self.clear(ui.ctx());
+                commands.push(AppCommand::CancelConnectionTest);
+                self.remove = remove;
+            }
+            return;
+        }
+        let mut edit = None;
+        widgets::setting_group(ui, title, Some(description), |ui| {
+            if let Some(error) = &self.error {
+                widgets::card_block(ui, |ui| {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("Could not apply: {error}"),
+                    );
+                });
+            }
+            for d in settings.destinations.iter() {
+                ui.push_id(d.id.0, |ui| {
+                    let default = Some(d.id) == settings.destinations.default_id();
+                    let token = d.credential_ref.is_some();
+                    let host = d.origin.as_str();
+                    let host = host.strip_prefix("https://").unwrap_or(host).to_owned();
+                    let mut detail = host;
+                    if let Some(domain) = &d.link_domain_override {
+                        detail.push_str(&format!(", links use {}", domain.as_str()));
+                    }
+                    widgets::setting_row_with(
+                        ui,
+                        |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    egui::RichText::new(&d.name)
+                                        .font(tokens::medium(tokens::BODY_SIZE))
+                                        .color(ui.visuals().text_color()),
+                                );
+                                if default {
+                                    widgets::pill(ui, "Default", PillTone::Default);
+                                }
+                                if token {
+                                    widgets::pill(ui, "Token saved", PillTone::Success);
+                                } else {
+                                    widgets::pill(ui, "Needs a token", PillTone::Warning);
+                                }
+                            });
+                            widgets::hint(ui, &detail);
+                        },
+                        |ui| {
+                            let clicked = if token {
+                                widgets::toggle_button(ui, false, None, "Edit")
+                                    .on_hover_text(format!("Edit {}", d.name))
+                                    .clicked()
+                            } else {
+                                widgets::primary_button(ui, None, "Add token").clicked()
+                            };
+                            if clicked {
+                                edit = Some(d.id);
+                            }
+                        },
+                    );
+                });
+            }
+            if let Some(id) = self.remove {
+                widgets::card_block(ui, |ui| {
+                    ui.label("Remove this connection? Unfinished uploads or workflows can prevent removal. Choose another default first when needed.");
+                    ui.horizontal_wrapped(|ui| {
+                        if widgets::toggle_button(ui, false, None, "Remove").clicked() {
+                            let mut destinations = settings.destinations.clone();
+                            match destinations.remove(id, None, &Default::default()) {
+                                Ok(_) => {
+                                    commands.push(AppCommand::ApplyDestinations {
+                                        edit: DestinationEdit {
+                                            destinations,
+                                            tokens: vec![],
+                                        },
+                                        revision: settings.revision,
+                                    });
+                                    self.remove = None;
+                                }
+                                Err(error) => self.error = Some(error),
+                            }
+                        }
+                        if widgets::ghost_button(ui, None, "Keep it").clicked() {
+                            self.remove = None;
+                        }
+                    });
+                });
+            }
+            widgets::card_footer(ui, |ui| {
+                let add = ui
+                    .add_enabled_ui(settings.destinations.len() < 32, |ui| {
+                        widgets::toggle_button(ui, false, Some(Icon::Plus), "Add connection")
+                            .clicked()
+                    })
+                    .inner;
+                if add {
+                    self.draft = Some(ConnectionDraft::new(settings, None));
+                    self.just_opened = true;
+                    self.error = None;
+                }
+                if widgets::toggle_button(ui, false, None, "Import VectrCap config…").clicked() {
+                    commands.push(AppCommand::ChooseImportConfig);
+                }
+                // Wide: the drop hint sits at the right end; narrow: it wraps inline.
+                if ui.available_width() > 220.0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        widgets::hint(ui, "Or drop a .vectrcap file here");
+                    });
+                } else {
+                    widgets::hint(ui, "Or drop a .vectrcap file here");
+                }
+            });
+        });
         if let Some(id) = edit {
             self.draft = Some(ConnectionDraft::new(settings, Some(id)));
             self.just_opened = true;
             self.error = None;
         }
-        if let Some(id) = self.remove {
-            ui.label("Remove this connection? Unfinished uploads or workflows can prevent removal. Choose another default first when needed.");
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Confirm removal").clicked() {
-                    let mut destinations = settings.destinations.clone();
-                    match destinations.remove(id, None, &Default::default()) {
-                        Ok(_) => {
-                            commands.push(AppCommand::ApplyDestinations {
-                                edit: DestinationEdit {
-                                    destinations,
-                                    tokens: vec![],
-                                },
-                                revision: settings.revision,
-                            });
-                            self.remove = None;
+    }
+}
+
+fn general(
+    ui: &mut Ui,
+    settings: &Settings,
+    notifications_enabled: bool,
+    commands: &mut Vec<AppCommand>,
+) {
+    widgets::setting_group(ui, "General", None, |ui| {
+        let label = "Show a notification when an upload finishes";
+        widgets::setting_row(ui, label, None, |ui| {
+            let mut enabled = notifications_enabled;
+            if widgets::toggle_switch(ui, &mut enabled, label).changed() {
+                commands.push(AppCommand::SetNotificationsEnabled(enabled));
+            }
+        });
+        let label = "Start VectrCap when Windows starts";
+        widgets::setting_row(ui, label, None, |ui| {
+            let mut startup = settings.startup;
+            if widgets::toggle_switch(ui, &mut startup.launch_at_sign_in, label).changed() {
+                commands.push(AppCommand::SetStartup {
+                    startup,
+                    revision: settings.revision,
+                });
+            }
+        });
+        widgets::setting_row(
+            ui,
+            "Interface size",
+            Some(
+                "Scales text and controls on top of Windows display scaling. Captures keep their pixels.",
+            ),
+            |ui| {
+                let mut appearance = settings.appearance;
+                egui::ComboBox::from_id_salt("ui-scale")
+                    .width(tokens::CONTROL_COLUMN - 16.0)
+                    .selected_text(format!("{}%", appearance.ui_scale_percent))
+                    .show_ui(ui, |ui| {
+                        for scale in
+                            crate::persistence::settings::AppearancePreferences::VALID_SCALES
+                        {
+                            ui.selectable_value(
+                                &mut appearance.ui_scale_percent,
+                                scale,
+                                format!("{scale}%"),
+                            );
                         }
-                        Err(error) => self.error = Some(error),
-                    }
+                    });
+                if appearance != settings.appearance {
+                    commands.push(AppCommand::SetAppearance {
+                        appearance,
+                        revision: settings.revision,
+                    });
                 }
-                if ui.button("Keep connection").clicked() {
-                    self.remove = None;
+            },
+        );
+    });
+}
+
+fn storage(ui: &mut Ui, settings: &Settings, commands: &mut Vec<AppCommand>) {
+    use crate::persistence::settings::StorageMode;
+    let mut policy = settings.archive.clone();
+    widgets::setting_group(
+        ui,
+        "Local copies",
+        Some(
+            "Files VectrCap saves on this computer. Working files for uploads and recordings are kept whatever you choose.",
+        ),
+        |ui| {
+            let mode_label = |mode: StorageMode| match mode {
+                StorageMode::AlwaysSave => "Always",
+                StorageMode::PendingOrFailed => "Until the upload succeeds",
+                StorageMode::NeverAutomatic => "Only when a task asks",
+            };
+            widgets::setting_row(ui, "Keep a local copy", None, |ui| {
+                egui::ComboBox::from_id_salt("archive-mode")
+                    .width(tokens::CONTROL_COLUMN - 16.0)
+                    .selected_text(mode_label(policy.storage_mode))
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            StorageMode::AlwaysSave,
+                            StorageMode::PendingOrFailed,
+                            StorageMode::NeverAutomatic,
+                        ] {
+                            ui.selectable_value(&mut policy.storage_mode, mode, mode_label(mode));
+                        }
+                    });
+            });
+            let folder = policy.archive_root.as_ref().map_or_else(
+                || "Pictures\\VectrCap".to_owned(),
+                |p| p.display().to_string(),
+            );
+            widgets::setting_row(ui, "Capture folder", Some(&folder), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if widgets::toggle_button(ui, false, Some(Icon::Folder), "Browse…").clicked() {
+                    commands.push(AppCommand::ChooseArchiveFolder);
+                }
+                if policy.archive_root.is_some()
+                    && widgets::ghost_button(ui, None, "Use default").clicked()
+                {
+                    policy.archive_root = None;
                 }
             });
-        }
-        if ui
-            .add_enabled(
-                settings.destinations.len() < 32,
-                egui::Button::new("Add connection"),
-            )
-            .clicked()
-        {
-            self.draft = Some(ConnectionDraft::new(settings, None));
-            self.just_opened = true;
-            self.error = None;
-        }
-        commands
+            let label = "Delete old copies";
+            widgets::setting_row(
+                ui,
+                label,
+                Some(
+                    "Only copies VectrCap saved. Runs at launch; files still waiting to upload are kept. Favorites don't change this.",
+                ),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let mut cleanup = policy.cleanup_age_days.is_some();
+                    if widgets::toggle_switch(ui, &mut cleanup, label).changed() {
+                        policy.cleanup_age_days = cleanup.then_some(30);
+                    }
+                    if let Some(days) = &mut policy.cleanup_age_days {
+                        ui.add(
+                            egui::DragValue::new(days)
+                                .range(1..=3650)
+                                .prefix("after ")
+                                .suffix(" days"),
+                        );
+                    }
+                },
+            );
+        },
+    );
+    if policy != settings.archive {
+        commands.push(AppCommand::SetArchivePolicy {
+            policy,
+            revision: settings.revision,
+        });
     }
 }
 fn field(ui: &mut Ui, title: &str, value: &mut String, limit: usize, focus: bool) -> bool {
@@ -1000,6 +1179,76 @@ mod tests {
         output.textures_delta.clear();
     }
     #[test]
+    fn sections_are_the_ten_in_spec_order() {
+        assert_eq!(
+            SettingsCategory::ALL.map(|c| c.label()),
+            [
+                "Connections",
+                "Capture",
+                "Recording",
+                "Shortcuts",
+                "Tasks",
+                "Storage",
+                "General",
+                "Integrations",
+                "Backup",
+                "Troubleshooting"
+            ]
+        );
+    }
+
+    /// Names of the switches (checkbox role) a category draws.
+    fn switches(category: SettingsCategory) -> Vec<String> {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let settings = Settings::default();
+        let mut pane = SettingsPane::default();
+        pane.select(category);
+        let mut last = None;
+        for _ in 0..2 {
+            let mut output = context.run_ui(Default::default(), |ui| {
+                pane.draw(ui, &settings, true, &[], None);
+            });
+            output.textures_delta.clear();
+            last = Some(output);
+        }
+        last.expect("two frames")
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| &update.nodes)
+            .filter(|(_, node)| node.role() == egui::accesskit::Role::CheckBox)
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn tasks_section_owns_after_capture_and_after_upload_toggles() {
+        use crate::workflow::profile::{CaptureTask, UploadTask};
+        let tasks = switches(SettingsCategory::Tasks);
+        for task in CaptureTask::ALL {
+            assert!(
+                tasks.iter().any(|l| l == task.label()),
+                "{:?} missing",
+                task.label()
+            );
+        }
+        for task in UploadTask::ALL {
+            assert!(
+                tasks.iter().any(|l| l == task.label()),
+                "{:?} missing",
+                task.label()
+            );
+        }
+        let capture = switches(SettingsCategory::Capture);
+        assert!(
+            UploadTask::ALL
+                .iter()
+                .all(|task| !capture.iter().any(|l| l == task.label()))
+        );
+    }
+
+    #[test]
     fn select_sets_the_shown_category() {
         let mut pane = SettingsPane::default();
         pane.select(SettingsCategory::Shortcuts);
@@ -1031,7 +1280,7 @@ mod tests {
         pane.draft = Some(ConnectionDraft::new(&settings, None));
         pane.category = SettingsCategory::Troubleshooting;
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            pane.show_categories(ui);
+            pane.show_categories(ui, false);
             let commands = pane.draw(ui, &settings, true, &[], None);
             assert!(
                 commands

@@ -323,8 +323,23 @@ impl TroubleshootingPane {
         client: &DesktopClient,
         gate: &PickerGate,
     ) {
+        super::widgets::setting_group(
+            ui,
+            "Connection check and diagnostic report",
+            Some(
+                "The check sends a health request and a token check to one connection; nothing is uploaded. The report holds counts and error codes only: no file names, links or tokens.",
+            ),
+            |ui| super::widgets::card_block(ui, |ui| self.draw_body(ui, settings, client, gate)),
+        );
+    }
+    fn draw_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &Settings,
+        client: &DesktopClient,
+        gate: &PickerGate,
+    ) {
         self.reconcile(settings);
-        ui.heading("Troubleshooting");
         for action in self.controls(ui, settings) {
             match action {
                 TroubleshootingAction::Refresh => {

@@ -312,7 +312,7 @@ pub fn setting_group(
     description: Option<&str>,
     add_rows: impl FnOnce(&mut Ui),
 ) {
-    let strong = ui.visuals().strong_text_color();
+    let strong = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
     ui.label(RichText::new(title).font(semibold(BODY_SIZE)).color(strong));
     if let Some(description) = description {
@@ -330,22 +330,49 @@ pub fn setting_row(
     description: Option<&str>,
     add_control: impl FnOnce(&mut Ui),
 ) -> Response {
-    let key = rows_key(ui);
-    let first = ui.data_mut(|d| {
-        let seen = d.get_temp_mut_or(key, 0_usize);
-        *seen += 1;
-        *seen == 1
-    });
-    let stacked = ui.available_width() < STACK_BELOW;
-    let strong = ui.visuals().strong_text_color();
+    let strong = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
-    let text = |ui: &mut Ui| {
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
+    setting_row_with(
+        ui,
+        |ui| {
             ui.label(RichText::new(label).font(medium(BODY_SIZE)).color(strong));
             if let Some(description) = description {
                 ui.label(RichText::new(description).size(BODY_SIZE).color(weak));
             }
+        },
+        add_control,
+    )
+}
+
+/// Whether this is the card's first block (no separator above it).
+fn first_in_card(ui: &mut Ui) -> bool {
+    let key = rows_key(ui);
+    ui.data_mut(|d| {
+        let seen = d.get_temp_mut_or(key, 0_usize);
+        *seen += 1;
+        *seen == 1
+    })
+}
+
+fn separate_unless_first(ui: &Ui, first: bool, rect: Rect) {
+    if !first {
+        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+        ui.painter().hline(rect.x_range(), rect.top(), stroke);
+    }
+}
+
+/// A setting row whose left side is drawn by `text` (e.g. a name with pills).
+pub fn setting_row_with(
+    ui: &mut Ui,
+    text: impl FnOnce(&mut Ui),
+    add_control: impl FnOnce(&mut Ui),
+) -> Response {
+    let first = first_in_card(ui);
+    let stacked = ui.available_width() < STACK_BELOW;
+    let text = |ui: &mut Ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            text(ui);
         });
     };
     let response = Frame::new()
@@ -359,31 +386,86 @@ pub fn setting_row(
             } else {
                 ui.horizontal(|ui| {
                     let text_width = (ui.available_width() - CONTROL_COLUMN - 24.0).max(0.0);
-                    ui.allocate_ui_with_layout(
-                        vec2(text_width, 0.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(text_width);
-                            text(ui);
-                        },
-                    );
+                    // Plain vertical + with_layout: allocate_ui_with_layout pads
+                    // each column, making rows ~10 pt taller than the mockup.
+                    ui.vertical(|ui| {
+                        ui.set_width(text_width);
+                        text(ui);
+                    });
                     ui.add_space(24.0);
-                    ui.allocate_ui_with_layout(
-                        vec2(CONTROL_COLUMN, 0.0),
-                        Layout::right_to_left(Align::Center),
-                        |ui| {
-                            ui.set_width(CONTROL_COLUMN);
-                            add_control(ui);
-                        },
-                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), add_control);
                 });
             }
         })
         .response;
-    if !first {
-        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    separate_unless_first(ui, first, response.rect);
+    response
+}
+
+/// Free-form content inside a card, padded like a row and separated from the
+/// block above it (forms, previews, multi-line results).
+pub fn card_block<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let first = first_in_card(ui);
+    let inner = Frame::new()
+        .inner_margin(Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
+            add(ui)
+        });
+    separate_unless_first(ui, first, inner.response.rect);
+    inner.inner
+}
+
+/// A card's action row: top border, 10×16 padding, controls left to right.
+pub fn card_footer(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    let inner = Frame::new()
+        .inner_margin(Margin::symmetric(ROW_PAD_X as i8, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                add(ui);
+            });
+        });
+    // A footer always follows rows, so it always gets the border.
+    separate_unless_first(ui, false, inner.response.rect);
+}
+
+/// Muted footer/hint text (12 pt).
+pub fn hint(ui: &mut Ui, text: &str) -> Response {
+    let weak = ui.visuals().weak_text_color();
+    ui.label(RichText::new(text).size(SMALL_SIZE).color(weak))
+}
+
+/// A Settings section entry: 32 high, muted text, muted fill when current.
+pub fn section_button(ui: &mut Ui, selected: bool, label: &str, width: f32) -> Response {
+    let galley =
         ui.painter()
-            .hline(response.rect.x_range(), response.rect.top(), stroke);
+            .layout_no_wrap(label.to_owned(), medium(BODY_SIZE), Color32::PLACEHOLDER);
+    let width = width.max(galley.size().x + 20.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
+    response.widget_info(|| WidgetInfo::selected(Role::Button, ui.is_enabled(), selected, label));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let lit = selected || response.hovered();
+        if lit {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(RADIUS_CONTROL),
+                visuals.widgets.inactive.bg_fill,
+            );
+        }
+        let color = if lit {
+            visuals.text_color()
+        } else {
+            visuals.weak_text_color()
+        };
+        ui.painter().galley(
+            pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
     }
     response
 }
