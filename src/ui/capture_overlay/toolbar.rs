@@ -5,15 +5,35 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 const BAR_HEIGHT: f32 = 40.0;
 const ICON_SIZE: f32 = 28.0;
 
+/// Wide enough for every tool, both swatches, Options, Output and ×.
+const DOCK_WIDTH: f32 = 740.0;
+/// Gap between the dock and the top edge of the screen.
+const DOCK_MARGIN: f32 = 8.0;
+
+/// A compact dock, top centre of the launch monitor (or of the canvas),
+/// never wider than the space it sits in.
 fn bar_rect(viewport: Rect, monitor: Option<Rect>) -> Rect {
     let bounds = monitor
         .map(|m| m.intersect(viewport))
         .filter(|r| r.is_positive())
         .unwrap_or(viewport);
+    let margin = DOCK_MARGIN.min((bounds.height() - BAR_HEIGHT).max(0.0));
+    let size = Vec2::new(
+        DOCK_WIDTH.min((bounds.width() - 2.0 * DOCK_MARGIN).max(bounds.width().min(1.0))),
+        BAR_HEIGHT.min(bounds.height()),
+    );
     Rect::from_min_size(
-        bounds.min,
-        Vec2::new(bounds.width(), BAR_HEIGHT.min(bounds.height())),
+        Pos2::new(bounds.center().x - size.x / 2.0, bounds.top() + margin),
+        size,
     )
+}
+
+/// The dock gets out of the way of a selection that reaches it, and comes
+/// back when the pointer goes to it (except while dragging the selection),
+/// so the tools stay reachable over a full-screen selection.
+fn dock_hidden(dock: Rect, selection: Option<Rect>, pointer: Option<Pos2>, dragging: bool) -> bool {
+    selection.is_some_and(|s| s.intersects(dock))
+        && (dragging || !pointer.is_some_and(|p| dock.expand(4.0).contains(p)))
 }
 
 pub(super) fn tool_button(
@@ -182,6 +202,19 @@ impl CaptureOverlay {
             transform.viewport,
             self.toolbar_monitor.map(|m| transform.rect(m)),
         );
+        let menu_open = egui::Popup::is_any_open(ctx);
+        if !menu_open
+            && dock_hidden(
+                rect,
+                self.document.crop().map(|c| transform.rect(c)),
+                ctx.pointer_hover_pos(),
+                self.region_dragging,
+            )
+        {
+            // Errors still show below where the dock would be.
+            self.toolbar_error(ctx, rect);
+            return;
+        }
         egui::Area::new(egui::Id::unique(("capture-tools", self.document.id())))
             .fixed_pos(rect.min)
             .movable(false)
@@ -192,6 +225,8 @@ impl CaptureOverlay {
                 egui::Frame::new()
                     .fill(ui.visuals().window_fill)
                     .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .shadow(ui.visuals().popup_shadow)
                     .inner_margin(egui::Margin::symmetric(6, 4))
                     .show(ui, |ui| {
                         ui.set_width((rect.width() - 12.0).max(1.0));
@@ -288,6 +323,9 @@ impl CaptureOverlay {
                         }
                     });
             });
+        self.toolbar_error(ctx, rect);
+    }
+    fn toolbar_error(&self, ctx: &egui::Context, rect: Rect) {
         if let Some(error) = &self.error {
             egui::Area::new(egui::Id::unique(("capture-tool-error", self.document.id())))
                 .fixed_pos(rect.left_bottom() + Vec2::new(8.0, 6.0))
@@ -380,14 +418,34 @@ impl CaptureOverlay {
 mod tests {
     use super::*;
     #[test]
-    fn pinned_bar_uses_launch_monitor_top_without_moving_the_canvas() {
+    fn pinned_bar_is_a_compact_dock_top_centre_of_the_launch_monitor() {
         let desktop = Rect::from_min_size(Pos2::new(-1920.0, -200.0), Vec2::new(5760.0, 2360.0));
         let monitor = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(3840.0, 2160.0));
         let bar = bar_rect(desktop, Some(monitor));
-        assert_eq!(bar.min, monitor.min);
-        assert_eq!(bar.width(), monitor.width());
+        assert_eq!(bar.width(), DOCK_WIDTH);
+        assert_eq!(bar.center().x, monitor.center().x);
+        assert_eq!(bar.top(), monitor.top() + DOCK_MARGIN);
         assert_eq!(bar.height(), BAR_HEIGHT);
-        assert!(desktop.contains_rect(bar));
+        assert!(monitor.contains_rect(bar));
+    }
+    #[test]
+    fn the_dock_hides_under_the_selection_unless_the_pointer_reaches_for_it() {
+        let dock = Rect::from_min_size(Pos2::new(100.0, 8.0), Vec2::new(700.0, BAR_HEIGHT));
+        let below = Rect::from_min_size(Pos2::new(200.0, 300.0), Vec2::splat(100.0));
+        let over = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(900.0, 600.0));
+        let on_dock = Some(dock.center());
+        assert!(!dock_hidden(dock, None, None, false));
+        assert!(!dock_hidden(dock, Some(below), None, false));
+        assert!(dock_hidden(dock, Some(over), None, false));
+        assert!(dock_hidden(
+            dock,
+            Some(over),
+            Some(Pos2::new(400.0, 400.0)),
+            false
+        ));
+        assert!(!dock_hidden(dock, Some(over), on_dock, false));
+        // Not while the selection itself is being dragged across it.
+        assert!(dock_hidden(dock, Some(over), on_dock, true));
     }
     #[test]
     fn launch_monitor_anchor_tracks_physical_geometry_at_native_dpi() {
@@ -397,9 +455,11 @@ mod tests {
             let viewport =
                 Rect::from_min_size(Pos2::ZERO, Vec2::new(5760.0 / scale, 2360.0 / scale));
             let transform = OverlayTransform::new(source, viewport, scale).unwrap();
-            let bar = bar_rect(viewport, Some(transform.rect(monitor)));
-            assert_eq!(bar.min, Pos2::new(1920.0 / scale, 200.0 / scale));
-            assert_eq!(bar.width(), 3840.0 / scale);
+            let monitor_rect = transform.rect(monitor);
+            let bar = bar_rect(viewport, Some(monitor_rect));
+            assert_eq!(bar.center().x, monitor_rect.center().x);
+            assert_eq!(bar.top(), 200.0 / scale + DOCK_MARGIN);
+            assert!(monitor_rect.contains_rect(bar));
             let physical = PhysicalPoint { x: 100, y: 100 };
             assert_eq!(
                 transform.physical(transform.logical(physical)),
@@ -412,8 +472,9 @@ mod tests {
         for width in [240.0, 360.0, 960.0] {
             let viewport = Rect::from_min_size(Pos2::new(17.0, 83.0), Vec2::new(width, 400.0));
             let bar = bar_rect(viewport, None);
-            assert_eq!(bar.min, viewport.min);
-            assert_eq!(bar.width(), width);
+            assert!(viewport.contains_rect(bar), "{bar:?} in {viewport:?}");
+            assert!(bar.width() <= DOCK_WIDTH);
+            assert_eq!(bar.center().x, viewport.center().x);
             assert!(bar.height() <= 40.0);
         }
     }
