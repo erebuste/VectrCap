@@ -35,6 +35,15 @@ enum Row<'a> {
 impl Row<'_> {
     /// 0 attention, 1 uploading, 2 waiting, 3 paused, 4 failed/uncertain,
     /// 5 rejected files, 6 Explorer selections waiting for setup.
+    /// A stable egui id for this row: its workflow, job, file or request.
+    fn key(&self) -> String {
+        match self {
+            Row::Attention(runner, _) => format!("attention-{}", runner.context().id),
+            Row::Job(job, _) => format!("job-{}", job.id.0),
+            Row::Rejected(name, _) => format!("rejected-{name}"),
+            Row::Pending(pending) => format!("pending-{}", pending.request),
+        }
+    }
     fn rank(&self) -> u8 {
         match self {
             Row::Attention(..) => 0,
@@ -732,7 +741,9 @@ pub fn draw(ui: &mut Ui, view: &DesktopView, expanded: &mut bool) -> Vec<AppComm
             let more = total > IN_PROGRESS_MAX_ROWS;
             for (i, row) in rows.iter().take(shown).enumerate() {
                 let view = row_view(row, view, failed_jobs);
-                ui.push_id(i, |ui| {
+                // Keyed by what the row shows: rows re-sort as uploads change
+                // state, and an index key would move focus/menus to another job.
+                ui.push_id(row.key(), |ui| {
                     draw_row(ui, view, i + 1 < shown || more, &mut commands)
                 });
             }
@@ -844,6 +855,43 @@ mod tests {
         let failed = text.iter().position(|t| t.starts_with("Upload failed"));
         assert!(attention < uploading && uploading < failed, "{text:?}");
         assert!(attention.is_some());
+    }
+
+    #[test]
+    fn rows_keep_their_id_when_they_move() {
+        let mut view = mockup_view(MockupVariant::HistoryBusy);
+        let running = view
+            .jobs
+            .iter()
+            .find(|j| j.status == JobStatus::Running)
+            .unwrap()
+            .id;
+        let key = |view: &DesktopView| {
+            rows(view)
+                .iter()
+                .find(|row| matches!(row, Row::Job(job, _) if job.id == running))
+                .map(Row::key)
+                .unwrap()
+        };
+        let before = key(&view);
+        let position = |view: &DesktopView| {
+            rows(view)
+                .iter()
+                .position(|row| matches!(row, Row::Job(job, _) if job.id == running))
+        };
+        let index = position(&view);
+        // The upload fails: it moves down the list but keeps its id.
+        for job in &mut view.jobs {
+            if job.id == running {
+                job.status = JobStatus::Failed {
+                    code: "transient".into(),
+                };
+            }
+        }
+        assert_ne!(position(&view), index);
+        assert_eq!(key(&view), before);
+        let keys: std::collections::HashSet<_> = rows(&view).iter().map(Row::key).collect();
+        assert_eq!(keys.len(), rows(&view).len(), "keys are unique");
     }
 
     #[test]

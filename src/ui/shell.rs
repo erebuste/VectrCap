@@ -621,8 +621,14 @@ fn nav_item(
         egui::vec2(ui.available_width(), tokens::NAV_ITEM_HEIGHT),
         egui::Sense::click(),
     );
+    // The count is in the name too: the collapsed sidebar hides the badge.
+    let name = if badge > 0 {
+        format!("{label}, {badge} in progress")
+    } else {
+        label.to_owned()
+    };
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), current, label)
+        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), current, &name)
     });
     if ui.is_rect_visible(rect) {
         let visuals = ui.visuals();
@@ -871,7 +877,7 @@ mod tests {
         });
         let mut labels = button_labels(&output);
         labels.sort();
-        assert_eq!(labels, ["History", "Quit", "Settings"]);
+        assert_eq!(labels, ["History, 4 in progress", "Quit", "Settings"]);
     }
 
     #[test]
@@ -891,7 +897,7 @@ mod tests {
         );
         let labels = button_labels(&output);
         for name in ["History", "Settings", "Quit"] {
-            assert!(labels.iter().any(|l| l == name), "missing {name}");
+            assert!(labels.iter().any(|l| l.starts_with(name)), "missing {name}");
         }
     }
 

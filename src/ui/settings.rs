@@ -192,6 +192,11 @@ impl SettingsPane {
         {
             commands.push(command);
         }
+        if self.category != SettingsCategory::Integrations {
+            // Re-read the registration next time the section opens: it can
+            // change outside the app (Windows Settings, another install).
+            self.integrations = Default::default();
+        }
         if self.category != SettingsCategory::Shortcuts {
             self.recording = None;
             self.adding = None;
@@ -389,8 +394,8 @@ impl SettingsPane {
                                         .color(ui.visuals().text_color()),
                                 );
                                 widgets::hint(ui, &description);
-                                if destinations {
-                                    ui.horizontal_wrapped(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if destinations {
                                         let label = match destination {
                                             DestinationSelection::Inherit => {
                                                 "Default destination".to_owned()
@@ -418,11 +423,11 @@ impl SettingsPane {
                                                     );
                                                 }
                                             });
-                                        reset = widgets::ghost_button(ui, None, "Default")
-                                            .on_hover_text("Restore this action's default key")
-                                            .clicked();
-                                    });
-                                }
+                                    }
+                                    reset = widgets::ghost_button(ui, None, "Default")
+                                        .on_hover_text("Restore this action's default key")
+                                        .clicked();
+                                });
                             },
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -654,6 +659,16 @@ impl SettingsPane {
                             };
                             if clicked {
                                 edit = Some(d.id);
+                            }
+                            if !default
+                                && widgets::ghost_button(ui, None, "Make default")
+                                    .on_hover_text(format!("Use {} for future uploads", d.name))
+                                    .clicked()
+                            {
+                                commands.push(AppCommand::SetDefault {
+                                    id: d.id,
+                                    revision: settings.revision,
+                                });
                             }
                         },
                     );
@@ -1199,6 +1214,11 @@ mod tests {
 
     /// Names of the switches (checkbox role) a category draws.
     fn switches(category: SettingsCategory) -> Vec<String> {
+        labels(category, egui::accesskit::Role::CheckBox)
+    }
+
+    /// Names of the widgets with `role` a category draws.
+    fn labels(category: SettingsCategory, role: egui::accesskit::Role) -> Vec<String> {
         let context = egui::Context::default();
         context.enable_accesskit();
         let settings = Settings::default();
@@ -1217,7 +1237,7 @@ mod tests {
             .accesskit_update
             .iter()
             .flat_map(|update| &update.nodes)
-            .filter(|(_, node)| node.role() == egui::accesskit::Role::CheckBox)
+            .filter(|(_, node)| node.role() == role)
             .filter_map(|(_, node)| node.label().map(str::to_owned))
             .collect()
     }
@@ -1246,6 +1266,22 @@ mod tests {
                 .iter()
                 .all(|task| !capture.iter().any(|l| l == task.label()))
         );
+    }
+
+    #[test]
+    fn every_listed_shortcut_can_restore_its_default_key() {
+        let shown = Settings::default()
+            .shortcuts
+            .effective()
+            .iter()
+            .filter(|binding| shortcut_is_shown(binding))
+            .count();
+        let defaults = labels(SettingsCategory::Shortcuts, egui::accesskit::Role::Button)
+            .into_iter()
+            .filter(|label| label == "Default")
+            .count();
+        assert!(shown > 0);
+        assert_eq!(defaults, shown);
     }
 
     #[test]

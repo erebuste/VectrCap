@@ -246,6 +246,14 @@ impl HistoryPane {
                 "{queued} uploads queued; {skipped} selected items skipped."
             ));
         }
+        // A pinned target that has since arrived on this page (the refresh
+        // caught up) becomes the selection.
+        if let Some(focus) = self.pinned
+            && locate(focus, view).is_some()
+        {
+            self.pinned = None;
+            self.apply_focus(focus, view, &mut commands);
+        }
         let records = &view.history_page.records;
         self.previews.update(ui.ctx(), records);
         let editing = search_focused
@@ -368,24 +376,13 @@ impl HistoryPane {
         view: &DesktopView,
         commands: &mut Vec<AppCommand>,
     ) {
+        if focus == HistoryFocus::InProgress {
+            // The In progress section is always at the top of the page.
+            commands.push(AppCommand::ClearHistoryFocus);
+            return;
+        }
         let records = &view.history_page.records;
-        let target = match focus {
-            HistoryFocus::InProgress => {
-                // The In progress section is always at the top of the page.
-                commands.push(AppCommand::ClearHistoryFocus);
-                return;
-            }
-            HistoryFocus::Artifact(artifact) => {
-                records.iter().position(|r| r.artifact.id == artifact)
-            }
-            HistoryFocus::Workflow(id) => workflow(view, id)
-                .and_then(|r| r.context().artifact.as_ref())
-                .and_then(|a| records.iter().position(|r| r.artifact.id == a.id)),
-            HistoryFocus::Batch(job) => records
-                .iter()
-                .position(|r| r.job.as_ref().is_some_and(|j| j.id == job)),
-        };
-        if let Some(index) = target {
+        if let Some(index) = locate(focus, view) {
             let id = records[index].id;
             self.active = Some(id);
             self.selection = vec![id];
@@ -1441,6 +1438,21 @@ struct ItemState<'a> {
     selection: &'a mut Vec<Uuid>,
 }
 
+/// Where a focus target sits on the current page of records, if it does.
+fn locate(focus: HistoryFocus, view: &DesktopView) -> Option<usize> {
+    let records = &view.history_page.records;
+    match focus {
+        HistoryFocus::InProgress => None,
+        HistoryFocus::Artifact(artifact) => records.iter().position(|r| r.artifact.id == artifact),
+        HistoryFocus::Workflow(id) => workflow(view, id)
+            .and_then(|r| r.context().artifact.as_ref())
+            .and_then(|a| records.iter().position(|r| r.artifact.id == a.id)),
+        HistoryFocus::Batch(job) => records
+            .iter()
+            .position(|r| r.job.as_ref().is_some_and(|j| j.id == job)),
+    }
+}
+
 fn workflow(view: &DesktopView, id: Uuid) -> Option<&crate::workflow::runner::TaskRunner> {
     view.task_workflows.iter().find(|r| r.context().id == id)
 }
@@ -1621,6 +1633,11 @@ fn batch_section(ui: &mut Ui, view: &DesktopView, commands: &mut Vec<AppCommand>
     }
     if waiting > 0 {
         counts.push_str(&format!(", {waiting} waiting"));
+    }
+    // Jobs whose records are gone (removed from History) still count in the total.
+    let missing = view.batch_summary.len() - jobs.len();
+    if missing > 0 {
+        counts.push_str(&format!(", {missing} unavailable"));
     }
     ui.label(
         egui::RichText::new(counts)
@@ -2080,6 +2097,32 @@ mod tests {
         assert!(text.contains(&"What ran after capture".to_owned()));
         assert!(
             !commands
+                .iter()
+                .any(|c| matches!(c, AppCommand::ClearHistoryFocus))
+        );
+    }
+
+    #[test]
+    fn pinned_focus_selects_the_record_once_it_reaches_the_page() {
+        let mut view = busy();
+        let runner = &view.task_workflows[0];
+        let id = runner.context().id;
+        let artifact = (**runner.context().artifact.as_ref().unwrap()).clone();
+        view.history_focus = Some(HistoryFocus::Workflow(id));
+        let mut pane = HistoryPane::default();
+        render(&mut pane, &view);
+        assert_eq!(pane.pinned, Some(HistoryFocus::Workflow(id)));
+        // The history refresh catches up: the capture is now a record on page 1.
+        let mut record = view.history_page.records[0].clone();
+        record.id = Uuid::new_v4();
+        record.artifact = artifact;
+        let record_id = record.id;
+        view.history_page.records.insert(0, record);
+        let (_, commands) = render(&mut pane, &view);
+        assert_eq!(pane.pinned, None);
+        assert_eq!(pane.active, Some(record_id));
+        assert!(
+            commands
                 .iter()
                 .any(|c| matches!(c, AppCommand::ClearHistoryFocus))
         );
