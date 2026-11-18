@@ -23,9 +23,31 @@ try {
     & cargo +stable build --release --locked --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed; no package was published.' }
     & (Join-Path $PSScriptRoot 'generate-notices.ps1') -Check
-    # A fresh local output folder avoids overwriting an existing package. No
-    # registry writes, global installation, elevation or execution-policy changes.
-    $package = Join-Path $taskRepoRoot ('target/packages/VectrCap-x64-' + [guid]::NewGuid().ToString('N'))
+    # One fixed local output folder, replaced on every build. No registry
+    # writes, global installation, elevation or execution-policy changes.
+    $packages = Join-Path $taskRepoRoot 'target/packages'
+    $package = Join-Path $packages 'VectrCap-x64'
+    # A running packaged VectrCap locks its exe: stop only copies started from
+    # target/packages (an installed or dev copy elsewhere keeps running).
+    $running = @(Get-Process -Name 'VectrCap' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($packages, [StringComparison]::OrdinalIgnoreCase) })
+    if ($running.Count -gt 0) {
+        Write-Host "Stopping $($running.Count) running packaged VectrCap process(es)."
+        $running | Stop-Process -Force
+        $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    # Replace the package, and drop the per-build folders older scripts made.
+    # Windows can hold a stopped exe's file lock for a moment, so retry.
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            Get-ChildItem -LiteralPath $packages -Directory -Filter 'VectrCap-x64*' -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+            break
+        } catch {
+            if ($attempt -ge 20) { throw "Could not replace the package folder: $_" }
+            Start-Sleep -Milliseconds 250
+        }
+    }
     [void][IO.Directory]::CreateDirectory((Join-Path $package 'assets/fonts'))
     Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/vectrcap.exe' -Destination (Join-Path $package 'VectrCap.exe')
     Copy-Item -LiteralPath 'assets/THIRD-PARTY-NOTICES.md' -Destination (Join-Path $package 'assets/THIRD-PARTY-NOTICES.md')
