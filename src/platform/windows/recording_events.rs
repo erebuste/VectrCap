@@ -35,6 +35,17 @@ pub fn place_overlay(title: &str, bounds: PhysicalRect) -> Result<(), AppError> 
         }
         // Best effort only; strict geometric exclusion remains the fallback.
         let _ = super::windows::set_capture_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        // Click-through (mouse passthrough) makes the window layered, and a
+        // layered window with no opacity set is never drawn: the recording
+        // boundary was invisible. Give it full opacity.
+        if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED as isize != 0 {
+            let (mut key, mut alpha, mut flags) = (0, 0, 0);
+            if GetLayeredWindowAttributes(hwnd, &mut key, &mut alpha, &mut flags) == 0
+                || flags & LWA_ALPHA == 0
+            {
+                SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+            }
+        }
         if SetWindowPos(
             hwnd,
             HWND_TOPMOST,
