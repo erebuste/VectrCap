@@ -218,18 +218,7 @@ impl CaptureOverlay {
                 .as_mut()
                 .expect("region gesture has a selection model")
                 .handle(SelectionInput::PrimaryUp(p));
-            let selected = matches!(
-                outcome,
-                SelectionOutcome::Selected(_) | SelectionOutcome::Changed(_)
-            );
-            self.selection_outcome(outcome, true)?;
-            // Releasing a successful screenshot selection is the confirmation.
-            // Recording/scrolling keep their explicit Start/countdown boundary.
-            if selected && !self.recording_selection {
-                self.handle(OverlayInput::Enter)?;
-                self.finish_tasks_on_release = self.release_runs_tasks;
-            }
-            return Ok(());
+            return self.confirm_selection(outcome);
         }
         if self.gesture.is_some() {
             self.pointer_move(p, shift)?;
@@ -269,7 +258,15 @@ impl CaptureOverlay {
             return Ok(false);
         };
         self.editable()?;
-        if *repeat {
+        // Held arrows keep nudging, as in ShareX; every other key fires once.
+        let arrow = matches!(
+            key,
+            egui::Key::ArrowLeft
+                | egui::Key::ArrowRight
+                | egui::Key::ArrowUp
+                | egui::Key::ArrowDown
+        );
+        if *repeat && !arrow {
             return Ok(false);
         }
         if focus == ShortcutFocus::ShortcutEntry {
@@ -290,9 +287,14 @@ impl CaptureOverlay {
             self.handle(OverlayInput::Enter)?;
             return Ok(true);
         }
+        // ShareX: Ctrl+H shows/hides the capture toolbar.
+        if *key == egui::Key::H && modifiers.ctrl && !modifiers.shift && !modifiers.alt {
+            self.toolbar_hidden = !self.toolbar_hidden;
+            return Ok(true);
+        }
         if !self.recording_selection
             && let Some(chord) = native_chord(*key, *modifiers)
-            && self.handle_chord(saved, chord, focus, false)?
+            && self.handle_chord(saved, chord, focus, *repeat)?
         {
             return Ok(true);
         }
@@ -307,20 +309,44 @@ impl CaptureOverlay {
             self.selected = None;
             return Ok(true);
         }
-        if self.tool == AnnotationTool::Region
-            && !modifiers.ctrl
-            && !modifiers.alt
-            && !modifiers.mac_cmd
-        {
+        if self.tool == AnnotationTool::Region && !modifiers.alt && !modifiers.mac_cmd {
+            // ShareX region keys: Space = whole desktop, ~ = monitor under the pointer.
+            if !modifiers.ctrl
+                && !modifiers.shift
+                && matches!(key, egui::Key::Space | egui::Key::Backtick)
+            {
+                let input = match (key, self.pointer) {
+                    (egui::Key::Space, _) => SelectionInput::SelectFullscreen,
+                    (_, Some(p)) => SelectionInput::SelectMonitorAt(p),
+                    _ => return Ok(false),
+                };
+                let Some(selection) = &mut self.selection else {
+                    return Ok(false);
+                };
+                let outcome = selection.handle(input);
+                self.confirm_selection(outcome)?;
+                return Ok(true);
+            }
+            if *key == egui::Key::Delete && self.document.crop().is_some() {
+                self.apply(EditorCommand::Crop(None))?;
+                return Ok(true);
+            }
+            // Arrows: 1px, Shift 10px. They move the selection (Ctrl resizes it),
+            // or the pointer itself before anything is selected.
+            let step = if modifiers.shift { 10 } else { 1 };
             let (dx, dy) = match key {
-                egui::Key::ArrowLeft => (-1, 0),
-                egui::Key::ArrowRight => (1, 0),
-                egui::Key::ArrowUp => (0, -1),
-                egui::Key::ArrowDown => (0, 1),
+                egui::Key::ArrowLeft => (-step, 0),
+                egui::Key::ArrowRight => (step, 0),
+                egui::Key::ArrowUp => (0, -step),
+                egui::Key::ArrowDown => (0, step),
                 _ => return Ok(false),
             };
-            if let Some(crop) = self.document.crop() {
-                let desired = if modifiers.shift {
+            let Some(crop) = self.document.crop() else {
+                crate::platform::windows::windows::nudge_pointer(dx, dy)?;
+                return Ok(true);
+            };
+            {
+                let desired = if modifiers.ctrl {
                     PhysicalRect::new(
                         crop.left(),
                         crop.top(),
@@ -335,7 +361,7 @@ impl CaptureOverlay {
                     crop.translated(dx, dy)?
                 };
                 if let Some(selection) = &mut self.selection {
-                    let outcome = if modifiers.shift {
+                    let outcome = if modifiers.ctrl {
                         selection.handle(SelectionInput::ResizeCrop(desired))
                     } else {
                         selection.handle(SelectionInput::MoveCrop { dx, dy })

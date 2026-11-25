@@ -75,7 +75,7 @@ pub fn menu_layout(
         submenu(
             "Capture",
             vec![
-                item("capture-window", "Window under pointer"),
+                item("capture-window", "Active window"),
                 item("capture-fullscreen", "Fullscreen"),
                 item("capture-last", "Last region"),
                 item("scrolling", "Scrolling (manual)"),
@@ -138,22 +138,64 @@ pub fn menu_layout(
 fn error() -> AppError {
     AppError::Persistence("native tray unavailable")
 }
-/// A left click on the icon starts a region capture (as in ShareX); the menu
-/// opens on right click. Acts on release, so one click is one capture.
-fn tray_click_command(event: &tray_icon::TrayIconEvent) -> Option<AppCommand> {
-    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
-    matches!(
-        event,
-        TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            ..
+/// Tray mouse actions, as in ShareX: left click = region capture, double click
+/// = main window, middle click = upload clipboard; the menu opens on right click.
+/// A left click waits out the double-click time so a double click never also captures.
+#[derive(Default)]
+struct TrayClicks {
+    ticket: u64,
+    swallow_up: bool,
+}
+#[allow(clippy::large_enum_variant)] // one short-lived value per click
+enum TrayClick {
+    Now(AppCommand),
+    /// Capture after the double-click time, if `fire` still accepts this ticket.
+    Deferred(u64),
+}
+impl TrayClicks {
+    fn event(&mut self, event: &tray_icon::TrayIconEvent) -> Option<TrayClick> {
+        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+        match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } => {
+                // The release that ends a double click is not a new click.
+                if std::mem::take(&mut self.swallow_up) {
+                    return None;
+                }
+                self.ticket += 1;
+                Some(TrayClick::Deferred(self.ticket))
+            }
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.ticket += 1;
+                self.swallow_up = true;
+                Some(TrayClick::Now(AppCommand::Show(Window::History)))
+            }
+            TrayIconEvent::Click {
+                button: MouseButton::Middle,
+                button_state: MouseButtonState::Up,
+                ..
+            } => Some(TrayClick::Now(AppCommand::UploadClipboard)),
+            _ => None,
         }
-    )
-    .then(|| AppCommand::StartCapture {
-        mode: crate::capture::request::CaptureMode::Region,
-        selection: Default::default(),
-    })
+    }
+    fn fire(&self, ticket: u64) -> Option<AppCommand> {
+        (ticket == self.ticket).then(|| AppCommand::StartCapture {
+            mode: crate::capture::request::CaptureMode::Region,
+            selection: Default::default(),
+        })
+    }
+}
+#[allow(unsafe_code)]
+fn double_click_time() -> std::time::Duration {
+    // SAFETY: no arguments; returns the user's setting in milliseconds.
+    let ms = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    std::time::Duration::from_millis(u64::from(ms.clamp(100, 1000)))
 }
 impl Tray {
     #[allow(unsafe_code)]
@@ -166,11 +208,28 @@ impl Tray {
         let map = choices.clone();
         let hotkey_client = client.clone();
         let click_client = client.clone();
+        let clicks = Arc::new(Mutex::new(TrayClicks::default()));
         tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
-            if let Some(command) = tray_click_command(&event)
-                && let Err(error) = click_client.submit(command)
-            {
-                click_client.report_error(error);
+            let Some(click) = clicks.lock().ok().and_then(|mut c| c.event(&event)) else {
+                return;
+            };
+            let submit = |client: &DesktopClient, command| {
+                if let Err(error) = client.submit(command) {
+                    client.report_error(error);
+                }
+            };
+            match click {
+                TrayClick::Now(command) => submit(&click_client, command),
+                TrayClick::Deferred(ticket) => {
+                    let (clicks, client) = (clicks.clone(), click_client.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(double_click_time());
+                        let command = clicks.lock().ok().and_then(|c| c.fire(ticket));
+                        if let Some(command) = command {
+                            submit(&client, command);
+                        }
+                    });
+                }
             }
         }));
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -384,16 +443,66 @@ mod tests {
             button,
             button_state,
         };
+        let mut c = TrayClicks::default();
+        let Some(TrayClick::Deferred(ticket)) =
+            c.event(&click(MouseButton::Left, MouseButtonState::Up))
+        else {
+            panic!("a left click defers a capture");
+        };
         assert!(matches!(
-            tray_click_command(&click(MouseButton::Left, MouseButtonState::Up)),
+            c.fire(ticket),
             Some(AppCommand::StartCapture {
                 mode: crate::capture::request::CaptureMode::Region,
                 ..
             })
         ));
         // One capture per click, and the right button keeps the menu.
-        assert!(tray_click_command(&click(MouseButton::Left, MouseButtonState::Down)).is_none());
-        assert!(tray_click_command(&click(MouseButton::Right, MouseButtonState::Up)).is_none());
+        assert!(
+            c.event(&click(MouseButton::Left, MouseButtonState::Down))
+                .is_none()
+        );
+        assert!(
+            c.event(&click(MouseButton::Right, MouseButtonState::Up))
+                .is_none()
+        );
+        assert!(matches!(
+            c.event(&click(MouseButton::Middle, MouseButtonState::Up)),
+            Some(TrayClick::Now(AppCommand::UploadClipboard))
+        ));
+    }
+
+    #[test]
+    fn a_double_click_opens_the_window_without_capturing() {
+        use tray_icon::{
+            MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId, dpi::PhysicalPosition,
+        };
+        let id = TrayIconId::new("tray");
+        let at = PhysicalPosition::new(0.0, 0.0);
+        let up = TrayIconEvent::Click {
+            id: id.clone(),
+            position: at,
+            rect: Rect::default(),
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+        };
+        let mut c = TrayClicks::default();
+        let Some(TrayClick::Deferred(first)) = c.event(&up) else {
+            panic!("first release defers");
+        };
+        assert!(matches!(
+            c.event(&TrayIconEvent::DoubleClick {
+                id,
+                position: at,
+                rect: Rect::default(),
+                button: MouseButton::Left,
+            }),
+            Some(TrayClick::Now(AppCommand::Show(Window::History)))
+        ));
+        assert!(
+            c.event(&up).is_none(),
+            "the double click's release is swallowed"
+        );
+        assert!(c.fire(first).is_none(), "the pending capture is cancelled");
     }
 
     fn label(node: &MenuNode) -> String {
@@ -452,7 +561,7 @@ mod tests {
         assert_eq!(
             names("Capture"),
             [
-                "Window under pointer",
+                "Active window",
                 "Fullscreen",
                 "Last region",
                 "Scrolling (manual)",

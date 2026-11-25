@@ -220,17 +220,73 @@ fn native_keys_honor_saved_mapping_and_physical_pixels_at_200_percent() {
         overlay.document().crop(),
         Some(crop.translated(1, 0).unwrap())
     );
+    // ShareX: Shift moves 10px, held arrows repeat, Ctrl resizes.
+    let fast = Event::Key {
+        key: Key::ArrowRight,
+        physical_key: None,
+        pressed: true,
+        repeat: true,
+        modifiers: Modifiers::SHIFT,
+    };
+    overlay
+        .handle_key_event(&fast, &saved, ShortcutFocus::Normal, false)
+        .unwrap();
+    assert_eq!(
+        overlay.document().crop(),
+        Some(crop.translated(11, 0).unwrap())
+    );
     let resize = Event::Key {
         key: Key::ArrowRight,
         physical_key: None,
         pressed: true,
         repeat: false,
-        modifiers: Modifiers::SHIFT,
+        modifiers: Modifiers::CTRL,
     };
     overlay
         .handle_key_event(&resize, &saved, ShortcutFocus::Normal, false)
         .unwrap();
     assert_eq!(overlay.document().crop().unwrap().width(), crop.width() + 1);
+}
+
+#[test]
+fn space_selects_the_whole_source_and_confirms() {
+    let mut overlay = session();
+    overlay.retain_editor_after_selection();
+    let space = Event::Key {
+        key: Key::Space,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    assert!(
+        overlay
+            .handle_key_event(
+                &space,
+                &ShortcutSettings::default(),
+                ShortcutFocus::Normal,
+                false
+            )
+            .unwrap()
+    );
+    assert!(overlay.document().crop().is_some());
+    assert!(overlay.finish_visible());
+    let delete = Event::Key {
+        key: Key::Delete,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    };
+    overlay
+        .handle_key_event(
+            &delete,
+            &ShortcutSettings::default(),
+            ShortcutFocus::Normal,
+            false,
+        )
+        .unwrap();
+    assert_eq!(overlay.document().crop(), None);
 }
 
 #[test]

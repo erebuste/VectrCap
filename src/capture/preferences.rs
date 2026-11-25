@@ -71,7 +71,7 @@ impl Default for RegionCapturePreferences {
             lens_scale: 20,
             show_rgb: false,
             show_hex: false,
-            center_crosshair: false,
+            center_crosshair: true,
             screen_crosshair: false,
             fixed_size: false,
             fixed_dimensions: SizePreset {
@@ -96,8 +96,9 @@ impl Default for RegionCapturePreferences {
             mouse: MouseBindings {
                 right: CaptureMouseAction::CancelActiveOrCapture,
                 middle: CaptureMouseAction::ToggleSelectionDrawing,
-                button4: CaptureMouseAction::None,
-                button5: CaptureMouseAction::None,
+                // ShareX: back = whole desktop, forward = active monitor.
+                button4: CaptureMouseAction::SelectFullscreen,
+                button5: CaptureMouseAction::SelectActiveMonitor,
             },
         }
     }

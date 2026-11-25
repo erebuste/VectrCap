@@ -30,7 +30,17 @@ pub enum SelectionInput {
     LayoutChanged(Vec<MonitorGeometry>),
     Escape,
     Auxiliary(MouseButton),
-    Alt(bool),
+    /// Held modifiers: Alt snaps to a size preset, Shift draws a square and
+    /// Ctrl moves the new selection instead of resizing it (as in ShareX).
+    Modifiers {
+        alt: bool,
+        shift: bool,
+        ctrl: bool,
+    },
+    /// Space: the whole capture source.
+    SelectFullscreen,
+    /// `~`: the monitor under this point.
+    SelectMonitorAt(PhysicalPoint),
     Context(InputContext),
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +68,7 @@ enum GestureKind {
 }
 struct Gesture {
     anchor: PhysicalPoint,
+    last: PhysicalPoint,
     kind: GestureKind,
     dragged: bool,
 }
@@ -73,6 +84,8 @@ pub struct SelectionModel {
     gesture: Option<Gesture>,
     context: InputContext,
     alt: bool,
+    shift: bool,
+    ctrl: bool,
     cancelled: bool,
     /// The crop is still the one the capture opened with (Fullscreen, Window,
     /// Last region): a plain click on it confirms, like releasing a drag does.
@@ -105,7 +118,10 @@ impl SelectionModel {
             .ok_or(AppError::Capture(
                 "launch pointer is outside the capture source",
             ))?;
-        let permitted = if preferences.active_monitor_only {
+        // Fullscreen is the whole desktop, so the active-monitor limit can't clip it.
+        let permitted = if preferences.active_monitor_only
+            && !matches!(snapshot.mode, CaptureMode::Window | CaptureMode::Fullscreen)
+        {
             active_monitor
         } else {
             snapshot.bounds
@@ -123,6 +139,8 @@ impl SelectionModel {
             gesture: None,
             context: InputContext::Region,
             alt: false,
+            shift: false,
+            ctrl: false,
             cancelled: false,
         };
         if let Some(crop) = model.crop {
@@ -242,7 +260,7 @@ impl SelectionModel {
                         ))?;
                     return self.sized_rect(g.anchor, p, *preset);
                 }
-                PhysicalRect::from_points(g.anchor, p)?
+                crate::editor::shapes::constrained_shape(g.anchor, p, self.shift)?
                     .intersection(self.permitted)
                     .ok_or(AppError::InvalidInput("selection is empty"))
             }
@@ -281,6 +299,36 @@ impl SelectionModel {
             }
         }
     }
+    /// Holding Ctrl while drawing a new selection drags it along with the pointer.
+    fn carry_anchor(g: &mut Gesture, p: PhysicalPoint, ctrl: bool) -> Result<(), AppError> {
+        if ctrl && matches!(g.kind, GestureKind::New) {
+            let shift = |a: i32, from: i32, to: i32| {
+                i32::try_from(i64::from(a) + i64::from(to) - i64::from(from))
+                    .map_err(|_| AppError::InvalidInput("selection movement overflows"))
+            };
+            g.anchor = PhysicalPoint {
+                x: shift(g.anchor.x, g.last.x, p.x)?,
+                y: shift(g.anchor.y, g.last.y, p.y)?,
+            };
+        }
+        g.last = p;
+        Ok(())
+    }
+    /// The whole permitted source, or the monitor under `at` within it.
+    fn select_whole(&mut self, at: Option<PhysicalPoint>) -> SelectionOutcome {
+        if self.context != InputContext::Region || self.gesture.is_some() {
+            return SelectionOutcome::Unchanged;
+        }
+        let r = match at {
+            None => self.permitted.intersection(self.bounds),
+            Some(p) => self
+                .monitors
+                .iter()
+                .find(|m| m.bounds().contains(p))
+                .and_then(|m| m.bounds().intersection(self.permitted)),
+        };
+        r.map_or(SelectionOutcome::Unchanged, |r| self.accept(r, false))
+    }
     /// A drag preview is separate from the committed crop; Escape restores the latter.
     pub fn preview(&self, p: PhysicalPoint) -> Result<Option<PhysicalRect>, AppError> {
         self.gesture
@@ -312,10 +360,14 @@ impl SelectionModel {
                 self.gesture = None;
                 O::Unchanged
             }
-            I::Alt(alt) => {
+            I::Modifiers { alt, shift, ctrl } => {
                 self.alt = alt;
+                self.shift = shift;
+                self.ctrl = ctrl;
                 O::Unchanged
             }
+            I::SelectFullscreen => self.select_whole(None),
+            I::SelectMonitorAt(p) => self.select_whole(Some(p)),
             I::Clear => {
                 self.crop = None;
                 self.gesture = None;
@@ -323,6 +375,9 @@ impl SelectionModel {
             }
             I::PointerMove(p) => {
                 if let Some(g) = self.gesture.as_mut() {
+                    if let Err(e) = Self::carry_anchor(g, p, self.ctrl) {
+                        return O::Rejected(e);
+                    }
                     g.dragged |= p.x.abs_diff(g.anchor.x) > self.threshold.0
                         || p.y.abs_diff(g.anchor.y) > self.threshold.1;
                     if !g.dragged {
@@ -366,6 +421,7 @@ impl SelectionModel {
                 };
                 self.gesture = Some(Gesture {
                     anchor: point,
+                    last: point,
                     kind,
                     dragged: false,
                 });
@@ -375,6 +431,9 @@ impl SelectionModel {
                 let Some(mut g) = self.gesture.take() else {
                     return O::Unchanged;
                 };
+                if let Err(e) = Self::carry_anchor(&mut g, p, self.ctrl) {
+                    return O::Rejected(e);
+                }
                 g.dragged |= p.x.abs_diff(g.anchor.x) > self.threshold.0
                     || p.y.abs_diff(g.anchor.y) > self.threshold.1;
                 if g.dragged {
@@ -451,12 +510,7 @@ impl SelectionModel {
                         };
                         O::ToolChanged(self.context)
                     }
-                    CaptureMouseAction::SelectFullscreen => self.accept(
-                        self.permitted
-                            .intersection(self.bounds)
-                            .expect("permitted source bounds"),
-                        false,
-                    ),
+                    CaptureMouseAction::SelectFullscreen => self.select_whole(None),
                     CaptureMouseAction::SelectActiveMonitor => {
                         self.accept(self.active_monitor, false)
                     }
@@ -525,6 +579,77 @@ mod tests {
             moved,
             SelectionOutcome::Changed(_) | SelectionOutcome::Selected(_)
         ));
+    }
+
+    /// Two side-by-side 200×200 monitors, nothing preselected.
+    fn two_monitors() -> SelectionModel {
+        let left = PhysicalRect::new(0, 0, 200, 200).unwrap();
+        let right = PhysicalRect::new(200, 0, 200, 200).unwrap();
+        let bounds = PhysicalRect::new(0, 0, 400, 200).unwrap();
+        let snapshot = CaptureSnapshot::new(
+            vec![0; 400 * 200 * 4],
+            bounds,
+            vec![
+                MonitorGeometry::new("left".into(), left, 1.0).unwrap(),
+                MonitorGeometry::new("right".into(), right, 1.0).unwrap(),
+            ],
+            vec![],
+        )
+        .unwrap();
+        SelectionModel::new(
+            &snapshot,
+            RegionCapturePreferences::default(),
+            PhysicalPoint { x: 50, y: 50 },
+            (4, 4),
+        )
+        .unwrap()
+    }
+    fn mods(m: &mut SelectionModel, shift: bool, ctrl: bool) {
+        m.handle(SelectionInput::Modifiers {
+            alt: false,
+            shift,
+            ctrl,
+        });
+    }
+
+    #[test]
+    fn shift_draws_a_square() {
+        let mut m = two_monitors();
+        mods(&mut m, true, false);
+        press(&mut m, PhysicalPoint { x: 10, y: 10 });
+        assert_eq!(
+            m.handle(SelectionInput::PrimaryUp(PhysicalPoint { x: 50, y: 30 })),
+            SelectionOutcome::Selected(PhysicalRect::new(10, 10, 40, 40).unwrap())
+        );
+    }
+
+    #[test]
+    fn ctrl_moves_the_new_selection_instead_of_resizing() {
+        let mut m = two_monitors();
+        press(&mut m, PhysicalPoint { x: 10, y: 10 });
+        m.handle(SelectionInput::PointerMove(PhysicalPoint { x: 50, y: 50 }));
+        mods(&mut m, false, true);
+        m.handle(SelectionInput::PointerMove(PhysicalPoint { x: 60, y: 70 }));
+        assert_eq!(
+            m.handle(SelectionInput::PrimaryUp(PhysicalPoint { x: 60, y: 70 })),
+            SelectionOutcome::Selected(PhysicalRect::new(20, 30, 40, 40).unwrap())
+        );
+    }
+
+    #[test]
+    fn space_selects_the_desktop_and_tilde_the_monitor_under_the_pointer() {
+        let mut m = two_monitors();
+        assert_eq!(
+            m.handle(SelectionInput::SelectFullscreen),
+            SelectionOutcome::Selected(PhysicalRect::new(0, 0, 400, 200).unwrap())
+        );
+        assert_eq!(
+            m.handle(SelectionInput::SelectMonitorAt(PhysicalPoint {
+                x: 300,
+                y: 10
+            })),
+            SelectionOutcome::Selected(PhysicalRect::new(200, 0, 200, 200).unwrap())
+        );
     }
 
     #[test]

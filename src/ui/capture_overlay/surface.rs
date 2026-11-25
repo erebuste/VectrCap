@@ -222,7 +222,9 @@ impl CaptureOverlay {
                 });
             });
         }
-        self.toolbar(&ctx, transform);
+        if !self.toolbar_hidden {
+            self.toolbar(&ctx, transform);
+        }
         let editing_text = self.text.is_some();
         self.text_editor(&ctx);
         // Let TextEdit first process Text/Paste/IME; then Enter commits the
@@ -312,7 +314,15 @@ impl CaptureOverlay {
                                 || self.region_dragging
                                 || over_image(&ctx, ui, *pos)
                             {
-                                self.pointer_move(p, ctx.input(|i| i.modifiers.shift))
+                                let modifiers = ctx.input(|i| i.modifiers);
+                                if let Some(selection) = &mut self.selection {
+                                    selection.handle(SelectionInput::Modifiers {
+                                        alt: modifiers.alt,
+                                        shift: modifiers.shift,
+                                        ctrl: modifiers.ctrl,
+                                    });
+                                }
+                                self.pointer_move(p, modifiers.shift)
                             } else {
                                 self.hover = None;
                                 Ok(())
@@ -337,7 +347,11 @@ impl CaptureOverlay {
                                 });
                                 self.chrome_focused = false;
                                 if let Some(selection) = &mut self.selection {
-                                    selection.handle(SelectionInput::Alt(modifiers.alt));
+                                    selection.handle(SelectionInput::Modifiers {
+                                        alt: modifiers.alt,
+                                        shift: modifiers.shift,
+                                        ctrl: modifiers.ctrl,
+                                    });
                                 }
                                 self.pointer_down(p)
                             } else if !pressed && (self.gesture.is_some() || self.region_dragging) {
@@ -369,7 +383,21 @@ impl CaptureOverlay {
                             egui::PointerButton::Extra2 => Some(MouseButton::Button5),
                             _ => None,
                         };
-                        button.map_or(Ok(()), |button| self.auxiliary(button))
+                        button.map_or(Ok(()), |button| {
+                            self.auxiliary(button, transform.physical(*pos))
+                        })
+                    }
+                    egui::Event::MouseWheel {
+                        delta, modifiers, ..
+                    } if self.tool == AnnotationTool::Region
+                        && delta.y != 0.0
+                        && ctx
+                            .input(|i| i.pointer.hover_pos())
+                            .is_some_and(|pos| over_image(&ctx, ui, pos)) =>
+                    {
+                        self.magnifier
+                            .scroll(delta.y > 0.0, modifiers.ctrl, &self.preferences);
+                        Ok(())
                     }
                     _ => Ok(()),
                 };
@@ -415,9 +443,10 @@ impl CaptureOverlay {
             && let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
             && over_image(&ctx, ui, pos)
         {
-            match CaptureReadout::sample(&self.document, point, &self.preferences) {
+            let prefs = self.magnifier.apply(&self.preferences);
+            match CaptureReadout::sample(&self.document, point, &prefs) {
                 Ok(mut readout) => {
-                    let r = readout.paint(&ctx, pos, viewport, &self.preferences);
+                    let r = readout.paint(&ctx, pos, viewport, &prefs);
                     self.note(r);
                 }
                 Err(error) => self.error = Some(error),

@@ -168,6 +168,52 @@ pub fn physical_pointer() -> Result<PhysicalPoint, AppError> {
     }
     Ok(PhysicalPoint { x: p.x, y: p.y })
 }
+/// Region-capture arrow keys move the real cursor, so hover and the magnifier follow.
+#[allow(unsafe_code)]
+pub fn nudge_pointer(dx: i32, dy: i32) -> Result<(), AppError> {
+    let p = physical_pointer()?;
+    // SAFETY: plain value arguments; Windows clips the cursor to the desktop.
+    if unsafe { SetPhysicalCursorPos(p.x.saturating_add(dx), p.y.saturating_add(dy)) } == 0 {
+        return Err(AppError::Capture("pointer could not be moved"));
+    }
+    Ok(())
+}
+#[allow(unsafe_code)]
+fn is_shell_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 32];
+    // SAFETY: writable fixed buffer; Win32 validates the transient HWND.
+    let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+    let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
+    matches!(
+        class.as_str(),
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW"
+    )
+}
+impl Windows {
+    /// ShareX's "active window": the foreground window. When that is the taskbar
+    /// or desktop (e.g. launched from the tray), the topmost app window instead.
+    /// `candidates` must come from the latest `enumerate`, in z-order.
+    #[allow(unsafe_code)]
+    pub(crate) fn active(&self, candidates: &[WindowCandidate]) -> Option<WindowCandidate> {
+        let usable = |c: &&WindowCandidate| {
+            self.entries
+                .get(&c.id)
+                .is_some_and(|w| !is_shell_window(w.hwnd as HWND))
+        };
+        // SAFETY: no arguments; the result is only compared, never dereferenced.
+        let foreground = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) } as usize;
+        candidates
+            .iter()
+            .filter(usable)
+            .find(|c| {
+                self.entries
+                    .get(&c.id)
+                    .is_some_and(|w| w.hwnd == foreground)
+            })
+            .or_else(|| candidates.iter().find(usable))
+            .copied()
+    }
+}
 #[allow(unsafe_code)]
 pub(crate) fn window_rect(window: NativeWindow) -> Result<PhysicalRect, AppError> {
     let mut r = RECT::default();

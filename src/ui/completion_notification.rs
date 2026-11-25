@@ -18,7 +18,8 @@ const PICTURE_H: f32 = 112.0;
 const CAPTION_H: f32 = 18.0;
 const PAD: f32 = 8.0;
 const GAP: f32 = 8.0;
-const TOAST_TTL: Duration = Duration::from_secs(6);
+/// ShareX: 3 s on screen plus a 1 s fade.
+const TOAST_TTL: Duration = Duration::from_secs(4);
 /// Same inset Windows uses between a native toast and the work-area corner.
 const CORNER_MARGIN: f32 = 16.0;
 
@@ -116,13 +117,14 @@ fn paint(
 
 fn card(ui: &mut Ui, notice: &NoticeDisplay, thumbs: Option<&NoticeThumbs>) -> Vec<AppCommand> {
     let action = primary_action(notice);
-    let sense = if action.is_some() {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(PICTURE_W, PICTURE_H + CAPTION_H), sense);
+    // Every card takes clicks: right click closes it, as in ShareX.
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(PICTURE_W, PICTURE_H + CAPTION_H),
+        egui::Sense::click(),
+    );
+    if response.secondary_clicked() {
+        return vec![AppCommand::DismissNotice(notice.view.id())];
+    }
     let picture = egui::Rect::from_min_size(rect.min, egui::vec2(PICTURE_W, PICTURE_H));
     let caption = egui::Rect::from_min_size(
         egui::pos2(rect.min.x, picture.max.y),
@@ -421,8 +423,18 @@ pub fn viewport_builder_for(count: usize, pixels_per_point: f32) -> eframe::egui
     builder
 }
 
+/// ShareX shows the toast on the active monitor: the one under the pointer.
 fn toast_position(size: [f32; 2], scale: f32) -> Option<[f32; 2]> {
-    let area = crate::platform::windows::monitors::primary_work_area().ok()?;
+    use crate::platform::windows::{monitors, windows::physical_pointer};
+    let area = physical_pointer()
+        .ok()
+        .and_then(|p| {
+            monitors::enumerate_work_areas()
+                .ok()?
+                .into_iter()
+                .find(|a| a.contains(p))
+        })
+        .or_else(|| monitors::primary_work_area().ok())?;
     Some(toast_corner(area, size, scale))
 }
 

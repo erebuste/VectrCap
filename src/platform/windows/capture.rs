@@ -141,13 +141,12 @@ pub fn acquire_screenshot(
     let pins = super::windows::PinCaptureGuard::begin()?;
     let mut source = WindowsCaptureSource::new();
     if request.mode == CaptureMode::Window {
-        let pointer = source.pointer()?;
+        let candidates = source.windows()?;
         request.target = Some(
             source
-                .windows()?
-                .into_iter()
-                .find(|w| w.bounds.contains(pointer))
-                .ok_or(AppError::Capture("no eligible window under the pointer"))?,
+                .windows
+                .active(&candidates)
+                .ok_or(AppError::Capture("no active window to capture"))?,
         );
     }
     let result = CaptureService::new(source, NativeCountdown::new(hide_app_chrome), cancel)

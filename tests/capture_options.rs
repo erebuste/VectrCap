@@ -439,9 +439,9 @@ fn delayed_window_target_never_changes_silently() {
     assert!(!events.borrow().contains(&"desktop"));
 }
 #[test]
-fn screenshot_cursor_defaults_off_independent_of_recording() {
+fn screenshot_cursor_defaults_on_independent_of_recording() {
     let p = ScreenshotPreferences::default();
-    assert!(!p.include_cursor);
+    assert!(p.include_cursor);
     assert_eq!(p.delay_seconds, 0);
     assert_eq!(ScreenshotPreferences::DELAY_PRESETS, [0, 3, 5, 10]);
     let mut p = p;
@@ -449,15 +449,15 @@ fn screenshot_cursor_defaults_off_independent_of_recording() {
         .push(vectrcap::capture::request::CaptureOverride {
             mode: CaptureMode::Region,
             delay_seconds: Some(5),
-            include_cursor: Some(true),
+            include_cursor: Some(false),
         });
     let req = p
         .request(CaptureMode::Region, RegionCapturePreferences::default())
         .unwrap();
-    assert!(req.include_cursor);
+    assert!(!req.include_cursor);
     assert_eq!(req.delay_seconds, 5);
     assert!(
-        !p.request(CaptureMode::Fullscreen, RegionCapturePreferences::default())
+        p.request(CaptureMode::Fullscreen, RegionCapturePreferences::default())
             .unwrap()
             .include_cursor
     );

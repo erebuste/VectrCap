@@ -65,12 +65,22 @@ pub struct CaptureOverride {
     pub delay_seconds: Option<u8>,
     pub include_cursor: Option<bool>,
 }
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScreenshotPreferences {
     pub delay_seconds: u8,
     pub include_cursor: bool,
     pub overrides: Vec<CaptureOverride>,
+}
+impl Default for ScreenshotPreferences {
+    fn default() -> Self {
+        // ShareX shows the cursor in screenshots by default.
+        Self {
+            delay_seconds: 0,
+            include_cursor: true,
+            overrides: Vec::new(),
+        }
+    }
 }
 impl ScreenshotPreferences {
     pub const DELAY_PRESETS: [u8; 4] = [0, 3, 5, 10];
@@ -310,7 +320,7 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
         let layout = self.source.monitors()?;
         validate_layout(&layout)?;
         let pointer = self.source.pointer()?;
-        let monitor = layout
+        layout
             .iter()
             .find(|m| m.bounds().contains(pointer))
             .ok_or(AppError::Capture("pointer is outside the display layout"))?;
@@ -328,7 +338,7 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
         };
         let bounds = match request.mode {
             CaptureMode::Window => target.expect("window target was validated").bounds,
-            CaptureMode::Fullscreen => monitor.bounds(),
+            // Fullscreen is the whole desktop across every monitor, as in ShareX.
             _ => virtual_bounds(&layout.iter().map(|m| m.bounds()).collect::<Vec<_>>())?,
         };
         bounds.rgba_len()?;

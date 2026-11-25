@@ -48,7 +48,7 @@ fn region_defaults_match_confirmed_choices() {
     assert!(
         !p.show_rgb
             && !p.show_hex
-            && !p.center_crosshair
+            && p.center_crosshair
             && !p.screen_crosshair
             && !p.fixed_size
             && !p.active_monitor_only
@@ -79,8 +79,8 @@ fn region_defaults_match_confirmed_choices() {
     );
     assert_eq!(p.mouse.right, Action::CancelActiveOrCapture);
     assert_eq!(p.mouse.middle, Action::ToggleSelectionDrawing);
-    assert_eq!(p.mouse.button4, Action::None);
-    assert_eq!(p.mouse.button5, Action::None);
+    assert_eq!(p.mouse.button4, Action::SelectFullscreen);
+    assert_eq!(p.mouse.button5, Action::SelectActiveMonitor);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
     let mut s = Settings {
@@ -182,7 +182,11 @@ fn fixed_size_rejects_out_of_bounds_without_resizing() {
 #[test]
 fn alt_presets_only_apply_to_region_tool() {
     let mut m = model(RegionCapturePreferences::default());
-    m.handle(Input::Alt(true));
+    m.handle(Input::Modifiers {
+        alt: true,
+        shift: false,
+        ctrl: false,
+    });
     assert_eq!(
         drag(&mut m, Point { x: -700, y: 10 }, Point { x: -50, y: 500 }),
         Outcome::Selected(r(-700, 10, 640, 480))
@@ -218,9 +222,10 @@ fn active_monitor_is_fixed_at_session_start() {
         drag(&mut m, Point { x: -100, y: 10 }, Point { x: 500, y: 100 }),
         Outcome::Selected(r(-100, 10, 100, 90))
     );
+    // The back button selects the whole permitted source: still the start monitor.
     assert_eq!(
         m.handle(Input::Auxiliary(MouseButton::Button4)),
-        Outcome::Unchanged
+        Outcome::Selected(r(-800, 0, 800, 800))
     );
     assert_eq!(m.permitted_bounds(), r(-800, 0, 800, 800));
 }

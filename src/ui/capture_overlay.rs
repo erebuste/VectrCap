@@ -186,6 +186,49 @@ pub struct CaptureOverlay {
     preview: surface::OverlayPreview,
     generation: u64,
     chrome_focused: bool,
+    toolbar_hidden: bool,
+    /// Wheel changes to the magnifier for this capture only (ShareX-style).
+    magnifier: MagnifierWheel,
+}
+/// Wheel = magnifier size, Ctrl+wheel = zoom. Shrinking past the smallest
+/// size hides it; scrolling up brings it back.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct MagnifierWheel {
+    pub hidden: bool,
+    pub scale: Option<u8>,
+    pub count: Option<u8>,
+}
+impl MagnifierWheel {
+    pub(crate) fn scroll(&mut self, up: bool, ctrl: bool, prefs: &RegionCapturePreferences) {
+        if self.hidden {
+            self.hidden = !up;
+            return;
+        }
+        if ctrl {
+            // Fewer source pixels = more zoom. The count stays odd.
+            let count = self.count.unwrap_or(prefs.lens_source_count);
+            self.count = Some(if up {
+                count.saturating_sub(2).max(9)
+            } else {
+                (count + 2).min(35)
+            });
+        } else {
+            let scale = self.scale.unwrap_or(prefs.lens_scale);
+            if !up && scale <= 4 {
+                self.hidden = true;
+            } else {
+                self.scale = Some(if up { (scale + 2).min(24) } else { scale - 2 }.max(4));
+            }
+        }
+    }
+    /// The preferences the magnifier draws with.
+    pub(crate) fn apply(&self, prefs: &RegionCapturePreferences) -> RegionCapturePreferences {
+        let mut p = prefs.clone();
+        p.show_magnifier &= !self.hidden;
+        p.lens_scale = self.scale.unwrap_or(p.lens_scale);
+        p.lens_source_count = self.count.unwrap_or(p.lens_source_count);
+        p
+    }
 }
 impl CaptureOverlay {
     pub fn new(document: EditorDocument) -> Self {
@@ -222,6 +265,8 @@ impl CaptureOverlay {
             preview: Default::default(),
             generation: 0,
             chrome_focused: false,
+            toolbar_hidden: false,
+            magnifier: MagnifierWheel::default(),
         }
     }
     pub fn initialize_preferences(
@@ -442,6 +487,11 @@ impl CaptureOverlay {
                     self.error = None;
                     return Ok(None);
                 }
+                // Like ShareX: clear a selected annotation before closing.
+                if self.tool == AnnotationTool::Select && self.selected.take().is_some() {
+                    self.changed();
+                    return Ok(None);
+                }
                 self.cancelled = true;
                 self.finish_visible = false;
                 Ok(Some(OverlayAction::Cancel))
@@ -468,7 +518,11 @@ impl CaptureOverlay {
                 self.finish_visible = true;
                 Ok(Some(OverlayAction::Continue))
             }
-            OverlayInput::Finish(OverlayAction::Cancel) => self.handle(OverlayInput::Escape),
+            OverlayInput::Finish(OverlayAction::Cancel) => {
+                // The Cancel button closes; only Esc/right-click deselect first.
+                self.selected = None;
+                self.handle(OverlayInput::Escape)
+            }
             OverlayInput::Finish(action) => {
                 if self.has_active_edit() {
                     return Err(AppError::InUse("complete or cancel the active edit first"));
@@ -548,8 +602,48 @@ impl CaptureOverlay {
         }
         Ok(())
     }
-    fn auxiliary(&mut self, button: MouseButton) -> Result<(), AppError> {
+    /// Releasing a drawn region, Space or `~` confirms a new selection.
+    /// Recording/scrolling keep their explicit Start/countdown boundary.
+    fn confirm_selection(&mut self, outcome: SelectionOutcome) -> Result<(), AppError> {
+        let selected = matches!(
+            outcome,
+            SelectionOutcome::Selected(_) | SelectionOutcome::Changed(_)
+        );
+        self.selection_outcome(outcome, true)?;
+        if selected && !self.recording_selection {
+            self.handle(OverlayInput::Enter)?;
+            self.finish_tasks_on_release = self.release_runs_tasks;
+        }
+        Ok(())
+    }
+    fn auxiliary(
+        &mut self,
+        button: MouseButton,
+        at: Option<PhysicalPoint>,
+    ) -> Result<(), AppError> {
         if self.preferences.mouse.action(button) == CaptureMouseAction::CancelActiveOrCapture {
+            // ShareX-style right-click: cancel the active edit, else remove what's
+            // under the pointer (the region or an annotation), else close.
+            if !self.has_active_edit()
+                && !self.chrome_focused
+                && let Some(p) = at
+            {
+                if self.tool == AnnotationTool::Region {
+                    if self.document.crop().is_some_and(|c| c.contains(p)) {
+                        return self.apply(EditorCommand::Crop(None));
+                    }
+                } else if let Some(id) =
+                    crate::editor::eraser::erase_annotation_hits(&self.document, &[p], 2.0)?
+                        .last()
+                        .copied()
+                {
+                    self.apply(EditorCommand::Erase(vec![id]))?;
+                    if self.selected == Some(id) {
+                        self.selected = None;
+                    }
+                    return Ok(());
+                }
+            }
             self.handle(OverlayInput::Escape)?;
             return Ok(());
         }
@@ -564,13 +658,46 @@ impl CaptureOverlay {
                     AnnotationTool::Region
                 })
             }
-            _ => {
+            action => {
+                // Like ShareX, whole-desktop/monitor buttons take the shot; the
+                // monitor is the one under the pointer, not the launch monitor.
+                let input = match (action, at) {
+                    (CaptureMouseAction::SelectActiveMonitor, Some(p)) => {
+                        SelectionInput::SelectMonitorAt(p)
+                    }
+                    _ => SelectionInput::Auxiliary(button),
+                };
                 if let Some(selection) = &mut self.selection {
-                    let outcome = selection.handle(SelectionInput::Auxiliary(button));
-                    self.selection_outcome(outcome, true)?;
+                    let outcome = selection.handle(input);
+                    self.confirm_selection(outcome)?;
                 }
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_resizes_ctrl_wheel_zooms_and_shrinking_past_the_minimum_hides() {
+        let prefs = RegionCapturePreferences::default();
+        let mut m = MagnifierWheel::default();
+        m.scroll(true, false, &prefs);
+        assert_eq!(m.apply(&prefs).lens_scale, prefs.lens_scale + 2);
+        m.scroll(true, true, &prefs);
+        assert_eq!(
+            m.apply(&prefs).lens_source_count,
+            prefs.lens_source_count - 2
+        );
+        for _ in 0..20 {
+            m.scroll(false, false, &prefs);
+        }
+        assert!(!m.apply(&prefs).show_magnifier);
+        m.scroll(true, false, &prefs);
+        assert!(m.apply(&prefs).show_magnifier);
+        assert!(m.apply(&prefs).validate().is_ok());
     }
 }
