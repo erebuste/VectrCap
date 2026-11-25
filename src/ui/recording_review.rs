@@ -159,7 +159,12 @@ impl ReviewPlayer {
             egui::ViewportId::from_hash_of(("recording-review", id)),
             egui::ViewportBuilder::default()
                 .with_title("VectrCap recording review")
-                .with_inner_size([780.0, 680.0]),
+                // MP4 review is text and buttons; GIF also shows a ≤640×360 preview.
+                .with_inner_size(if view.mp4 {
+                    [560.0, 230.0]
+                } else {
+                    [680.0, 600.0]
+                }),
             move |ui, _| {
                 let snapshot = client.snapshot();
                 let Some(recording) = snapshot.recording.filter(|r| {

@@ -501,7 +501,7 @@ impl ScrollingRuntime {
                                 item.take()
                                     .ok_or(AppError::Capture("scroll source already consumed"))?,
                                 CursorCaptureSettings::WithoutCursor,
-                                DrawBorderSettings::Default,
+                                crate::platform::windows::capture::capture_border(),
                                 SecondaryWindowSettings::Exclude,
                                 MinimumUpdateIntervalSettings::Default,
                                 DirtyRegionSettings::Default,

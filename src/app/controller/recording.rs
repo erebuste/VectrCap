@@ -219,11 +219,10 @@ impl AppController {
         let zoom = monitor.scale_factor() as f32
             * self.settings().appearance.ui_scale_percent as f32
             / 100.0;
-        let controls = crate::ui::recording_overlay::control_bounds(
-            rect,
-            monitor.bounds(),
-            ((450.0 * zoom).ceil() as u32, (240.0 * zoom).ceil() as u32),
-        )?;
+        let controls = crate::ui::recording_overlay::control_bounds(rect, monitor.bounds(), {
+            let (w, h) = crate::ui::recording_overlay::CONTROLS_SIZE;
+            ((w * zoom).ceil() as u32, (h * zoom).ceil() as u32)
+        })?;
         self.recording
             .as_mut()
             .expect("recording selection")

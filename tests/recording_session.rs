@@ -412,6 +412,14 @@ fn recording_controls_never_overlap_selected_pixels() {
     assert!(m.contains_rect(c));
     assert!(c.intersection(r).is_none());
     assert!(control_bounds(m, m, (450, 160)).is_err());
+    // Docked like the capture tools: top centre of the monitor when that is free.
+    let dock = control_bounds(r, m, (560, 44)).unwrap();
+    assert_eq!((dock.left(), dock.top()), (-1920 + (1920 - 560) / 2, 8));
+    // A selection reaching the top pushes it to the bottom centre.
+    let tall = PhysicalRect::new(-1920, 0, 1920, 600).unwrap();
+    let low = control_bounds(tall, m, (560, 44)).unwrap();
+    assert_eq!(low.top(), 1080 - 44 - 8);
+    assert!(low.intersection(tall).is_none());
 }
 
 #[test]

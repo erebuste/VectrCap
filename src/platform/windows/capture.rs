@@ -131,6 +131,17 @@ impl WindowsCaptureSource {
     }
 }
 
+/// Windows draws a yellow frame around whatever it captures: for a region
+/// recording that is the whole monitor, not the region. Turn it off where the
+/// OS allows it (Windows 11); our own boundary marks the region instead.
+pub(crate) fn capture_border() -> DrawBorderSettings {
+    match windows_capture::graphics_capture_api::GraphicsCaptureApi::is_border_settings_supported()
+    {
+        Ok(true) => DrawBorderSettings::WithoutBorder,
+        _ => DrawBorderSettings::Default,
+    }
+}
+
 /// Dedicated acquisition worker entry. All native adapters are created and
 /// dropped on this thread; cancellation never produces an output artifact.
 pub fn acquire_screenshot(
@@ -310,7 +321,7 @@ impl WindowsCaptureSource {
             } else {
                 CursorCaptureSettings::WithoutCursor
             },
-            DrawBorderSettings::Default,
+            crate::platform::windows::capture::capture_border(),
             SecondaryWindowSettings::Exclude,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,

@@ -291,7 +291,7 @@ impl NativeCapture {
         let settings = Settings::new(
             item,
             cursor,
-            DrawBorderSettings::Default,
+            crate::platform::windows::capture::capture_border(),
             SecondaryWindowSettings::Exclude,
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
