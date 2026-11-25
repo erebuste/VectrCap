@@ -68,7 +68,8 @@ impl Default for RegionCapturePreferences {
             show_magnifier: true,
             lens_shape: LensShape::Circle,
             lens_source_count: 15,
-            lens_scale: 20,
+            // ShareX: a 150 px lens over 15 pixels, i.e. 10 px per pixel.
+            lens_scale: 10,
             show_rgb: false,
             show_hex: false,
             center_crosshair: true,

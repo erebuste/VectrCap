@@ -43,7 +43,7 @@ fn region_defaults_match_confirmed_choices() {
     assert_eq!(p.dim_percent, 20);
     assert_eq!(
         (p.lens_shape, p.lens_source_count, p.lens_scale),
-        (LensShape::Circle, 15, 20)
+        (LensShape::Circle, 15, 10)
     );
     assert!(
         !p.show_rgb

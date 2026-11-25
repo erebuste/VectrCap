@@ -216,8 +216,17 @@ fn completion_surface_requests_no_activation_or_taskbar_entry() {
     let size = builder.inner_size.unwrap();
     assert!(size.x <= 240.0 && size.y <= 180.0, "{size:?}");
     let position = builder.position.expect("toast position");
-    let area =
-        vectrcap::platform::windows::monitors::primary_work_area().expect("primary work area");
+    // The toast follows the pointer's monitor (ShareX), else the primary one.
+    use vectrcap::platform::windows::{monitors, windows::physical_pointer};
+    let area = physical_pointer()
+        .ok()
+        .and_then(|p| {
+            monitors::enumerate_work_areas()
+                .ok()?
+                .into_iter()
+                .find(|a| a.contains(p))
+        })
+        .unwrap_or_else(|| monitors::primary_work_area().expect("primary work area"));
     let margin = 16.0;
     let x = (area.right() as f32 - size.x - margin).max(area.left() as f32);
     let y = (area.bottom() as f32 - size.y - margin).max(area.top() as f32);

@@ -204,21 +204,19 @@ impl MagnifierWheel {
             self.hidden = !up;
             return;
         }
+        // As in ShareX: the wheel shows more/fewer pixels at the same pixel size
+        // (the lens grows/shrinks); Ctrl+wheel zooms within the same lens size.
+        let count = self.count.unwrap_or(prefs.lens_source_count);
+        let scale = self.scale.unwrap_or(prefs.lens_scale);
         if ctrl {
-            // Fewer source pixels = more zoom. The count stays odd.
-            let count = self.count.unwrap_or(prefs.lens_source_count);
-            self.count = Some(if up {
-                count.saturating_sub(2).max(9)
-            } else {
-                (count + 2).min(35)
-            });
+            let next = if up { count - 2 } else { count + 2 }.clamp(9, 35);
+            let size = f32::from(count) * f32::from(scale);
+            self.count = Some(next);
+            self.scale = Some((size / f32::from(next)).round().clamp(4.0, 24.0) as u8);
+        } else if !up && count <= 9 {
+            self.hidden = true;
         } else {
-            let scale = self.scale.unwrap_or(prefs.lens_scale);
-            if !up && scale <= 4 {
-                self.hidden = true;
-            } else {
-                self.scale = Some(if up { (scale + 2).min(24) } else { scale - 2 }.max(4));
-            }
+            self.count = Some(if up { count + 2 } else { count - 2 }.clamp(9, 35));
         }
     }
     /// The preferences the magnifier draws with.
@@ -685,13 +683,23 @@ mod tests {
     fn wheel_resizes_ctrl_wheel_zooms_and_shrinking_past_the_minimum_hides() {
         let prefs = RegionCapturePreferences::default();
         let mut m = MagnifierWheel::default();
+        // Wheel up: two more pixels, same pixel size.
         m.scroll(true, false, &prefs);
-        assert_eq!(m.apply(&prefs).lens_scale, prefs.lens_scale + 2);
-        m.scroll(true, true, &prefs);
+        let p = m.apply(&prefs);
         assert_eq!(
-            m.apply(&prefs).lens_source_count,
-            prefs.lens_source_count - 2
+            (p.lens_source_count, p.lens_scale),
+            (prefs.lens_source_count + 2, prefs.lens_scale)
         );
+        // Ctrl+wheel up: fewer, bigger pixels in about the same lens size.
+        m.scroll(true, true, &prefs);
+        let q = m.apply(&prefs);
+        assert_eq!(q.lens_source_count, p.lens_source_count - 2);
+        assert!(q.lens_scale > p.lens_scale);
+        let (before, after) = (
+            u32::from(p.lens_source_count) * u32::from(p.lens_scale),
+            u32::from(q.lens_source_count) * u32::from(q.lens_scale),
+        );
+        assert!(before.abs_diff(after) <= u32::from(q.lens_source_count));
         for _ in 0..20 {
             m.scroll(false, false, &prefs);
         }
