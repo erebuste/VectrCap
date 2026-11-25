@@ -52,9 +52,33 @@ pub fn control_bounds(
 pub struct RecordingHost {
     review: super::recording_review::ReviewPlayer,
     selection_id: Option<uuid::Uuid>,
+    /// The red line around the area being recorded, per session.
+    boundary: Option<(
+        uuid::Uuid,
+        Option<crate::platform::windows::recording_events::RecordingBoundary>,
+    )>,
 }
 impl RecordingHost {
     pub fn show(&mut self, ctx: &egui::Context, client: &DesktopClient, view: &DesktopView) {
+        let framed = view
+            .recording
+            .as_ref()
+            .filter(|r| {
+                matches!(
+                    r.state,
+                    RecordingState::Countdown | RecordingState::Recording | RecordingState::Paused
+                )
+            })
+            .and_then(|r| Some((r.id, r.options.as_ref()?.rect)));
+        if self.boundary.as_ref().map(|(id, _)| *id) != framed.map(|(id, _)| id) {
+            self.boundary = framed.map(|(id, rect)| {
+                let shown =
+                    crate::platform::windows::recording_events::RecordingBoundary::show(rect)
+                        .inspect_err(|e| client.report_error(e.clone()))
+                        .ok();
+                (id, shown)
+            });
+        }
         let active_selection = view
             .recording
             .as_ref()
@@ -166,7 +190,7 @@ impl RecordingHost {
                 | RecordingState::Paused
                 | RecordingState::Finalizing
                 | RecordingState::Interrupted
-        ) && let Some(o) = &recording.options
+        ) && recording.options.is_some()
         {
             if let Some(bounds) = recording.controls {
                 let title = format!("VectrCap recording controls {id}");
@@ -223,69 +247,6 @@ impl RecordingHost {
                         }
                         ui.ctx()
                             .request_repaint_after(std::time::Duration::from_millis(100));
-                    },
-                );
-            }
-            // Four thin, click-through windows form a boundary entirely outside the source.
-            let r = o.rect;
-            for (index, (x, y, w, h)) in [
-                (
-                    r.left().saturating_sub(2),
-                    r.top().saturating_sub(2),
-                    r.width().saturating_add(4),
-                    2,
-                ),
-                (
-                    r.left().saturating_sub(2),
-                    r.bottom(),
-                    r.width().saturating_add(4),
-                    2,
-                ),
-                (r.left().saturating_sub(2), r.top(), 2, r.height()),
-                (r.right(), r.top(), 2, r.height()),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let Ok(bounds) = PhysicalRect::new(x, y, w, h) else {
-                    continue;
-                };
-                let title = format!("VectrCap recording boundary {id} {index}");
-                let _ = crate::platform::windows::recording_events::place_overlay(&title, bounds);
-                let client = client.clone();
-                ctx.show_viewport_deferred(
-                    egui::ViewportId::from_hash_of(("recording-boundary", id, index)),
-                    egui::ViewportBuilder::default()
-                        .with_title(title.clone())
-                        .with_decorations(false)
-                        .with_resizable(false)
-                        .with_taskbar(false)
-                        .with_visible(false)
-                        .with_mouse_passthrough(true)
-                        .with_inner_size([w as f32, h as f32])
-                        .with_clamp_size_to_monitor_size(false)
-                        .with_window_level(egui::WindowLevel::AlwaysOnTop),
-                    move |ui, _| {
-                        if client.snapshot().recording.is_none_or(|r| {
-                            r.id != id
-                                || !matches!(
-                                    r.state,
-                                    RecordingState::Countdown
-                                        | RecordingState::Recording
-                                        | RecordingState::Paused
-                                )
-                        }) {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            return;
-                        }
-                        if crate::platform::windows::recording_events::place_overlay(&title, bounds)
-                            .is_ok()
-                        {
-                            ui.ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        }
-                        ui.painter()
-                            .rect_filled(ui.max_rect(), 0.0, egui::Color32::RED);
                     },
                 );
             }
