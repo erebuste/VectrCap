@@ -368,16 +368,15 @@ fn run(
         } else {
             feed_synthetic(&mut *encoder, options.audio(), &mut audio_frames, t)?;
         }
+        // Cut off at the media time read above, not just the limit: after a resume,
+        // WGC presentation stamps can map a few ms ahead of the clock, and a frame
+        // past `t` would land after the final endpoint ("invalid MP4 endpoint").
         drain_video(
             &capture,
             &mut *encoder,
             &mut last_video,
             probe.as_ref().map_or(Duration::ZERO, |p| p.encoder_delay),
-            Some(
-                physical_audio
-                    .as_ref()
-                    .map_or(limit, |a| a.end_time().min(limit)),
-            ),
+            Some(physical_audio.as_ref().map_or(t, |a| a.end_time().min(t))),
         )?;
         if requested_stop || t >= limit {
             break t;
