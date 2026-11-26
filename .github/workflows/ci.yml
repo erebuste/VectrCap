@@ -21,34 +21,21 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Explicitly provision Rust and verify the stable alias matches the pin
+      # rust-toolchain.toml pins the compiler; every cargo call below uses it.
+      - name: Install the pinned Rust toolchain
         run: |
           $ErrorActionPreference = 'Stop'
-          $descriptor = Get-Content -Raw rust-toolchain.toml
-          if ($descriptor -notmatch 'channel\s*=\s*"([0-9.]+)"') { throw 'Missing exact toolchain pin' }
-          $pinned = $Matches[1]
-          rustup toolchain install $pinned --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+          if ((Get-Content -Raw rust-toolchain.toml) -notmatch 'channel\s*=\s*"([0-9.]+)"') { throw 'Missing exact toolchain pin' }
+          rustup toolchain install $Matches[1] --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Pinned toolchain provisioning failed' }
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { throw 'Stable alias provisioning failed' }
-          $compiler = rustc +stable --version
-          if ($LASTEXITCODE -ne 0 -or $compiler -notmatch "^rustc $([regex]::Escape($pinned)) ") {
-            throw "+stable must match pinned rustc $pinned. Review a toolchain upgrade explicitly if upstream stable has advanced."
-          }
+          rustc --version
       - name: Fetch locked Windows dependencies explicitly
-        run: cargo +stable fetch --locked --target x86_64-pc-windows-msvc
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
       - name: Formatter
-        run: cargo +stable fmt --check
+        run: cargo fmt --check
       - name: Clippy
-        run: cargo +stable clippy --all-targets --offline -- -D warnings
+        run: cargo clippy --all-targets --offline -- -D warnings
       - name: All-target tests (no ignored interactive tests)
-        run: cargo +stable test --all-targets --offline
+        run: cargo test --all-targets --offline
       - name: Build and package unsigned x64 release with locked notices
         run: ./scripts/build-release.ps1
-
-  # INTERACTIVE HOST ACCEPTANCE IS A SEPARATE HUMAN CHECKLIST, not a CI job:
-  # docs/verification/windows-acceptance.md. Real tray/desktop/clipboard/Explorer,
-  # credentials/server, monitors/DPI/contrast/Narrator, audio/video/codec and OS
-  # failure scenarios require a person on Windows with appropriate hardware and
-  # server access. A green CI run or successful build does not pass these checks.
-  # Signing and installer selection are separately deferred delivery decisions.

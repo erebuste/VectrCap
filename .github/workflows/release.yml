@@ -25,24 +25,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ((Get-Content -Raw Cargo.toml) -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'No package version' }
           if ("v$($Matches[1])" -ne '${{ github.ref_name }}') { throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $($Matches[1])" }
-      - name: Explicitly provision Rust and verify the stable alias matches the pin
+      # rust-toolchain.toml pins the compiler; every cargo call below uses it.
+      - name: Install the pinned Rust toolchain
         run: |
           $ErrorActionPreference = 'Stop'
-          $descriptor = Get-Content -Raw rust-toolchain.toml
-          if ($descriptor -notmatch 'channel\s*=\s*"([0-9.]+)"') { throw 'Missing exact toolchain pin' }
-          $pinned = $Matches[1]
-          rustup toolchain install $pinned --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+          if ((Get-Content -Raw rust-toolchain.toml) -notmatch 'channel\s*=\s*"([0-9.]+)"') { throw 'Missing exact toolchain pin' }
+          rustup toolchain install $Matches[1] --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Pinned toolchain provisioning failed' }
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) { throw 'Stable alias provisioning failed' }
-          $compiler = rustc +stable --version
-          if ($LASTEXITCODE -ne 0 -or $compiler -notmatch "^rustc $([regex]::Escape($pinned)) ") {
-            throw "+stable must match pinned rustc $pinned."
-          }
+          rustc --version
       - name: Fetch locked Windows dependencies
-        run: cargo +stable fetch --locked --target x86_64-pc-windows-msvc
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
       - name: Tests
-        run: cargo +stable test --all-targets --offline
+        run: cargo test --all-targets --offline
       - name: Build package
         run: ./scripts/build-release.ps1
       - name: Release assets

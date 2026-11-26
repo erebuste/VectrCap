@@ -6,10 +6,10 @@ use vectrcap::{
             SizePreset,
         },
         request::CaptureSnapshot,
-        windows::HoverArea,
         selection::{
             InputContext, SelectionInput as Input, SelectionModel, SelectionOutcome as Outcome,
         },
+        windows::HoverArea,
     },
     persistence::settings::Settings,
 };

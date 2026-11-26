@@ -248,11 +248,7 @@ impl Windows {
             let mut children: Vec<usize> = vec![];
             // SAFETY: the callback only touches `children`, which outlives the call.
             unsafe {
-                EnumChildWindows(
-                    hwnd,
-                    Some(collect_child),
-                    &mut children as *mut _ as LPARAM,
-                )
+                EnumChildWindows(hwnd, Some(collect_child), &mut children as *mut _ as LPARAM)
             };
             // Windows App SDK title bars (Explorer's tab row) are a helper window,
             // not a control: they extend the title bar instead.

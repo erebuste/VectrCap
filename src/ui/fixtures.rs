@@ -1,5 +1,4 @@
-//! Sample data mirroring docs/mockups/2026-11-17-main-window.html, used to
-//! render the real shell next to the mockup. Never used by the running app.
+//! Sample History/Settings data for UI tests. Never used by the running app.
 use super::settings::SettingsCategory;
 use crate::{
     app::{

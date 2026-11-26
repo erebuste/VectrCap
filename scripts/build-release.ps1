@@ -12,15 +12,12 @@ try {
     $descriptor = [IO.File]::ReadAllText((Join-Path $taskRepoRoot 'rust-toolchain.toml'))
     if ($descriptor -notmatch 'channel\s*=\s*"([0-9.]+)"') { throw 'Missing exact Rust version.' }
     $pinned = $Matches[1]
-    $compiler = & rustc +stable --version
+    # rust-toolchain.toml selects the pinned compiler for every cargo call here.
+    $compiler = & rustc --version
     if ($LASTEXITCODE -ne 0 -or $compiler -notmatch "^rustc $([regex]::Escape($pinned)) ") {
-        throw "The installed +stable alias must be rustc $pinned. Provision it explicitly; auto-install is disabled."
+        throw "rustc $pinned is required. Install it: rustup toolchain install $pinned (auto-install is disabled)."
     }
-    $targets = & rustup target list --installed --toolchain stable
-    if ($LASTEXITCODE -ne 0 -or $targets -notcontains 'x86_64-pc-windows-msvc') {
-        throw 'Target x86_64-pc-windows-msvc is not installed for +stable.'
-    }
-    & cargo +stable build --release --locked --target x86_64-pc-windows-msvc
+    & cargo build --release --locked --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed; no package was published.' }
     & (Join-Path $PSScriptRoot 'generate-notices.ps1') -Check
     # One fixed local output folder, replaced on every build. No registry

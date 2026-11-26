@@ -1,4 +1,4 @@
-//! Layout and type values from docs/mockups/2026-11-17-main-window.html, in egui
+//! Layout and type values from the main-window design, in egui
 //! points at 100% scale. Colors live in `platform::windows::appearance`.
 use eframe::egui::{FontFamily, FontId};
 

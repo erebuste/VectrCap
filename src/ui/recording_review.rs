@@ -270,8 +270,16 @@ fn draw_review(
         } else {
             "Recording ready"
         };
-        ui.label(RichText::new(title).font(semibold(TITLE_SIZE - 2.0)).color(strong));
-        widgets::pill(ui, if recording.mp4 { "MP4" } else { "GIF" }, PillTone::Neutral);
+        ui.label(
+            RichText::new(title)
+                .font(semibold(TITLE_SIZE - 2.0))
+                .color(strong),
+        );
+        widgets::pill(
+            ui,
+            if recording.mp4 { "MP4" } else { "GIF" },
+            PillTone::Neutral,
+        );
         if recording.interruption.is_some() {
             widgets::pill(ui, "Interrupted", PillTone::Warning);
         }
@@ -280,7 +288,11 @@ fn draw_review(
         }
     });
     if let Some(metadata) = &recording.metadata {
-        ui.label(RichText::new(metadata_label(metadata)).size(SMALL_SIZE).color(weak));
+        ui.label(
+            RichText::new(metadata_label(metadata))
+                .size(SMALL_SIZE)
+                .color(weak),
+        );
     }
     ui.add_space(12.0);
 
@@ -410,7 +422,10 @@ fn draw_review(
         });
     });
     if recording.uploaded {
-        widgets::hint(ui, "Cancel its job in Uploads before discarding the source.");
+        widgets::hint(
+            ui,
+            "Cancel its job in Uploads before discarding the source.",
+        );
     }
     commands
 }

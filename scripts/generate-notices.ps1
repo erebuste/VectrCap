@@ -6,7 +6,7 @@ Push-Location $taskRepoRoot
 try {
     # Only locked normal/build dependencies reachable for the shipped Windows target.
     # Cached crate license files and committed supplements make this offline/repeatable.
-    $raw = & cargo +stable metadata --locked --offline --filter-platform x86_64-pc-windows-msvc --format-version 1
+    $raw = & cargo metadata --locked --offline --filter-platform x86_64-pc-windows-msvc --format-version 1
     if ($LASTEXITCODE -ne 0) { throw 'Unable to read locked dependency metadata.' }
     $metadata = ($raw -join "`n") | ConvertFrom-Json
     $packagesById = @{}

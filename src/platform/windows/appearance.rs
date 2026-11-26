@@ -42,7 +42,7 @@ const VECTR_PRIMARY_FOREGROUND: Color32 = Color32::from_rgb(26, 17, 37);
 const VECTR_DESTRUCTIVE: Color32 = Color32::from_rgb(255, 100, 103);
 /// `--border` (`oklch(1 0 0 / 10%)`): translucent white over the background.
 const VECTR_BORDER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
-/// Mockup status green (no Vectr token; `docs/mockups/2026-11-17-main-window.html`).
+/// Mockup status green (no Vectr token).
 const VECTR_SUCCESS: Color32 = Color32::from_rgb(134, 209, 161);
 /// Mockup attention amber.
 const VECTR_WARNING: Color32 = Color32::from_rgb(242, 196, 109);

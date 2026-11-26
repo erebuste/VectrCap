@@ -187,7 +187,10 @@ impl SelectionModel {
             return None;
         }
         if self.hover_areas.is_empty() {
-            self.windows.iter().map(|w| w.bounds).find(|r| r.contains(p))
+            self.windows
+                .iter()
+                .map(|w| w.bounds)
+                .find(|r| r.contains(p))
         } else {
             self.hover_areas
                 .iter()

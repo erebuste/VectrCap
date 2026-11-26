@@ -469,7 +469,12 @@ impl CaptureOverlay {
         let px = 1.0 / t.pixels_per_point;
         let ants = |r: egui::Rect| {
             let r = r.shrink(px / 2.0);
-            let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+            let corners = [
+                r.left_top(),
+                r.right_top(),
+                r.right_bottom(),
+                r.left_bottom(),
+            ];
             for i in 0..4 {
                 let line = [corners[i], corners[(i + 1) % 4]];
                 painter.line_segment(line, egui::Stroke::new(px, color));
