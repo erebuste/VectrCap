@@ -157,6 +157,94 @@ impl Windows {
         Ok(current)
     }
 }
+const MAX_CONTROLS: usize = 4096;
+#[allow(unsafe_code)]
+unsafe extern "system" fn collect_child(hwnd: HWND, data: LPARAM) -> i32 {
+    // SAFETY: this pointer belongs to the synchronous EnumChildWindows call below.
+    let children = unsafe { &mut *(data as *mut Vec<usize>) };
+    children.push(hwnd as usize);
+    (children.len() < MAX_CONTROLS) as i32
+}
+#[allow(unsafe_code)]
+fn client_rect(hwnd: HWND) -> Option<PhysicalRect> {
+    let mut r = RECT::default();
+    let mut origin = POINT::default();
+    // SAFETY: writable stack values; Win32 validates the transient HWND.
+    unsafe {
+        if GetClientRect(hwnd, &mut r) == 0
+            || windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut origin) == 0
+        {
+            return None;
+        }
+    }
+    rect_from_win32(RECT {
+        left: origin.x,
+        top: origin.y,
+        right: origin.x + r.right,
+        bottom: origin.y + r.bottom,
+    })
+    .ok()
+}
+/// ShareX skips a client area that is the whole window bar a thin border
+/// (custom title bars); otherwise it would always win over the window.
+fn same_as_frame(client: PhysicalRect, frame: PhysicalRect) -> bool {
+    const TOLERANCE: i32 = 8;
+    client.left() - frame.left() <= TOLERANCE
+        && client.top() - frame.top() <= TOLERANCE
+        && frame.right() - client.right() <= TOLERANCE
+        && frame.bottom() - client.bottom() <= TOLERANCE
+}
+impl Windows {
+    /// ShareX's window list with "detect controls": for each window in z-order,
+    /// its visible child controls (smallest first, clipped to the window), its
+    /// client area when it has a real title bar, then the window itself.
+    #[allow(unsafe_code)]
+    pub(crate) fn hover_areas(&self, candidates: &[WindowCandidate]) -> Vec<PhysicalRect> {
+        let Ok(_dpi) = DpiContext::enter() else {
+            return vec![];
+        };
+        let mut areas = vec![];
+        for candidate in candidates {
+            let frame = candidate.bounds;
+            let Some(window) = self.entries.get(&candidate.id) else {
+                continue;
+            };
+            let hwnd = window.hwnd as HWND;
+            let mut children: Vec<usize> = vec![];
+            // SAFETY: the callback only touches `children`, which outlives the call.
+            unsafe {
+                EnumChildWindows(
+                    hwnd,
+                    Some(collect_child),
+                    &mut children as *mut _ as LPARAM,
+                )
+            };
+            let mut controls: Vec<PhysicalRect> = children
+                .into_iter()
+                .filter_map(|child| {
+                    let child = child as HWND;
+                    let mut r = RECT::default();
+                    // SAFETY: Win32 validates the transient child HWND.
+                    if unsafe { IsWindowVisible(child) == 0 || GetWindowRect(child, &mut r) == 0 } {
+                        return None;
+                    }
+                    rect_from_win32(r).ok()?.intersection(frame)
+                })
+                .filter(|r| *r != frame)
+                .collect();
+            controls.sort_by_key(|r| u64::from(r.width()) * u64::from(r.height()));
+            controls.dedup();
+            areas.extend(controls);
+            if let Some(client) = client_rect(hwnd).and_then(|c| c.intersection(frame))
+                && !same_as_frame(client, frame)
+            {
+                areas.push(client);
+            }
+            areas.push(frame);
+        }
+        areas
+    }
+}
 #[allow(unsafe_code)]
 pub fn physical_pointer() -> Result<PhysicalPoint, AppError> {
     let mut p = POINT::default();

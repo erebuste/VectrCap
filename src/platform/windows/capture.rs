@@ -246,6 +246,9 @@ impl CaptureSource for WindowsCaptureSource {
     fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError> {
         self.windows.enumerate()
     }
+    fn hover_areas(&mut self, windows: &[WindowCandidate]) -> Vec<PhysicalRect> {
+        self.windows.hover_areas(windows)
+    }
     fn desktop(
         &mut self,
         bounds: PhysicalRect,

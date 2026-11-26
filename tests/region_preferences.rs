@@ -148,6 +148,32 @@ fn lens_count_and_zoom_are_bounded() {
     );
 }
 #[test]
+fn hover_picks_controls_and_client_area_like_sharex() {
+    // Native order: a window's controls (smallest first), its client area, then the window.
+    let window = r(0, 0, 600, 400);
+    let client = r(0, 30, 600, 370);
+    let button = r(20, 50, 80, 24);
+    let s = CaptureSnapshot::new(
+        vec![0; 1600 * 800 * 4],
+        r(-800, 0, 1600, 800),
+        vec![
+            MonitorGeometry::new("a".into(), r(-800, 0, 800, 800), 1.5).unwrap(),
+            MonitorGeometry::new("b".into(), r(0, 0, 800, 800), 1.0).unwrap(),
+        ],
+        vec![],
+    )
+    .unwrap()
+    .with_hover_areas(vec![button, client, window]);
+    let click = |at: Point| {
+        let mut m =
+            SelectionModel::new(&s, Default::default(), Point { x: -400, y: 50 }, (4, 4)).unwrap();
+        drag(&mut m, at, at)
+    };
+    assert_eq!(click(Point { x: 30, y: 60 }), Outcome::Selected(button));
+    assert_eq!(click(Point { x: 300, y: 200 }), Outcome::Selected(client));
+    assert_eq!(click(Point { x: 300, y: 10 }), Outcome::Selected(window));
+}
+#[test]
 fn disabled_window_detection_keeps_manual_drag() {
     let mut m = model(RegionCapturePreferences {
         window_detection: false,

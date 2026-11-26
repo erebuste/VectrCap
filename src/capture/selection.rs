@@ -78,6 +78,7 @@ pub struct SelectionModel {
     active_monitor: PhysicalRect,
     monitors: Vec<MonitorGeometry>,
     windows: Vec<WindowCandidate>,
+    hover_areas: Vec<PhysicalRect>,
     preferences: RegionCapturePreferences,
     threshold: (u32, u32),
     crop: Option<PhysicalRect>,
@@ -132,6 +133,7 @@ impl SelectionModel {
             active_monitor,
             monitors: snapshot.monitors.clone(),
             windows: snapshot.windows.clone(),
+            hover_areas: snapshot.hover_areas.clone(),
             preferences,
             threshold,
             crop: snapshot.initial_crop,
@@ -184,10 +186,12 @@ impl SelectionModel {
         if !self.preferences.window_detection || !self.point_available(p) {
             return None;
         }
-        self.windows
-            .iter()
-            .find(|w| w.bounds.contains(p))
-            .and_then(|w| w.bounds.intersection(self.permitted))
+        if self.hover_areas.is_empty() {
+            self.windows.iter().map(|w| w.bounds).find(|r| r.contains(p))
+        } else {
+            self.hover_areas.iter().copied().find(|r| r.contains(p))
+        }
+        .and_then(|r| r.intersection(self.permitted))
     }
     fn accept(&mut self, r: PhysicalRect, changed: bool) -> SelectionOutcome {
         if let Err(error) = self.validate_crop(r) {

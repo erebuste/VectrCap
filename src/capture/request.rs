@@ -131,6 +131,9 @@ pub struct CaptureSnapshot {
     pub(crate) bounds: PhysicalRect,
     pub(crate) monitors: Vec<MonitorGeometry>,
     pub(crate) windows: Vec<WindowCandidate>,
+    /// ShareX hover targets in pick order (controls, client areas, windows);
+    /// empty means hover uses the window bounds.
+    pub(crate) hover_areas: Vec<PhysicalRect>,
     pub(crate) initial_crop: Option<PhysicalRect>,
     pub(crate) hint: Option<SnapshotHint>,
     preferences: RegionCapturePreferences,
@@ -170,6 +173,7 @@ impl CaptureSnapshot {
             bounds,
             monitors,
             windows,
+            hover_areas: vec![],
             initial_crop: None,
             hint: None,
             preferences: RegionCapturePreferences::default(),
@@ -187,6 +191,10 @@ impl CaptureSnapshot {
     }
     pub fn windows(&self) -> &[WindowCandidate] {
         &self.windows
+    }
+    pub fn with_hover_areas(mut self, areas: Vec<PhysicalRect>) -> Self {
+        self.hover_areas = areas;
+        self
     }
     pub fn initial_crop(&self) -> Option<PhysicalRect> {
         self.initial_crop
@@ -230,6 +238,11 @@ pub trait CaptureSource {
     fn monitors(&mut self) -> Result<Vec<MonitorGeometry>, AppError>;
     fn pointer(&mut self) -> Result<PhysicalPoint, AppError>;
     fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError>;
+    /// ShareX "detect controls": child controls and client areas of `windows`
+    /// (z-ordered), plus the windows, in hover pick order. Best effort.
+    fn hover_areas(&mut self, _windows: &[WindowCandidate]) -> Vec<PhysicalRect> {
+        vec![]
+    }
     /// Retain the actual window source identity before a delay (not just a reusable HWND).
     /// This must not acquire pixels or start a capture session.
     fn prepare_window(&mut self, target: WindowCandidate) -> Result<(), AppError>;
@@ -368,7 +381,9 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
                 "window layout changed while capturing; try again",
             ));
         }
+        let areas = self.source.hover_areas(&windows);
         let mut snapshot = CaptureSnapshot::new(pixels, bounds, layout, windows)?;
+        snapshot.hover_areas = areas;
         snapshot.mode = request.mode;
         match request.mode {
             CaptureMode::Window | CaptureMode::Fullscreen => snapshot.initial_crop = Some(bounds),
