@@ -17,6 +17,18 @@ pub struct WindowCandidate {
     pub id: WindowId,
     pub bounds: PhysicalRect,
 }
+/// A region-capture hover target: pointing inside `hit` offers `select`
+/// (a control or client area offers itself; a title bar offers its window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoverArea {
+    pub hit: PhysicalRect,
+    pub select: PhysicalRect,
+}
+impl HoverArea {
+    pub fn itself(r: PhysicalRect) -> Self {
+        Self { hit: r, select: r }
+    }
+}
 pub struct WindowState {
     pub candidate: WindowCandidate,
     pub visible: bool,

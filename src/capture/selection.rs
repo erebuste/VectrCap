@@ -78,7 +78,7 @@ pub struct SelectionModel {
     active_monitor: PhysicalRect,
     monitors: Vec<MonitorGeometry>,
     windows: Vec<WindowCandidate>,
-    hover_areas: Vec<PhysicalRect>,
+    hover_areas: Vec<super::windows::HoverArea>,
     preferences: RegionCapturePreferences,
     threshold: (u32, u32),
     crop: Option<PhysicalRect>,
@@ -189,7 +189,10 @@ impl SelectionModel {
         if self.hover_areas.is_empty() {
             self.windows.iter().map(|w| w.bounds).find(|r| r.contains(p))
         } else {
-            self.hover_areas.iter().copied().find(|r| r.contains(p))
+            self.hover_areas
+                .iter()
+                .find(|a| a.hit.contains(p))
+                .map(|a| a.select)
         }
         .and_then(|r| r.intersection(self.permitted))
     }

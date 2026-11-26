@@ -6,6 +6,7 @@ use vectrcap::{
             SizePreset,
         },
         request::CaptureSnapshot,
+        windows::HoverArea,
         selection::{
             InputContext, SelectionInput as Input, SelectionModel, SelectionOutcome as Outcome,
         },
@@ -153,6 +154,10 @@ fn hover_picks_controls_and_client_area_like_sharex() {
     let window = r(0, 0, 600, 400);
     let client = r(0, 30, 600, 370);
     let button = r(20, 50, 80, 24);
+    // Explorer-style custom title bar: a tab control under the caption strip.
+    let caption = r(0, 0, 600, 30);
+    let tab = r(10, 4, 200, 26);
+    let area = |r| HoverArea { hit: r, select: r };
     let s = CaptureSnapshot::new(
         vec![0; 1600 * 800 * 4],
         r(-800, 0, 1600, 800),
@@ -163,7 +168,16 @@ fn hover_picks_controls_and_client_area_like_sharex() {
         vec![],
     )
     .unwrap()
-    .with_hover_areas(vec![button, client, window]);
+    .with_hover_areas(vec![
+        HoverArea {
+            hit: caption,
+            select: window,
+        },
+        area(tab),
+        area(button),
+        area(client),
+        area(window),
+    ]);
     let click = |at: Point| {
         let mut m =
             SelectionModel::new(&s, Default::default(), Point { x: -400, y: 50 }, (4, 4)).unwrap();
@@ -172,6 +186,7 @@ fn hover_picks_controls_and_client_area_like_sharex() {
     assert_eq!(click(Point { x: 30, y: 60 }), Outcome::Selected(button));
     assert_eq!(click(Point { x: 300, y: 200 }), Outcome::Selected(client));
     assert_eq!(click(Point { x: 300, y: 10 }), Outcome::Selected(window));
+    assert_eq!(click(Point { x: 50, y: 10 }), Outcome::Selected(window));
 }
 #[test]
 fn disabled_window_detection_keeps_manual_drag() {

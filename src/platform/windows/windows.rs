@@ -4,7 +4,7 @@ use crate::{
     app::error::AppError,
     capture::{
         geometry::{PhysicalPoint, PhysicalRect},
-        windows::{WindowCandidate, WindowId},
+        windows::{HoverArea, WindowCandidate, WindowId},
     },
 };
 use std::{
@@ -185,6 +185,33 @@ fn client_rect(hwnd: HWND) -> Option<PhysicalRect> {
     })
     .ok()
 }
+/// The window's title bar strip: from its top edge down to the bottom of the
+/// caption buttons, which DWM reports even for app-drawn title bars.
+#[allow(unsafe_code)]
+fn caption_band(hwnd: HWND, frame: PhysicalRect) -> Option<PhysicalRect> {
+    let mut buttons = RECT::default();
+    let mut window = RECT::default();
+    // SAFETY: writable stack values; Win32 validates the transient HWND.
+    unsafe {
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_BUTTON_BOUNDS as u32,
+            &mut buttons as *mut _ as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        ) < 0
+            || GetWindowRect(hwnd, &mut window) == 0
+        {
+            return None;
+        }
+    }
+    // Caption button bounds are relative to the window rect.
+    let bottom = window.top + buttons.bottom;
+    let height = bottom - frame.top();
+    if buttons.bottom <= buttons.top || height <= 0 || height as u32 >= frame.height() / 2 {
+        return None;
+    }
+    PhysicalRect::new(frame.left(), frame.top(), frame.width(), height as u32).ok()
+}
 /// ShareX skips a client area that is the whole window bar a thin border
 /// (custom title bars); otherwise it would always win over the window.
 fn same_as_frame(client: PhysicalRect, frame: PhysicalRect) -> bool {
@@ -199,7 +226,7 @@ impl Windows {
     /// its visible child controls (smallest first, clipped to the window), its
     /// client area when it has a real title bar, then the window itself.
     #[allow(unsafe_code)]
-    pub(crate) fn hover_areas(&self, candidates: &[WindowCandidate]) -> Vec<PhysicalRect> {
+    pub(crate) fn hover_areas(&self, candidates: &[WindowCandidate]) -> Vec<HoverArea> {
         let Ok(_dpi) = DpiContext::enter() else {
             return vec![];
         };
@@ -239,13 +266,21 @@ impl Windows {
                 .collect();
             controls.sort_by_key(|r| u64::from(r.width()) * u64::from(r.height()));
             controls.dedup();
-            areas.extend(controls);
+            // The title bar strip selects the whole window, even where an app
+            // (Explorer's tabs) draws its own controls into it.
+            if let Some(caption) = caption_band(hwnd, frame) {
+                areas.push(HoverArea {
+                    hit: caption,
+                    select: frame,
+                });
+            }
+            areas.extend(controls.into_iter().map(HoverArea::itself));
             if let Some(client) = client_rect(hwnd).and_then(|c| c.intersection(frame))
                 && !same_as_frame(client, frame)
             {
-                areas.push(client);
+                areas.push(HoverArea::itself(client));
             }
-            areas.push(frame);
+            areas.push(HoverArea::itself(frame));
         }
         areas
     }

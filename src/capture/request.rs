@@ -5,7 +5,7 @@ use super::{
     },
     last_region::LastRegion,
     preferences::RegionCapturePreferences,
-    windows::WindowCandidate,
+    windows::{HoverArea, WindowCandidate},
 };
 use crate::app::error::AppError;
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ pub struct CaptureSnapshot {
     pub(crate) windows: Vec<WindowCandidate>,
     /// ShareX hover targets in pick order (controls, client areas, windows);
     /// empty means hover uses the window bounds.
-    pub(crate) hover_areas: Vec<PhysicalRect>,
+    pub(crate) hover_areas: Vec<HoverArea>,
     pub(crate) initial_crop: Option<PhysicalRect>,
     pub(crate) hint: Option<SnapshotHint>,
     preferences: RegionCapturePreferences,
@@ -192,7 +192,7 @@ impl CaptureSnapshot {
     pub fn windows(&self) -> &[WindowCandidate] {
         &self.windows
     }
-    pub fn with_hover_areas(mut self, areas: Vec<PhysicalRect>) -> Self {
+    pub fn with_hover_areas(mut self, areas: Vec<HoverArea>) -> Self {
         self.hover_areas = areas;
         self
     }
@@ -240,7 +240,7 @@ pub trait CaptureSource {
     fn windows(&mut self) -> Result<Vec<WindowCandidate>, AppError>;
     /// ShareX "detect controls": child controls and client areas of `windows`
     /// (z-ordered), plus the windows, in hover pick order. Best effort.
-    fn hover_areas(&mut self, _windows: &[WindowCandidate]) -> Vec<PhysicalRect> {
+    fn hover_areas(&mut self, _windows: &[WindowCandidate]) -> Vec<HoverArea> {
         vec![]
     }
     /// Retain the actual window source identity before a delay (not just a reusable HWND).
