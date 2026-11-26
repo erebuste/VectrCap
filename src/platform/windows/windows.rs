@@ -188,26 +188,29 @@ fn client_rect(hwnd: HWND) -> Option<PhysicalRect> {
 /// The window's title bar strip: from its top edge down to the bottom of the
 /// caption buttons, which DWM reports even for app-drawn title bars.
 #[allow(unsafe_code)]
-fn caption_band(hwnd: HWND, frame: PhysicalRect) -> Option<PhysicalRect> {
+fn caption_band(
+    hwnd: HWND,
+    frame: PhysicalRect,
+    title_bottom: Option<i32>,
+) -> Option<PhysicalRect> {
     let mut buttons = RECT::default();
     let mut window = RECT::default();
     // SAFETY: writable stack values; Win32 validates the transient HWND.
-    unsafe {
-        if DwmGetWindowAttribute(
+    let buttons_bottom = unsafe {
+        (DwmGetWindowAttribute(
             hwnd,
             DWMWA_CAPTION_BUTTON_BOUNDS as u32,
             &mut buttons as *mut _ as *mut _,
             std::mem::size_of::<RECT>() as u32,
-        ) < 0
-            || GetWindowRect(hwnd, &mut window) == 0
-        {
-            return None;
-        }
-    }
-    // Caption button bounds are relative to the window rect.
-    let bottom = window.top + buttons.bottom;
+        ) >= 0
+            && GetWindowRect(hwnd, &mut window) != 0
+            && buttons.bottom > buttons.top)
+            // Caption button bounds are relative to the window rect.
+            .then_some(window.top + buttons.bottom)
+    };
+    let bottom = buttons_bottom.max(title_bottom)?;
     let height = bottom - frame.top();
-    if buttons.bottom <= buttons.top || height <= 0 || height as u32 >= frame.height() / 2 {
+    if height <= 0 || height as u32 >= frame.height() / 2 {
         return None;
     }
     PhysicalRect::new(frame.left(), frame.top(), frame.width(), height as u32).ok()
@@ -251,6 +254,9 @@ impl Windows {
                     &mut children as *mut _ as LPARAM,
                 )
             };
+            // Windows App SDK title bars (Explorer's tab row) are a helper window,
+            // not a control: they extend the title bar instead.
+            let mut title_bottom = None;
             let mut controls: Vec<PhysicalRect> = children
                 .into_iter()
                 .filter_map(|child| {
@@ -260,7 +266,12 @@ impl Windows {
                     if unsafe { IsWindowVisible(child) == 0 || GetWindowRect(child, &mut r) == 0 } {
                         return None;
                     }
-                    rect_from_win32(r).ok()?.intersection(frame)
+                    let r = rect_from_win32(r).ok()?.intersection(frame)?;
+                    if class_name(child) == "TITLE_BAR_SCAFFOLDING_WINDOW_CLASS" {
+                        title_bottom = title_bottom.max(Some(r.bottom()));
+                        return None;
+                    }
+                    Some(r)
                 })
                 .filter(|r| *r != frame)
                 .collect();
@@ -268,7 +279,7 @@ impl Windows {
             controls.dedup();
             // The title bar strip selects the whole window, even where an app
             // (Explorer's tabs) draws its own controls into it.
-            if let Some(caption) = caption_band(hwnd, frame) {
+            if let Some(caption) = caption_band(hwnd, frame, title_bottom) {
                 areas.push(HoverArea {
                     hit: caption,
                     select: frame,
@@ -307,13 +318,15 @@ pub fn nudge_pointer(dx: i32, dy: i32) -> Result<(), AppError> {
     Ok(())
 }
 #[allow(unsafe_code)]
-fn is_shell_window(hwnd: HWND) -> bool {
-    let mut class = [0u16; 32];
+fn class_name(hwnd: HWND) -> String {
+    let mut class = [0u16; 64];
     // SAFETY: writable fixed buffer; Win32 validates the transient HWND.
     let len = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
-    let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
+    String::from_utf16_lossy(&class[..len.max(0) as usize])
+}
+fn is_shell_window(hwnd: HWND) -> bool {
     matches!(
-        class.as_str(),
+        class_name(hwnd).as_str(),
         "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Progman" | "WorkerW"
     )
 }
