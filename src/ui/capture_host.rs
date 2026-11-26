@@ -65,6 +65,24 @@ impl CaptureHost {
                         if state.dialog_open {
                             return;
                         }
+                        // Like ShareX's Activate(): the region overlay must own the
+                        // keyboard, or Esc and shortcuts go to the app behind it.
+                        // Windows can refuse a new window the foreground, so ask
+                        // again while unfocused, a bounded number of times.
+                        if !state.image_local
+                            && state.scrolling_review.is_none()
+                            && !ui.ctx().input(|i| i.focused)
+                        {
+                            let tries = egui::Id::unique(("capture-focus-tries", session));
+                            let n = ui.ctx().data_mut(|d| {
+                                let n = d.get_temp_mut_or(tries, 0u32);
+                                *n += 1;
+                                *n
+                            });
+                            if n <= 20 {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                            }
+                        }
                         let mut command = None;
                         if state.intended_pin { ui.label("Pin from screen: select and annotate, then choose Pin. Copy, Save and Upload remain available."); }
                         let mut choose_folder = false;
