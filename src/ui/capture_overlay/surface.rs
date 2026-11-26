@@ -463,7 +463,24 @@ impl CaptureOverlay {
             .as_ref()
             .and_then(|s| self.pointer.and_then(|p| s.preview(p).ok().flatten()));
         let crop = preview.or(self.document.crop()).or(self.hover);
-        let color = painter.ctx().global_style().visuals.selection.stroke.color;
+        // ShareX's "marching ants": a white line with black 5/5 dashes, one
+        // physical pixel wide, readable on any screen content and on the dim.
+        let color = egui::Color32::WHITE;
+        let px = 1.0 / t.pixels_per_point;
+        let ants = |r: egui::Rect| {
+            let r = r.shrink(px / 2.0);
+            let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+            for i in 0..4 {
+                let line = [corners[i], corners[(i + 1) % 4]];
+                painter.line_segment(line, egui::Stroke::new(px, color));
+                painter.extend(egui::Shape::dashed_line(
+                    &line,
+                    egui::Stroke::new(px, egui::Color32::from_black_alpha(230)),
+                    5.0 * px,
+                    5.0 * px,
+                ));
+            }
+        };
         if let Some(crop) = crop {
             let r = t.rect(crop).intersect(t.viewport);
             let v = t.viewport;
@@ -484,12 +501,7 @@ impl CaptureOverlay {
             ] {
                 painter.rect_filled(outside, 0, dim);
             }
-            painter.rect_stroke(
-                r,
-                0,
-                egui::Stroke::new(2.0, color),
-                egui::StrokeKind::Inside,
-            );
+            ants(r);
             if self.document.crop().is_some() && self.tool == AnnotationTool::Region {
                 // Same five-physical-pixel inside edge zones used by SelectionModel.
                 let side = 5.0 / t.pixels_per_point;
@@ -519,12 +531,7 @@ impl CaptureOverlay {
             && let Some(a) = self.document.annotations().iter().find(|a| a.id() == id)
             && let Some(bounds) = annotation_bounds(a)
         {
-            painter.rect_stroke(
-                t.rect(bounds),
-                0,
-                egui::Stroke::new(1.0, color),
-                egui::StrokeKind::Outside,
-            );
+            ants(t.rect(bounds).expand(px));
         }
     }
 }
