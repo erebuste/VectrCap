@@ -12,14 +12,20 @@ use std::{
     time::{Duration, Instant},
 };
 pub fn metadata_label(m: &RecordingMetadata) -> String {
+    use crate::recording::options::AudioMode;
+    let audio = match m.audio {
+        AudioMode::Off => "No audio",
+        AudioMode::System => "System audio",
+        AudioMode::Microphone => "Microphone",
+        AudioMode::Both => "System + mic audio",
+    };
     format!(
-        "{} FPS | {} x {} | {:.2}s active | {} bytes | audio {:?}",
-        m.fps,
+        "{} × {}  ·  {} fps  ·  {:.1} s  ·  {}  ·  {audio}",
         m.width,
         m.height,
+        m.fps,
         m.active_millis as f64 / 1000.0,
-        m.size,
-        m.audio
+        super::history::format_size(m.size),
     )
 }
 pub struct PlaybackFrame {
@@ -161,7 +167,7 @@ impl ReviewPlayer {
                 .with_title("VectrCap recording review")
                 // MP4 review is text and buttons; GIF also shows a ≤640×360 preview.
                 .with_inner_size(if view.mp4 {
-                    [560.0, 230.0]
+                    [540.0, 250.0]
                 } else {
                     [680.0, 600.0]
                 }),
@@ -180,10 +186,13 @@ impl ReviewPlayer {
                     commands.push(AppCommand::CloseRecordingReview);
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    commands.extend(draw_review(ui, &recording, snapshot.error.as_ref()));
-                    if let Ok(mut player) = state.try_lock() {
-                        player.draw(ui);
-                    }
+                    egui::Frame::new().inner_margin(20).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if let Ok(mut player) = state.try_lock() {
+                            player.draw(ui);
+                        }
+                        commands.extend(draw_review(ui, &recording, snapshot.error.as_ref()));
+                    });
                 });
                 for command in commands {
                     if matches!(command, AppCommand::ChooseArchiveFolder) {
@@ -224,31 +233,99 @@ impl PlayerState {
             }
         }
         if let Some(texture) = &self.texture {
-            ui.add(egui::Image::new(texture).max_size(egui::vec2(640.0, 360.0)));
+            ui.vertical_centered(|ui| {
+                ui.add(
+                    egui::Image::new(texture)
+                        .max_size(egui::vec2(640.0, 360.0))
+                        .corner_radius(super::tokens::RADIUS_CONTROL),
+                );
+            });
+            ui.add_space(14.0);
         }
         if let Some(error) = &self.error {
             ui.label(error.to_string());
         }
     }
 }
+/// Header, stats line, a "Saved to" card, notices, then one action bar.
 fn draw_review(
     ui: &mut egui::Ui,
     recording: &RecordingView,
     action_error: Option<&AppError>,
 ) -> Vec<AppCommand> {
+    use super::{
+        icons::Icon,
+        tokens::*,
+        widgets::{self, PillTone},
+    };
+    use egui::{Align, Layout, RichText};
     let mut commands = Vec::new();
-    ui.heading(if recording.mp4 {
-        "MP4 recording review"
-    } else {
-        "GIF recording review"
+    let mut push = |c| commands.push(c);
+    let failed = recording.state == RecordingState::Failed;
+    let (strong, weak) = (ui.visuals().text_color(), ui.visuals().weak_text_color());
+
+    ui.horizontal(|ui| {
+        let title = if failed {
+            "Recording failed"
+        } else {
+            "Recording ready"
+        };
+        ui.label(RichText::new(title).font(semibold(TITLE_SIZE - 2.0)).color(strong));
+        widgets::pill(ui, if recording.mp4 { "MP4" } else { "GIF" }, PillTone::Neutral);
+        if recording.interruption.is_some() {
+            widgets::pill(ui, "Interrupted", PillTone::Warning);
+        }
+        if recording.uploaded {
+            widgets::pill(ui, "Upload queued", PillTone::Success);
+        }
     });
-    ui.label(&recording.task_target);
     if let Some(metadata) = &recording.metadata {
-        ui.label(metadata_label(metadata));
+        ui.label(RichText::new(metadata_label(metadata)).size(SMALL_SIZE).color(weak));
     }
+    ui.add_space(12.0);
+
+    if let Some(path) = &recording.archive_path {
+        widgets::card(ui, |ui| {
+            widgets::card_block(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 150.0).max(0.0));
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let folder = path.parent().unwrap_or(path).to_string_lossy();
+                        ui.add(
+                            egui::Label::new(RichText::new(name).font(medium(BODY_SIZE)))
+                                .truncate(),
+                        )
+                        .on_hover_text(path.to_string_lossy());
+                        ui.add(
+                            egui::Label::new(RichText::new(folder).size(SMALL_SIZE).color(weak))
+                                .truncate(),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if recording.mp4
+                            && recording.playback_path.is_some()
+                            && widgets::icon_button(ui, Icon::Play, "Play").clicked()
+                        {
+                            push(AppCommand::OpenRecordingPlayer);
+                        }
+                    });
+                });
+            });
+        });
+        ui.add_space(10.0);
+    }
+
+    widgets::hint(ui, &recording.task_target);
     if let Some(reason) = recording.interruption {
-        ui.colored_label(ui.visuals().warn_fg_color, reason.label());
-        ui.label("Interrupted recording: review the valid portion before choosing Upload.");
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "{} Only the part before it was kept; check it before uploading.",
+                reason.label()
+            ),
+        );
     }
     for error in [recording.error.as_ref(), action_error]
         .into_iter()
@@ -256,79 +333,84 @@ fn draw_review(
     {
         ui.colored_label(ui.visuals().error_fg_color, error.to_string());
     }
-    if let Some(path) = &recording.archive_path {
-        ui.label("Saved archive");
-        ui.label(path.to_string_lossy());
-    }
-    if recording.mp4
-        && recording.playback_path.is_some()
-        && ui.button("Open MP4 in associated player").clicked()
-    {
-        commands.push(AppCommand::OpenRecordingPlayer);
+    if failed {
+        widgets::hint(
+            ui,
+            "Fix the recording or audio settings and select the area again, or start without audio.",
+        );
     }
     if recording.archive_failed {
-        if ui.button("Retry save").clicked() {
-            commands.push(AppCommand::RetryRecordingArchive {
-                continue_without: false,
-            });
-        }
-        if ui.button("Choose archive folder").clicked() {
-            commands.push(AppCommand::ChooseArchiveFolder);
-        }
-        if ui.button("Continue without local copy").clicked() {
-            commands.push(AppCommand::RetryRecordingArchive {
-                continue_without: true,
-            });
-        }
-    }
-    if recording.state == RecordingState::Review {
+        ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(!recording.uploaded, egui::Button::new("Upload"))
-                .clicked()
-            {
-                commands.push(AppCommand::Recording(RecordingInput::Upload));
+            if widgets::icon_button(ui, Icon::Retry, "Retry save").clicked() {
+                push(AppCommand::RetryRecordingArchive {
+                    continue_without: false,
+                });
             }
-            if ui
-                .add_enabled(!recording.uploaded, egui::Button::new("Run selected tasks"))
-                .clicked()
-            {
-                commands.push(AppCommand::RunRecordingTasks);
+            if widgets::icon_button(ui, Icon::Folder, "Choose folder").clicked() {
+                push(AppCommand::ChooseArchiveFolder);
             }
-            if ui.button("Save").clicked() {
-                commands.push(AppCommand::Recording(RecordingInput::Save));
-            }
-            if ui.button("Discard").clicked() {
-                commands.push(AppCommand::Recording(RecordingInput::Discard));
-            }
-            if ui.button("Done").clicked() {
-                commands.push(AppCommand::CloseRecordingReview);
+            if widgets::ghost_button(ui, None, "Continue without local copy").clicked() {
+                push(AppCommand::RetryRecordingArchive {
+                    continue_without: true,
+                });
             }
         });
-        if recording.uploaded {
-            ui.label(
-                "Upload queued. Cancel its job in Uploads before discarding an active source.",
-            );
-            if ui.button("Show uploads").clicked() {
-                commands.push(AppCommand::FocusHistory(
-                    crate::app::events::HistoryFocus::InProgress,
-                ));
-            }
-        }
     }
-    if recording.state == RecordingState::Failed {
-        ui.label("Correct recording/audio settings and select the area again, or explicitly start without audio.");
-        if ui.button("Recording settings").clicked() {
-            commands.push(AppCommand::Show(crate::app::events::Window::Settings));
+
+    // Action bar: destructive on the left, the main action rightmost.
+    ui.add_space(14.0);
+    let line = ui.visuals().widgets.noninteractive.bg_stroke;
+    let y = ui.cursor().top();
+    ui.painter().hline(ui.max_rect().x_range(), y, line);
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let discard = if failed { "Discard session" } else { "Discard" };
+        if widgets::ghost_button(ui, Some(Icon::X), discard).clicked() {
+            push(AppCommand::Recording(RecordingInput::Discard));
         }
-        if recording.mp4 && ui.button("Start without audio").clicked() {
-            commands.push(AppCommand::Recording(RecordingInput::StartWithoutAudio {
-                now: Duration::ZERO,
-            }));
-        }
-        if ui.button("Discard failed session").clicked() {
-            commands.push(AppCommand::Recording(RecordingInput::Discard));
-        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if failed {
+                if recording.mp4
+                    && widgets::primary_button(ui, None, "Start without audio").clicked()
+                {
+                    push(AppCommand::Recording(RecordingInput::StartWithoutAudio {
+                        now: Duration::ZERO,
+                    }));
+                }
+                if widgets::icon_button(ui, Icon::Settings, "Recording settings").clicked() {
+                    push(AppCommand::Show(crate::app::events::Window::Settings));
+                }
+                return;
+            }
+            if recording.uploaded {
+                if widgets::icon_button(ui, Icon::History, "Show uploads").clicked() {
+                    push(AppCommand::FocusHistory(
+                        crate::app::events::HistoryFocus::InProgress,
+                    ));
+                }
+            } else {
+                if widgets::primary_button(ui, Some(Icon::Upload), "Upload").clicked() {
+                    push(AppCommand::Recording(RecordingInput::Upload));
+                }
+                if widgets::toggle_button(ui, false, None, "Run tasks")
+                    .on_hover_text("Run the selected after-capture tasks")
+                    .clicked()
+                {
+                    push(AppCommand::RunRecordingTasks);
+                }
+            }
+            if widgets::toggle_button(ui, false, None, "Save").clicked() {
+                push(AppCommand::Recording(RecordingInput::Save));
+            }
+            if widgets::ghost_button(ui, None, "Close").clicked() {
+                push(AppCommand::CloseRecordingReview);
+            }
+        });
+    });
+    if recording.uploaded {
+        widgets::hint(ui, "Cancel its job in Uploads before discarding the source.");
     }
     commands
 }
