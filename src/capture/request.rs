@@ -373,6 +373,8 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
                 .desktop(bounds, &layout, request.include_cursor)?
         };
         self.check_cancel()?;
+        // Read before the freshness check below, so windows that moved invalidate them too.
+        let areas = self.source.hover_areas(&windows);
         if !same_layout(&layout, &self.source.monitors()?) {
             return Err(AppError::Capture("display layout changed while capturing"));
         }
@@ -381,7 +383,6 @@ impl<S: CaptureSource, C: Countdown> CaptureService<S, C> {
                 "window layout changed while capturing; try again",
             ));
         }
-        let areas = self.source.hover_areas(&windows);
         let mut snapshot = CaptureSnapshot::new(pixels, bounds, layout, windows)?;
         snapshot.hover_areas = areas;
         snapshot.mode = request.mode;

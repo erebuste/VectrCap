@@ -206,9 +206,14 @@ impl Windows {
         let mut areas = vec![];
         for candidate in candidates {
             let frame = candidate.bounds;
-            let Some(window) = self.entries.get(&candidate.id) else {
+            // Same fail-closed identity check as capture: skip a window whose
+            // handle vanished, was recycled or moved since enumeration.
+            let Ok(window) = self.resolve(*candidate) else {
                 continue;
             };
+            if areas.len() >= MAX_CONTROLS * 4 {
+                break;
+            }
             let hwnd = window.hwnd as HWND;
             let mut children: Vec<usize> = vec![];
             // SAFETY: the callback only touches `children`, which outlives the call.
